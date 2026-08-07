@@ -1,0 +1,1279 @@
+// MemmonBar — menu-bar front end for memmon.
+//
+// Deliberately does no background work. `memmon --json` (which spawns `top`,
+// ~1.4s) runs ONLY when the popover opens. The title is refreshed from the tiny
+// cached sample the launchd sampler already writes — a file read, never a spawn.
+//
+// Build:  swiftc -O -o MemmonBar MemmonBar.swift -framework Cocoa
+
+import Cocoa
+import SwiftUI
+
+// MARK: - units
+
+let GB = 1024.0 * 1024.0 * 1024.0
+let MB = 1024.0 * 1024.0
+
+func human(_ b: Double) -> String {
+    if b >= GB { return String(format: "%.1fG", b / GB) }
+    if b >= MB { return String(format: "%.0fM", b / MB) }
+    return String(format: "%.0fB", b)
+}
+
+func durS(_ sec: Int) -> String {
+    if sec >= 86400 { return "\(sec / 86400)d\((sec % 86400) / 3600)h" }
+    if sec >= 3600 { return "\(sec / 3600)h\(String(format: "%02d", (sec % 3600) / 60))m" }
+    return "\(sec / 60)m"
+}
+
+func clockOf(_ ts: Double) -> String {
+    let f = DateFormatter(); f.dateFormat = "HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: ts))
+}
+
+func relative(_ ts: Double) -> String {
+    let s = Int(Date().timeIntervalSince1970 - ts)
+    if s < 60 { return "\(s)s ago" }
+    if s < 3600 { return "\(s / 60)m ago" }
+    return "\(s / 3600)h ago"
+}
+
+// MARK: - palette
+
+enum P {
+    // Deep indigo base with a violet lift, so coloured accents read as light
+    // rather than as stains on flat grey.
+    static let bgTop = Color(red: 0.055, green: 0.043, blue: 0.086)
+    static let bgMid = Color(red: 0.094, green: 0.071, blue: 0.161)
+    static let bgBot = Color(red: 0.129, green: 0.086, blue: 0.220)
+
+    static let card = Color(red: 1, green: 1, blue: 1).opacity(0.045)
+    static let cardHi = Color(red: 1, green: 1, blue: 1).opacity(0.085)
+    static let stroke = Color.white.opacity(0.085)
+    static let strokeHi = Color.white.opacity(0.16)
+
+    static let text = Color(red: 0.96, green: 0.95, blue: 1.0)
+    static let dim = Color(red: 0.72, green: 0.70, blue: 0.82)
+    static let faint = Color(red: 0.52, green: 0.50, blue: 0.63)
+
+    static let green = Color(red: 0.204, green: 0.867, blue: 0.596)   // #34DD98
+    static let amber = Color(red: 0.984, green: 0.749, blue: 0.235)   // #FBBF3C
+    static let red = Color(red: 0.984, green: 0.443, blue: 0.518)     // #FB7184
+    static let violet = Color(red: 0.694, green: 0.529, blue: 0.988)  // #B187FC
+    static let blue = Color(red: 0.298, green: 0.749, blue: 0.973)    // #4CBFF8
+    static let fuchsia = Color(red: 0.910, green: 0.475, blue: 0.976) // #E879F9
+
+    /// RAM is sky, swap is fuchsia — two hues that never read as the same thing.
+    static let ram = blue
+    static let swap = fuchsia
+
+    static func tint(_ level: String) -> Color {
+        switch level {
+        case "CRITICAL", "DANGER": return red
+        case "WATCH": return amber
+        default: return green
+        }
+    }
+
+    /// Matches Claude Code's own session convention rather than traffic-light
+    /// intuition: green means finished, grey means still going. Consistency with
+    /// the tool these sessions belong to beats a prettier mapping.
+    static func stateColor(_ s: String) -> Color {
+        switch s {
+        case "done", "stopped": return green      // completed
+        case "working": return dim                // working
+        case "blocked": return amber              // idle, waiting on you
+        case "terminal": return blue              // interactive terminal session
+        default: return faint
+        }
+    }
+
+    static func stateLabel(_ s: String) -> String {
+        switch s {
+        case "done", "stopped": return "completed"
+        case "working": return "working"
+        case "blocked": return "idle"             // Claude's 'blocked' = awaiting input
+        case "terminal": return "terminal"
+        default: return s
+        }
+    }
+}
+
+// MARK: - model
+
+struct Child: Identifiable {
+    let id = UUID()
+    var tag: String, worktree: String
+    var mem: Double, pid: Int, age: Int
+}
+
+struct Agent: Identifiable {
+    let id = UUID()
+    var kind: String, goal: String, active: Bool
+}
+
+struct Sess: Identifiable {
+    let id = UUID()
+    var name: String, state: String, doing: String
+    var total: Double, ram: Double, swap: Double
+    var procs: Int, subActive: Int
+    var root: Int
+    var children: [Child] = []
+    var agents: [Agent] = []       // active only — finished ones are noise
+    var subFinished: Int = 0
+    var started: [String] = []
+}
+
+struct WT: Identifiable {
+    let id = UUID()
+    var name: String, tag: String
+    var mem: Double, ram: Double, swap: Double
+    var procs: Int, orphans: Int
+}
+
+struct Blk: Identifiable {
+    let id = UUID()
+    var session: String, cmd: String, ts: Double
+}
+
+struct App: Identifiable {
+    let id = UUID()
+    var name: String
+    var mem: Double
+    var procs: Int
+}
+
+struct GateSess: Identifiable {
+    let id = UUID()
+    var name: String
+    var n: Int, warn: Int, block: Int
+}
+
+struct GateStats {
+    var paused = false
+    var pausedUntil: Double? = nil
+    var total = 0, allow = 0, warn = 0, block = 0, error = 0
+    var healthy = true
+    var spanS = 0, p50 = 0, p95 = 0
+    var sessions: [GateSess] = []
+}
+
+struct Snap {
+    var ramUsed = 0.0, ramTotal = 1.0, swapUsed = 0.0, swapTotal = 1.0
+    var free = 0.0, load = 0.0, compressed = 0.0
+    var level = "HEALTHY", reasons: [String] = [], headroom: Double? = nil
+    var score = 0
+    var advice = "", nextLevel: String? = nil, toNext: Int? = nil
+    var sessions: [Sess] = [], worktrees: [WT] = [], blocked: [Blk] = []
+    var orphanTotal = 0.0, orphanCount = 0
+    var idleSpares = 0, idleSpareMem = 0.0
+    var apps: [App] = []
+    var gate = GateStats()
+}
+
+final class Model: ObservableObject {
+    @Published var snap = Snap()
+    @Published var loaded = false
+    @Published var refreshing = false
+    @Published var lastSync: Date?
+
+    let python = "/usr/bin/python3"
+    let script = NSString(string: "~/.claude/memmon/memmon.py").expandingTildeInPath
+
+    @discardableResult
+    func run(_ args: [String]) -> Data? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [script] + args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return out
+    }
+
+    /// Full sync. Kicked off when the popover opens; the previous snapshot stays
+    /// on screen meanwhile so the UI never blanks or blocks.
+    func refresh() {
+        guard !refreshing else { return }
+        refreshing = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            var parsed: Snap?
+            if let d = self.run(["--json"]),
+               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+                parsed = Model.decode(j)
+            }
+            DispatchQueue.main.async {
+                if let parsed { self.snap = parsed; self.loaded = true; self.lastSync = Date() }
+                self.refreshing = false
+            }
+        }
+    }
+
+    static func decode(_ j: [String: Any]) -> Snap {
+        var s = Snap()
+        if let vm = j["vm"] as? [String: Any] {
+            s.ramUsed = vm["ram_used"] as? Double ?? 0
+            s.ramTotal = max(vm["ram_total"] as? Double ?? 1, 1)
+            s.swapUsed = vm["swap_used"] as? Double ?? 0
+            s.swapTotal = max(vm["swap_total"] as? Double ?? 1, 1)
+            s.free = vm["free_pct"] as? Double ?? 0
+            s.load = vm["load"] as? Double ?? 0
+            s.compressed = vm["compressor"] as? Double ?? 0
+        }
+        if let p = j["pressure"] as? [String: Any] {
+            s.level = p["level"] as? String ?? "HEALTHY"
+            s.reasons = p["reasons"] as? [String] ?? []
+            s.headroom = p["headroom_min"] as? Double
+            s.score = p["score"] as? Int ?? 0
+            s.advice = p["advice"] as? String ?? ""
+            s.nextLevel = p["next_level"] as? String
+            s.toNext = p["to_next"] as? Int
+        }
+        s.sessions = (j["sessions"] as? [[String: Any]] ?? []).map { d in
+            let subs = d["subagents_active"] as? [[String: Any]] ?? []
+            let all = d["subagents"] as? [[String: Any]] ?? []
+            let kids = d["top_children"] as? [[String: Any]] ?? []
+            // started is {service: [iso_ts, command]}. "Docker" and "Docker VM"
+            // are one action to the user, so collapse them.
+            var services = Set((d["started"] as? [String: Any] ?? [:]).keys
+                .map { $0 == "Docker VM" ? "Docker" : $0 })
+            services.remove("")
+            // Distinct agent types only; an omega wave spawns the same auditor
+            // several times and listing each is pure repetition.
+            var seenKinds = Set<String>()
+            let activeAgents = subs.compactMap { a -> Agent? in
+                let k = a["kind"] as? String ?? "agent"
+                guard !seenKinds.contains(k) else { return nil }
+                seenKinds.insert(k)
+                return Agent(kind: k, goal: a["goal"] as? String ?? "", active: true)
+            }
+            return Sess(
+                name: d["name"] as? String ?? "?",
+                state: d["state"] as? String ?? "",
+                doing: d["doing"] as? String ?? "",
+                total: d["mem"] as? Double ?? 0,
+                ram: d["ram"] as? Double ?? 0,
+                swap: d["swap"] as? Double ?? 0,
+                procs: d["nproc"] as? Int ?? 0,
+                subActive: subs.count,
+                root: d["root"] as? Int ?? 0,
+                children: kids.map {
+                    Child(tag: $0["tag"] as? String ?? "?",
+                          worktree: $0["worktree"] as? String ?? "",
+                          mem: $0["mem"] as? Double ?? 0,
+                          pid: $0["pid"] as? Int ?? 0,
+                          age: $0["age"] as? Int ?? 0)
+                },
+                agents: Array(activeAgents.prefix(5)),
+                subFinished: max(0, all.count - subs.count),
+                started: services.sorted())
+        }
+        s.worktrees = (j["worktrees"] as? [[String: Any]] ?? []).map { d in
+            WT(name: d["name"] as? String ?? "?",
+               tag: d["tag"] as? String ?? "",
+               mem: d["mem"] as? Double ?? 0,
+               ram: d["ram"] as? Double ?? 0,
+               swap: d["swap"] as? Double ?? 0,
+               procs: d["n"] as? Int ?? 0,
+               orphans: d["orphans"] as? Int ?? 0)
+        }
+        s.blocked = (j["blocked"] as? [[String: Any]] ?? []).map { d in
+            Blk(session: d["session"] as? String ?? "?",
+                cmd: d["cmd"] as? String ?? "",
+                ts: d["ts"] as? Double ?? 0)
+        }
+        s.orphanTotal = j["orphan_total"] as? Double ?? 0
+        s.orphanCount = (j["orphans"] as? [[String: Any]])?.count ?? 0
+        // Non-Claude memory feeds the verdict, so it has to be visible. A
+        // browser routinely outweighs every session combined, and no amount of
+        // scoping a build addresses that.
+        s.apps = ((j["apps"] as? [String: Any]) ?? [:]).compactMap { k, v in
+            guard let d = v as? [String: Any] else { return nil }
+            return App(name: k, mem: d["mem"] as? Double ?? 0,
+                       procs: d["n"] as? Int ?? 0)
+        }.sorted { $0.mem > $1.mem }
+        if let g = j["gate"] as? [String: Any] {
+            s.gate.paused = g["paused"] as? Bool ?? false
+            s.gate.pausedUntil = g["paused_until"] as? Double
+            s.gate.total = g["total"] as? Int ?? 0
+            s.gate.allow = g["allow"] as? Int ?? 0
+            s.gate.warn = g["warn"] as? Int ?? 0
+            s.gate.block = g["block"] as? Int ?? 0
+            s.gate.error = g["error"] as? Int ?? 0
+            s.gate.healthy = g["healthy"] as? Bool ?? true
+            s.gate.spanS = g["span_s"] as? Int ?? 0
+            s.gate.p50 = g["p50_ms"] as? Int ?? 0
+            s.gate.p95 = g["p95_ms"] as? Int ?? 0
+            s.gate.sessions = (g["sessions"] as? [[String: Any]] ?? []).map {
+                GateSess(name: $0["name"] as? String ?? "?",
+                         n: $0["n"] as? Int ?? 0,
+                         warn: $0["warn"] as? Int ?? 0,
+                         block: $0["block"] as? Int ?? 0)
+            }
+        }
+        if let ov = j["overhead"] as? [String: Any] {
+            s.idleSpares = ov["spares"] as? Int ?? 0
+            s.idleSpareMem = ov["spare_mem"] as? Double ?? 0
+        }
+        return s
+    }
+}
+
+// MARK: - building blocks
+
+struct Card<Content: View>: View {
+    var tint: Color = P.stroke
+    @ViewBuilder var content: Content
+    var body: some View {
+        content
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 14).fill(P.card))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(tint, lineWidth: 1))
+    }
+}
+
+struct Badge: View {
+    var text: String
+    var color: Color
+    var body: some View {
+        Text(text.uppercased())
+            .font(.system(size: 9, weight: .heavy, design: .rounded))
+            .tracking(0.4)
+            .foregroundColor(color)
+            .padding(.horizontal, 7).padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.16)))
+    }
+}
+
+struct Meter: View {
+    var value: Double            // 0…1
+    var tint: Color
+    var height: CGFloat = 5
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.09))
+                Capsule()
+                    .fill(LinearGradient(colors: [tint.opacity(0.75), tint],
+                                         startPoint: .leading, endPoint: .trailing))
+                    .frame(width: max(2, g.size.width * min(max(value, 0), 1)))
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+/// The big RAM / SWAP tiles.
+struct StatTile: View {
+    var icon: String, label: String
+    var value: String, unit: String, caption: String
+    var progress: Double, tint: Color
+    var badge: String?
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 5) {
+                    Image(systemName: icon).font(.system(size: 10, weight: .bold))
+                        .foregroundColor(tint)
+                    Text(label.uppercased())
+                        .font(.system(size: 9, weight: .heavy, design: .rounded))
+                        .tracking(0.5).foregroundColor(P.dim)
+                    Spacer(minLength: 4)
+                    if let badge { Badge(text: badge, color: tint) }
+                }
+                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    Text(value)
+                        .font(.system(size: 27, weight: .bold, design: .rounded))
+                        .foregroundColor(P.text)
+                    Text(unit).font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(P.dim)
+                }
+                Meter(value: progress, tint: tint)
+                Text(caption).font(.system(size: 9.5)).foregroundColor(P.faint)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+struct Chevron: View {
+    var open: Bool
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 8, weight: .black))
+            .foregroundColor(P.faint)
+            .rotationEffect(.degrees(open ? 90 : 0))
+    }
+}
+
+/// Collapsible section. Everything below the top two tiles lives in one of
+/// these so a machine with 11 sessions is still readable in a 620pt popover.
+struct Section<Content: View>: View {
+    var title: String
+    var count: Int
+    var tint: Color = P.dim
+    @Binding var open: Bool
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Button { withAnimation(.easeInOut(duration: 0.16)) { open.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Chevron(open: open)
+                    Text(title.uppercased())
+                        .font(.system(size: 9, weight: .heavy, design: .rounded))
+                        .tracking(0.7).foregroundColor(tint)
+                    Spacer()
+                    Text("\(count)")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(tint.opacity(0.9))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(tint.opacity(0.15)))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if open { content }
+        }
+    }
+}
+
+/// Without this nothing in the card explains itself — the dot colours and the
+/// pink outline both had to be asked about.
+struct Legend: View {
+    private let items: [(Color, String)] = [
+        (P.green, "completed"), (P.dim, "working"),
+        (P.amber, "idle"), (P.blue, "terminal"),
+    ]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 9) {
+                ForEach(items, id: \.1) { c, label in
+                    HStack(spacing: 3) {
+                        Circle().fill(c).frame(width: 5, height: 5)
+                        Text(label).font(.system(size: 8.5)).foregroundColor(P.faint)
+                    }
+                }
+            }
+            HStack(spacing: 4) {
+                RoundedRectangle(cornerRadius: 2)
+                    .stroke(P.red.opacity(0.6), lineWidth: 1)
+                    .frame(width: 12, height: 7)
+                Text("outlined = over half its memory is swapped to disk")
+                    .font(.system(size: 8.5)).foregroundColor(P.faint)
+            }
+        }
+        .padding(.bottom, 1)
+    }
+}
+
+struct DetailLine: View {
+    var left: String, right: String
+    var tint: Color = P.faint
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(left).font(.system(size: 9)).foregroundColor(tint).lineLimit(1)
+            Spacer(minLength: 4)
+            Text(right).font(.system(size: 9, design: .rounded))
+                .foregroundColor(P.faint)
+        }
+    }
+}
+
+struct SessionCard: View {
+    var s: Sess
+    @Binding var expanded: Bool
+    var onEnd: () -> Void
+    @State private var hoverClose = false
+
+    private var swapShare: Double { s.total > 0 ? s.swap / s.total : 0 }
+    private var hot: Bool { swapShare > 0.5 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Chevron(open: expanded)
+                Circle().fill(P.stateColor(s.state)).frame(width: 6, height: 6)
+                Text(s.name).font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(P.text).lineLimit(1)
+                Spacer(minLength: 6)
+                Text(human(s.total))
+                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
+                    .foregroundColor(P.text)
+                Button(action: onEnd) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .black))
+                        .foregroundColor(hoverClose ? .white : P.faint)
+                        .frame(width: 15, height: 15)
+                        .background(Circle().fill(hoverClose ? P.red : P.cardHi))
+                }
+                .buttonStyle(.plain)
+                .onHover { hoverClose = $0 }
+                .help("End this session")
+            }
+            // RAM vs swap in one bar — the swapped share is what hurts.
+            GeometryReader { g in
+                HStack(spacing: 2) {
+                    Capsule().fill(P.ram.opacity(0.9))
+                        .frame(width: max(2, g.size.width * (1 - swapShare)))
+                    Capsule().fill(hot ? P.red : P.swap.opacity(0.85))
+                }
+            }
+            .frame(height: 4)
+            HStack(spacing: 6) {
+                Text("RAM \(human(s.ram))").font(.system(size: 9, weight: .medium))
+                    .foregroundColor(P.ram)
+                Text("SWAP \(human(s.swap))").font(.system(size: 9, weight: .medium))
+                    .foregroundColor(hot ? P.red : P.swap)
+                Text("· \(s.procs)p").font(.system(size: 9)).foregroundColor(P.faint)
+                Spacer(minLength: 2)
+                if s.subActive > 0 {
+                    Badge(text: s.subActive == 1 ? "1 agent" : "\(s.subActive) agents", color: P.violet)
+                }
+            }
+            if !s.doing.isEmpty {
+                Text(s.doing).font(.system(size: 9.5)).foregroundColor(P.faint)
+                    .lineLimit(expanded ? 2 : 1).truncationMode(.tail)
+            }
+
+            if expanded {
+                // Only what a reader cannot infer from the collapsed row: the
+                // work this session spawned, and who is running right now.
+                let hasDetail = !s.children.isEmpty || !s.agents.isEmpty
+                    || !s.started.isEmpty
+                if hasDetail { Divider().overlay(P.stroke).padding(.vertical, 1) }
+
+                if !s.children.isEmpty {
+                    Text("SPAWNED").font(.system(size: 8, weight: .heavy))
+                        .tracking(0.5).foregroundColor(P.faint)
+                    ForEach(s.children) { c in
+                        DetailLine(
+                            left: c.worktree.isEmpty ? c.tag : "\(c.tag) · \(c.worktree)",
+                            right: human(c.mem),
+                            tint: P.dim)
+                    }
+                }
+                if !s.agents.isEmpty {
+                    Text("SUBAGENTS RUNNING").font(.system(size: 8, weight: .heavy))
+                        .tracking(0.5).foregroundColor(P.faint).padding(.top, 2)
+                    ForEach(s.agents) { a in
+                        HStack(spacing: 5) {
+                            Circle().fill(P.violet).frame(width: 4, height: 4)
+                            Text(a.kind).font(.system(size: 9, weight: .medium))
+                                .foregroundColor(P.violet).lineLimit(1)
+                            Spacer(minLength: 2)
+                        }
+                    }
+                }
+                if !s.started.isEmpty {
+                    HStack(spacing: 5) {
+                        Text("STARTED").font(.system(size: 8, weight: .heavy))
+                            .tracking(0.5).foregroundColor(P.faint)
+                        Text(s.started.joined(separator: " · "))
+                            .font(.system(size: 9)).foregroundColor(P.blue.opacity(0.85))
+                    }
+                    .padding(.top, 2)
+                }
+                if !hasDetail {
+                    Text("no spawned work — the session process is all of it")
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                }
+            }
+        }
+        .padding(.vertical, 8).padding(.horizontal, 11)
+        .background(RoundedRectangle(cornerRadius: 12).fill(
+            expanded ? P.cardHi : P.card))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .stroke(hot ? P.red.opacity(0.40)
+                    : (expanded ? P.strokeHi : P.stroke), lineWidth: 1))
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } }
+    }
+}
+
+/// Where the score sits between named tiers. An unlabelled progress bar told the
+/// reader nothing — the zones have to carry their own names and boundaries.
+struct LevelTrack: View {
+    var score: Int
+    var level: String
+
+    // (name, first point in zone, width in points)
+    private let zones: [(String, Int, Int)] = [
+        ("HEALTHY", 0, 2), ("WATCH", 2, 2), ("DANGER", 4, 3), ("CRITICAL", 7, 2),
+    ]
+    private func color(_ name: String) -> Color { P.tint(name) }
+
+    var body: some View {
+        VStack(spacing: 3) {
+            GeometryReader { g in
+                let total = CGFloat(zones.reduce(0) { $0 + $1.2 })
+                HStack(spacing: 2) {
+                    ForEach(zones, id: \.0) { name, start, width in
+                        let w = g.size.width * CGFloat(width) / total - 2
+                        let filled = min(max(score - start, 0), width)
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(color(name).opacity(0.16))
+                            Capsule().fill(color(name))
+                                .frame(width: w * CGFloat(filled) / CGFloat(width))
+                        }
+                        .frame(width: max(w, 2))
+                    }
+                }
+            }
+            .frame(height: 5)
+            HStack(spacing: 2) {
+                ForEach(zones, id: \.0) { name, _, width in
+                    Text(name)
+                        .font(.system(size: 7, weight: name == level ? .black : .medium,
+                                      design: .rounded))
+                        .foregroundColor(name == level ? color(name) : P.faint)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+    }
+}
+
+struct FooterButton: View {
+    var icon: String, label: String
+    var tint: Color = P.dim
+    var action: () -> Void
+    @State private var hover = false
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .bold))
+                Text(label).font(.system(size: 10.5, weight: .medium))
+            }
+            .foregroundColor(hover ? P.text : tint)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Capsule().fill(hover ? P.cardHi : P.card))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+    }
+}
+
+// MARK: - main view
+
+struct ContentView: View {
+    @ObservedObject var model: Model
+    var onQuit: () -> Void
+    var onReap: () -> Void
+    var onEndSession: (Sess) -> Void = { _ in }
+    var onToggleGate: (Bool) -> Void = { _ in }
+    /// ImageRenderer cannot lay out a ScrollView offscreen — it renders empty.
+    /// The preview drops the scroll container so the real content is exercised.
+    var flattened = false
+    /// Preview only: force every session open so the drill-down layout is
+    /// exercised without needing to click.
+    var previewExpandAll = false
+    var previewOpenGate = false
+    var frameHeight: CGFloat = 620
+
+    @State var openSessions = true
+    @State var openWorktrees = false
+    @State var openPool = false
+    @State var openApps = false
+    @State var openGate = false
+    @State var expandedSessions: Set<String> = []
+
+    private var s: Snap { model.snap }
+    private var tint: Color { P.tint(s.level) }
+    private var finished: [Sess] {
+        s.sessions.filter { $0.state == "done" || $0.state == "stopped" }
+    }
+    private var finishedCount: Int { finished.count }
+    private var finishedMem: Double { finished.reduce(0) { $0 + $1.total } }
+    private var sessionTotal: Double { s.sessions.reduce(0) { $0 + $1.total } }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [P.bgTop, P.bgBot],
+                           startPoint: .top, endPoint: .bottom)
+            VStack(spacing: 0) {
+                header
+                Divider().overlay(P.stroke)
+                if model.loaded {
+                    if flattened { body_; Spacer(minLength: 0) }
+                    else { ScrollView { body_ } }
+                } else {
+                    VStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("reading memory…").font(.system(size: 11))
+                            .foregroundColor(P.dim)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                Divider().overlay(P.stroke)
+                footer
+            }
+        }
+        .frame(width: 380, height: frameHeight, alignment: .top)
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(LinearGradient(colors: [P.violet, P.blue],
+                                             startPoint: .topLeading,
+                                             endPoint: .bottomTrailing))
+                Image(systemName: "memorychip.fill")
+                    .font(.system(size: 14, weight: .bold)).foregroundColor(.white)
+            }
+            .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("memmon").font(.system(size: 14, weight: .bold))
+                    .foregroundColor(P.text)
+                Text("Memory Monitor").font(.system(size: 9.5))
+                    .foregroundColor(P.faint)
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Circle().fill(tint).frame(width: 7, height: 7)
+                Text(model.refreshing ? "Syncing…" : s.level)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundColor(tint)
+            }
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .background(Capsule().fill(tint.opacity(0.14)))
+            .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
+        }
+        .padding(.horizontal, 14).padding(.vertical, 11)
+    }
+
+    private var body_: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            verdict
+            HStack(spacing: 10) {
+                StatTile(icon: "cpu.fill", label: "RAM",
+                         value: String(format: "%.0f", s.ramUsed / s.ramTotal * 100),
+                         unit: "% used",
+                         caption: "\(human(s.ramUsed)) of \(human(s.ramTotal)) · \(human(s.compressed)) compressed",
+                         progress: s.ramUsed / s.ramTotal, tint: P.ram)
+                StatTile(icon: "internaldrive.fill", label: "Swap",
+                         value: human(s.swapUsed), unit: "on disk",
+                         caption: String(format: "%.2fx RAM size · load %.1f",
+                                         s.swapUsed / s.ramTotal, s.load),
+                         progress: min(s.swapUsed / s.ramTotal, 1),
+                         tint: s.swapUsed > s.ramTotal ? P.red : P.swap,
+                         badge: s.swapUsed > s.ramTotal ? "over" : nil)
+            }
+            if s.gate.total > 0 { gateSection }
+            if !s.blocked.isEmpty { blockedCard }
+            if s.orphanTotal > 0 { orphanCard }
+
+            if !s.sessions.isEmpty {
+                Section(title: "Claude sessions", count: s.sessions.count,
+                        open: $openSessions) {
+                    VStack(spacing: 7) {
+                        Legend()
+                        if finishedMem > 0 {
+                            // Finished sessions are free memory: the work is done,
+                            // closing one costs nothing.
+                            Text("\(finishedCount) completed session"
+                                 + (finishedCount == 1 ? "" : "s")
+                                 + " still holding \(human(finishedMem)) — safe to close")
+                                .font(.system(size: 9)).foregroundColor(P.green)
+                        }
+                        ForEach(s.sessions) { sess in
+                            SessionCard(
+                                s: sess,
+                                expanded: Binding(
+                                    get: { previewExpandAll
+                                           || expandedSessions.contains(sess.name) },
+                                    set: { on in
+                                        if on { expandedSessions.insert(sess.name) }
+                                        else { expandedSessions.remove(sess.name) }
+                                    }),
+                                onEnd: { onEndSession(sess) })
+                        }
+                    }
+                }
+            }
+            if !s.worktrees.isEmpty {
+                Section(title: "Work by worktree", count: s.worktrees.count,
+                        open: $openWorktrees) {
+                    VStack(spacing: 6) { ForEach(s.worktrees) { worktreeRow($0) } }
+                }
+            }
+            if !s.apps.isEmpty {
+                Section(title: "Other apps", count: s.apps.count,
+                        open: $openApps) {
+                    VStack(spacing: 6) {
+                        ForEach(s.apps.prefix(6)) { a in
+                            HStack(spacing: 8) {
+                                Circle().fill(P.faint).frame(width: 5, height: 5)
+                                Text(a.name).font(.system(size: 10.5, weight: .medium))
+                                    .foregroundColor(P.text).lineLimit(1)
+                                Text("\(a.procs)p").font(.system(size: 8.5))
+                                    .foregroundColor(P.faint)
+                                Spacer(minLength: 4)
+                                Text(human(a.mem))
+                                    .font(.system(size: 11, weight: .bold,
+                                                  design: .rounded))
+                                    .foregroundColor(a.mem > sessionTotal
+                                                     ? P.amber : P.text)
+                            }
+                            .padding(.vertical, 5).padding(.horizontal, 11)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
+                        }
+                        if let biggest = s.apps.first, biggest.mem > sessionTotal {
+                            Text("\(biggest.name) alone outweighs every Claude "
+                                 + "session combined (\(human(sessionTotal)))")
+                                .font(.system(size: 9)).foregroundColor(P.amber)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+            if s.idleSpares > 0 {
+                Section(title: "Claude runtime pool", count: s.idleSpares,
+                        open: $openPool) {
+                    Text("\(s.idleSpares) idle prewarm process(es) holding "
+                         + "\(human(s.idleSpareMem)). Claimed sessions are counted "
+                         + "above and are never reclaimable.")
+                        .font(.system(size: 9.5)).foregroundColor(P.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+    }
+
+    private var verdict: some View {
+        Card(tint: tint.opacity(0.40)) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: s.level == "HEALTHY"
+                          ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .bold)).foregroundColor(tint)
+                    Text(s.level).font(.system(size: 12, weight: .heavy, design: .rounded))
+                        .foregroundColor(tint)
+                    Spacer()
+                    // Only once something is actually wrong. A red "~19 min left"
+                    // sitting on a green HEALTHY card contradicts itself, and the
+                    // projection is too noisy to be worth alarming about while
+                    // the machine is fine.
+                    if let h = s.headroom, h < 120, s.level != "HEALTHY" {
+                        Badge(text: String(format: "~%.0f min left", h), color: P.red)
+                    } else if let n = s.nextLevel, let t = s.toNext {
+                        Text("\(t) pt → \(n)")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .foregroundColor(P.faint)
+                    }
+                }
+                LevelTrack(score: s.score, level: s.level)
+                // Names the actual offender rather than repeating canned advice.
+                Text(s.advice).font(.system(size: 10)).foregroundColor(P.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !s.reasons.isEmpty {
+                    Text("because: " + s.reasons.joined(separator: " · "))
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+
+    /// What the gate has done to your sessions. Deliberately avoids the words
+    /// "evaluated / advised / allowed" — the distinction that matters is whether
+    /// a command was stopped, and only one of those three ever stops anything.
+    private var gateSection: some View {
+        let g = s.gate
+        return Section(title: "Session gate", count: g.total,
+                       tint: g.paused ? P.amber
+                             : (g.block > 0 ? P.red : (g.healthy ? P.dim : P.amber)),
+                       open: Binding(get: { previewOpenGate || openGate },
+                                    set: { openGate = $0 })) {
+            VStack(alignment: .leading, spacing: 8) {
+                // State first, and the control next to it: whether the gate is
+                // running at all outranks any statistic below.
+                HStack(spacing: 7) {
+                    Circle().fill(g.paused ? P.amber : P.green)
+                        .frame(width: 6, height: 6)
+                    Text(g.paused ? "Paused" : "Active")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(g.paused ? P.amber : P.green)
+                    if g.paused, let u = g.pausedUntil {
+                        Text("· resumes \(clockOf(u))")
+                            .font(.system(size: 9)).foregroundColor(P.faint)
+                    } else if g.paused {
+                        Text("· until you resume it")
+                            .font(.system(size: 9)).foregroundColor(P.faint)
+                    }
+                    Spacer(minLength: 4)
+                    FooterButton(icon: g.paused ? "play.fill" : "pause.fill",
+                                 label: g.paused ? "Resume" : "Pause",
+                                 tint: g.paused ? P.green : P.dim) {
+                        onToggleGate(!g.paused)
+                    }
+                }
+                if g.paused {
+                    Text("Nothing is being checked, warned or stopped. "
+                         + "Costs ~4ms per command instead of ~57ms.")
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 8) {
+                    gateStat("\(g.allow)", "ran silently", P.green)
+                    gateStat("\(g.warn)", "warned, still ran", P.amber)
+                    gateStat("\(g.block)", "stopped",
+                             g.block > 0 ? P.red : P.faint)
+                }
+                Text(g.block == 0
+                     ? "Nothing has ever been stopped — the gate has not cost anyone a command."
+                     : "\(g.block) command(s) were refused and never ran.")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(g.block == 0 ? P.green : P.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("checked \(g.total) heavy command(s) over \(durS(g.spanS)) · "
+                     + "adds \(g.p50)ms typical, \(g.p95)ms p95 · "
+                     + "light commands never reach it (~6ms)")
+                    .font(.system(size: 9)).foregroundColor(P.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !g.healthy {
+                    Text("⚠ the gate errored \(g.error) time(s) and fell open")
+                        .font(.system(size: 9.5)).foregroundColor(P.amber)
+                }
+                if !g.sessions.isEmpty {
+                    Divider().overlay(P.stroke)
+                    ForEach(g.sessions) { gs in
+                        HStack(spacing: 6) {
+                            Text(gs.name).font(.system(size: 9.5))
+                                .foregroundColor(P.dim).lineLimit(1)
+                            Spacer(minLength: 4)
+                            // "checked" alone reads as "every Bash call", which
+                            // is ~0.7% of the truth — only heavy commands reach
+                            // the memory check at all.
+                            Text("\(gs.n) heavy commands checked")
+                                .font(.system(size: 9))
+                                .foregroundColor(P.faint)
+                                .lineLimit(1).fixedSize()
+                            if gs.warn > 0 {
+                                Text("\(gs.warn) warned").font(.system(size: 9))
+                                    .foregroundColor(P.amber)
+                            }
+                            if gs.block > 0 {
+                                Text("\(gs.block) stopped").font(.system(size: 9))
+                                    .foregroundColor(P.red)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func gateStat(_ value: String, _ label: String,
+                          _ tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).font(.system(size: 17, weight: .bold, design: .rounded))
+                .foregroundColor(tint)
+            Text(label).font(.system(size: 8)).foregroundColor(P.faint)
+                .lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6).padding(.horizontal, 8)
+        .background(RoundedRectangle(cornerRadius: 9).fill(P.card))
+    }
+
+    private var blockedCard: some View {
+        let clear = s.level == "HEALTHY" || s.level == "WATCH"
+        return Card(tint: (clear ? P.green : P.amber).opacity(0.45)) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: clear ? "arrow.clockwise.circle.fill"
+                                            : "pause.circle.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(clear ? P.green : P.amber)
+                    Text("\(s.blocked.count) blocked command\(s.blocked.count == 1 ? "" : "s")")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(clear ? P.green : P.amber)
+                    Spacer()
+                }
+                ForEach(s.blocked.suffix(3)) { b in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(b.cmd).font(.system(size: 9.5, design: .monospaced))
+                            .foregroundColor(P.dim).lineLimit(1)
+                        Text("\(b.session) · \(relative(b.ts))")
+                            .font(.system(size: 8.5)).foregroundColor(P.faint)
+                    }
+                }
+                Text(clear ? "Memory is clear — safe to re-run these now"
+                           : "Still under pressure — wait before re-running")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(clear ? P.green : P.amber)
+            }
+        }
+    }
+
+    private var orphanCard: some View {
+        Card(tint: P.red.opacity(0.45)) {
+            HStack(spacing: 8) {
+                Image(systemName: "trash.fill").font(.system(size: 11, weight: .bold))
+                    .foregroundColor(P.red)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(human(s.orphanTotal)) reclaimable")
+                        .font(.system(size: 11.5, weight: .bold)).foregroundColor(P.text)
+                    Text("\(s.orphanCount) orphaned build process\(s.orphanCount == 1 ? "" : "es")")
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                }
+                Spacer()
+                FooterButton(icon: "bolt.fill", label: "Reap", tint: P.red,
+                             action: onReap)
+            }
+        }
+    }
+
+    private func worktreeRow(_ wt: WT) -> some View {
+        let hot = wt.mem > 6 * GB
+        return HStack(spacing: 8) {
+            Circle().fill(hot ? P.red : P.violet).frame(width: 5, height: 5)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(wt.name).font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(P.text).lineLimit(1)
+                Text("\(wt.tag) · \(wt.procs)p"
+                     + (wt.orphans > 0 ? " · \(wt.orphans) orphaned" : ""))
+                    .font(.system(size: 8.5)).foregroundColor(P.faint)
+            }
+            Spacer(minLength: 4)
+            Text(human(wt.mem))
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(hot ? P.red : P.text)
+        }
+        .padding(.vertical, 6).padding(.horizontal, 11)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
+    }
+
+    private var footer: some View {
+        HStack(spacing: 7) {
+            FooterButton(icon: "arrow.clockwise", label: "Sync") { model.refresh() }
+            Spacer()
+            if let t = model.lastSync {
+                Text(relative(t.timeIntervalSince1970))
+                    .font(.system(size: 9)).foregroundColor(P.faint)
+            }
+            FooterButton(icon: "power", label: "Quit", action: onQuit)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+    }
+}
+
+// MARK: - app
+
+final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let popover = NSPopover()
+    let model = Model()
+    let cache = NSString(string: "~/.claude/memmon/latest.json").expandingTildeInPath
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        popover.contentSize = NSSize(width: 380, height: 620)
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(
+            rootView: ContentView(model: model,
+                                  onQuit: { NSApp.terminate(nil) },
+                                  onReap: { [weak self] in self?.reap() },
+                                  onEndSession: { [weak self] s in
+                                      self?.endSession(s) },
+                                  onToggleGate: { [weak self] pause in
+                                      self?.toggleGate(pause) }))
+
+        statusItem.button?.action = #selector(toggle)
+        statusItem.button?.target = self
+        updateTitleFromCache()
+        // Cheap: reads a ~1KB file the sampler already wrote. No process spawn.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.updateTitleFromCache()
+        }
+    }
+
+    @objc func toggle() {
+        if popover.isShown {
+            popover.performClose(nil)
+        } else if let b = statusItem.button {
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            model.refresh()          // sync on open — the only expensive work
+        }
+    }
+
+    func popoverDidClose(_ note: Notification) { updateTitleFromCache() }
+
+    /// Colour comes from the pressure model, not from swap usage: macOS grows
+    /// swap on demand, so a large swapfile on its own means nothing.
+    func updateTitleFromCache() {
+        guard let d = FileManager.default.contents(atPath: cache),
+              let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let used = j["swap_used"] as? Double else { return }
+        let level = j["pressure"] as? String ?? "HEALTHY"
+        let dot: String
+        switch level {
+        case "CRITICAL", "DANGER": dot = "🔴"
+        case "WATCH": dot = "🟠"
+        default: dot = "🟢"
+        }
+        statusItem.button?.attributedTitle = NSAttributedString(
+            string: "\(dot) \(human(used))",
+            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12,
+                                                                 weight: .regular)])
+    }
+
+    /// Ending a session destroys unsaved work in it, so the confirmation states
+    /// exactly what is being killed and is not the default button.
+    func endSession(_ s: Sess) {
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "End “\(s.name)”?"
+        a.informativeText = """
+            This terminates the session and all \(s.procs) of its processes \
+            (\(human(s.total))), including any build it started.
+
+            Anything it has not written to disk is lost. It is sent SIGTERM, so \
+            it will try to flush its transcript first.
+            """
+        a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "End session")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertSecondButtonReturn else { return }
+        model.run(["--end-session", "\(s.root)", "--apply"])
+        model.refresh()
+    }
+
+    /// No confirmation: pausing destroys nothing and is trivially reversible,
+    /// unlike reap and endSession.
+    func toggleGate(_ pause: Bool) {
+        model.run([pause ? "--off" : "--on"])
+        model.refresh()
+    }
+
+    func reap() {
+        let a = NSAlert()
+        a.messageText = "Reap orphaned build processes?"
+        a.informativeText = "Kills orphaned or stale build processes only. "
+            + "Claimed Claude sessions are never touched."
+        a.addButton(withTitle: "Reap")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        model.run(["--reap", "--apply"])
+        model.refresh()
+    }
+
+}
+
+// MARK: - offscreen render
+//
+// `MemmonBar --render out.png` draws the popover with representative data and
+// exits. The UI is otherwise unreviewable without screen-recording permission,
+// and a layout that only breaks under DANGER with blocked commands is exactly
+// the state you cannot reproduce on demand.
+
+let PREVIEW_PAUSED = CommandLine.arguments.contains("--paused")
+
+@MainActor
+func renderPreview(to path: String) {
+    let m = Model()
+    var s = Snap()
+    s.ramUsed = 15.1 * GB; s.ramTotal = 16 * GB
+    s.swapUsed = 19.4 * GB; s.swapTotal = 21 * GB
+    s.compressed = 6.6 * GB; s.free = 18; s.load = 24.1
+    s.level = "DANGER"
+    s.reasons = ["swap 1.2x RAM size", "heavy thrashing 180 MB/s", "load 24 on 8 cores"]
+    s.headroom = 6
+    s.score = 6
+    s.nextLevel = "CRITICAL"; s.toNext = 1
+    s.advice = "web-checkout is running tsc typecheck (21.7G across 12 "
+             + "processes). Let it finish before starting another build."
+    s.sessions = [
+        Sess(name: "api error handling", state: "working",
+             doing: "[agent] infra + flake audit",
+             total: 6.8 * GB, ram: 2.9 * GB, swap: 3.9 * GB, procs: 20,
+             subActive: 9, root: 52963,
+             children: [
+                Child(tag: "tsc typecheck", worktree: "web-checkout",
+                      mem: 3.5 * GB, pid: 99036, age: 1800),
+                Child(tag: "vitest", worktree: "", mem: 331 * MB, pid: 77908, age: 540),
+             ],
+             agents: [
+                Agent(kind: "infra-auditor", goal: "infra audit",
+                      active: true),
+                Agent(kind: "schema-auditor", goal: "schema audit",
+                      active: true),
+                Agent(kind: "Explore", goal: "adjacent callers", active: false),
+             ],
+             started: ["typecheck", "tests"]),
+        Sess(name: "docs sweep", state: "blocked",
+             doing: "waiting on the codegen step",
+             total: 1.4 * GB, ram: 1.0 * GB, swap: 0.4 * GB, procs: 7,
+             subActive: 0, root: 57020),
+        Sess(name: "checkout redesign", state: "done",
+             doing: "audit complete; 2 checks running",
+             total: 653 * MB, ram: 352 * MB, swap: 301 * MB, procs: 4,
+             subActive: 2, root: 17525),
+        Sess(name: "pr #412 review", state: "terminal",
+             doing: "reviewing the checkout diff",
+             total: 505 * MB, ram: 240 * MB, swap: 265 * MB, procs: 4,
+             subActive: 0, root: 57588),
+    ]
+    s.worktrees = [
+        WT(name: "web-checkout", tag: "tsc typecheck",
+           mem: 21.7 * GB, ram: 9.1 * GB, swap: 12.6 * GB, procs: 12, orphans: 2),
+        WT(name: "web-search", tag: "tsc typecheck",
+           mem: 12.0 * GB, ram: 5.2 * GB, swap: 6.8 * GB, procs: 7, orphans: 0),
+    ]
+    s.blocked = [
+        Blk(session: "docs sweep", cmd: "pnpm typecheck",
+            ts: Date().timeIntervalSince1970 - 400),
+        Blk(session: "search indexing", cmd: "turbo run build --filter dashboard",
+            ts: Date().timeIntervalSince1970 - 1200),
+    ]
+    s.orphanTotal = 3.6 * GB; s.orphanCount = 2
+    s.idleSpares = 2; s.idleSpareMem = 186 * MB
+    s.gate = GateStats(paused: PREVIEW_PAUSED, pausedUntil: PREVIEW_PAUSED ? Date().timeIntervalSince1970 + 7200 : nil,
+                       total: 48, allow: 30, warn: 18, block: 0, error: 0,
+                       healthy: true, spanS: 63720, p50: 80, p95: 145,
+                       sessions: [
+                        GateSess(name: "checkout redesign", n: 16, warn: 1, block: 0),
+                        GateSess(name: "docs sweep", n: 9, warn: 5, block: 0),
+                       ])
+    m.snap = s; m.loaded = true; m.lastSync = Date()
+
+    let view = ContentView(model: m, onQuit: {}, onReap: {},
+                           flattened: true, previewExpandAll: false, previewOpenGate: true,
+                           frameHeight: 1000)
+    let renderer = ImageRenderer(content: view)
+    renderer.scale = 2
+    guard let img = renderer.nsImage,
+          let tiff = img.tiffRepresentation,
+          let rep = NSBitmapImageRep(data: tiff),
+          let png = rep.representation(using: .png, properties: [:]) else {
+        FileHandle.standardError.write("render failed\n".data(using: .utf8)!)
+        exit(1)
+    }
+    try? png.write(to: URL(fileURLWithPath: path))
+    print("rendered \(path)")
+}
+
+if let i = CommandLine.arguments.firstIndex(of: "--render"),
+   i + 1 < CommandLine.arguments.count {
+    let out = CommandLine.arguments[i + 1]
+    _ = NSApplication.shared          // AppKit must exist for text rendering
+    MainActor.assumeIsolated { renderPreview(to: out) }
+    exit(0)
+}
+
+let app = NSApplication.shared
+let controller = Controller()
+app.delegate = controller
+app.run()

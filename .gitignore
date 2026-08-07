@@ -1,0 +1,14 @@
+# build output
+MemmonBar
+MemmonBar.app/
+*.o
+*.dSYM/
+
+# runtime state lives in ~/.claude/memmon, never in the repo — but guard anyway
+*.jsonl
+latest.json
+blocked.json
+config.json
+sampler.err
+
+.DS_Store
