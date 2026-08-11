@@ -1859,11 +1859,12 @@ def _read_gate_rows(limit: int | None = 400) -> list[dict]:
     return out
 
 
-def gate_stats(limit: int | None = 400) -> dict:
+def gate_stats(limit: int | None = None) -> dict:
     """Summary of what the gate has actually done, for display in the UI.
 
-    Cheap: gate.jsonl is capped at 500 rows, and only heavy commands are ever
-    written to it."""
+    Reads the whole log rather than a fixed window: the file is already bounded
+    by _trim_lines, and a fixed window made the headline count freeze at exactly
+    the window size, which reads as a stalled tool rather than a capped view."""
     rows = _read_gate_rows(limit)
     if not rows:
         return {"total": 0}
