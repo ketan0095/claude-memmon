@@ -872,6 +872,30 @@ def map_pids_to_jobs() -> dict[int, str]:
     return mapping
 
 
+CONDUCTOR_CLAUDE_RE = re.compile(r"com\.conductor\.app/agent-binaries/claude/")
+
+
+def pid_cwds(pids: list[int]) -> dict[int, str]:
+    """pid -> working directory, via lsof. macOS ps truncates another
+    process's argv, so a Conductor session's --session-id is never visible;
+    its cwd is the only thing that names the worktree."""
+    if not pids:
+        return {}
+    out = _sh(["lsof", "-a", "-p", ",".join(map(str, pids)), "-d", "cwd", "-Fpn"],
+              timeout=20)
+    cwds: dict[int, str] = {}
+    pid = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pid = None
+        elif line.startswith("n") and pid:
+            cwds[pid] = line[1:]
+    return cwds
+
+
 def spare_is_idle(cmd: str) -> bool:
     """A prewarm process advertises itself on a .claim.sock. Once a session
     claims it the socket is removed, so a missing socket means this process is
@@ -937,6 +961,12 @@ def tag_for(cmd: str) -> str:
         if "bg-pty-host" in cmd:
             return "claude pty host"
         return "claude"
+    if "com.conductor.app" in cmd or "Conductor.app" in cmd:
+        if "agent-binaries/claude" in cmd:
+            return "claude"
+        if "conductor-runtime" in cmd:
+            return "conductor sidecar"
+        return "Conductor"
     if "typescript/bin/tsc" in cmd:
         return "tsc typecheck"
     if "turbo" in cmd and "run" in cmd:
@@ -1056,6 +1086,43 @@ def collect() -> dict:
             "intent": meta.get("last_prompt", ""),
         }
 
+    # Conductor-hosted sessions never write a job state file and their argv is
+    # truncated by ps, so neither path above finds them. The binary path prefix
+    # is visible, and lsof gives the cwd, which names the worktree. Transcripts
+    # are matched through the projects dir that mirrors that cwd.
+    seen_roots = set(sid_to_pid.values()) | set(short_to_pid.values())
+    conductor_roots = [pid for pid, info in ps.items()
+                       if CONDUCTOR_CLAUDE_RE.search(info["cmd"])
+                       and pid not in seen_roots]
+    cond_cwds = pid_cwds(conductor_roots)
+    by_proj: dict[str, list[str]] = defaultdict(list)
+    for tp_path in transcripts.values():
+        by_proj[os.path.basename(os.path.dirname(tp_path))].append(tp_path)
+    for paths in by_proj.values():
+        paths.sort(key=os.path.getmtime, reverse=True)
+    taken: set[str] = set()
+    for root in sorted(conductor_roots, key=lambda p: ps[p]["age"]):
+        cwd = cond_cwds.get(root, "")
+        proj = cwd.replace("/", "-").replace(".", "-")
+        tp = next((p for p in by_proj.get(proj, []) if p not in taken), None)
+        sid = os.path.basename(tp)[:-6] if tp else ""
+        if tp:
+            taken.add(tp)
+        if sid and sid in by_sid:
+            by_sid[sid].setdefault("root_pid", root)
+            continue
+        meta = read_transcript(tp) if tp else {}
+        fallback = f"pid{root}"
+        by_sid[sid or fallback] = {
+            "short": sid[:8] if sid else fallback,
+            "state": "conductor", "origin": "conductor",
+            "name": os.path.basename(cwd.rstrip("/")) or fallback,
+            "doing": meta.get("last_prompt", ""), "cwd": cwd,
+            "session_id": sid, "updated": meta.get("mtime", 0),
+            "intent": meta.get("last_prompt", ""),
+            "root_pid": root,
+        }
+
     # Which session most recently ran a command that starts each service.
     service_owner: dict[str, dict] = {}
     for sid, s in by_sid.items():
@@ -1078,7 +1145,8 @@ def collect() -> dict:
     claimed: set[int] = set()
     live_sessions = []
     for s in sessions:
-        root = short_to_pid.get(s.get("short")) or sid_to_pid.get(s["session_id"])
+        root = (s.get("root_pid") or short_to_pid.get(s.get("short"))
+                or sid_to_pid.get(s["session_id"]))
         if root is None:
             s["alive"] = False
             s["mem"] = s["cmprs"] = s["nproc"] = 0
