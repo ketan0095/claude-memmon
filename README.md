@@ -52,9 +52,12 @@ was missing before — **why**: which rule matched (`Built-in rule: vitest`,
 was doing at that moment. So a stop reads as `Built-in rule: pnpm … typecheck +
 CRITICAL memory → stopped` rather than as an unexplained number.
 
-Stopped commands stay listed until they are safe to re-run, so nothing is
-silently lost. Events recorded before rules were tracked say so plainly rather
-than being re-explained with today's rules.
+Anything still waiting to be re-run is listed in full and never collapsed —
+that is work that did not happen, and it should not take a click to find.
+Stops that have already been retried are history, so only the three most recent
+show, behind a "show all" toggle; warnings work the same way. Events recorded
+before rules were tracked say so plainly rather than being re-explained with
+today's rules.
 
 **RAM and Swap tiles** — RAM is what is in memory; Swap is what has been written
 to disk. Swap is measured against *RAM size* (`1.21x`), not against the swapfile,

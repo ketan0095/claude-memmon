@@ -913,6 +913,7 @@ struct ContentView: View {
     // popover open, which is the opposite of what those tiles are for.
     @State var openMatchRules = false
     @State var showAllWarnings = false
+    @State var showAllStops = false
     @State var expandedSessions: Set<String> = []
 
     private var s: Snap { model.snap }
@@ -1115,14 +1116,19 @@ struct ContentView: View {
     private var recentWarnings: [GateEvent] {
         s.gate.events.filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
     }
-    private var stoppedEvents: [GateEvent] {
-        let stopped = s.gate.events.filter { $0.action == "block" }
-        return stopped.sorted {
-            if ($0.retryStatus == "waiting") != ($1.retryStatus == "waiting") {
-                return $0.retryStatus == "waiting"
-            }
-            return $0.ts > $1.ts
-        }
+    // Stops split by whether they still represent unfinished work. A command
+    // that never ran and is still waiting is the one thing here nobody should
+    // have to expand a disclosure to find, so those are always listed in full.
+    // Everything else is history and is capped like the warnings are — an
+    // uncapped list grew with the log and pushed the rest of the popover down
+    // for no benefit, since an already-retried stop is not actionable.
+    private var pendingStops: [GateEvent] {
+        s.gate.events.filter { $0.action == "block" && $0.retryStatus == "waiting" }
+            .sorted { $0.ts > $1.ts }
+    }
+    private var resolvedStops: [GateEvent] {
+        s.gate.events.filter { $0.action == "block" && $0.retryStatus != "waiting" }
+            .sorted { $0.ts > $1.ts }
     }
 
     private var policyCopy: String {
@@ -1308,11 +1314,29 @@ struct ContentView: View {
                     s.level == "HEALTHY" || s.gate.paused ? P.green : P.amber)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            ForEach(stoppedEvents) { GateEventCard(event: $0) }
+            // Unfinished work first, never truncated.
+            ForEach(pendingStops) { GateEventCard(event: $0) }
             ForEach(s.gate.pending.filter { !$0.eventRetained }) {
                 MissingGateEventCard(item: $0)
             }
-            if stoppedEvents.isEmpty && s.gate.pending.isEmpty {
+            if showAllStops {
+                LazyVStack(spacing: 7) {
+                    ForEach(resolvedStops) { GateEventCard(event: $0) }
+                }
+            } else {
+                ForEach(Array(resolvedStops.prefix(3))) { GateEventCard(event: $0) }
+            }
+            if resolvedStops.count > 3 {
+                Button(showAllStops
+                       ? "Show only 3 recent stops"
+                       : "Show all \(resolvedStops.count) earlier stops") {
+                    withAnimation(.easeInOut(duration: 0.16)) { showAllStops.toggle() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundColor(P.red)
+            }
+            if pendingStops.isEmpty && resolvedStops.isEmpty && s.gate.pending.isEmpty {
                 Text("No commands have been stopped since \(retainedDate(s.gate.since)).")
                     .font(.system(size: 9)).foregroundColor(P.faint)
             }
@@ -1602,6 +1626,34 @@ func renderPreview(to path: String) {
                       shape: "docker compose build", samples: nil, observedPeak: nil,
                       blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
                   reasons: ["swap growing 1330 MB/min"], retryStatus: "not_waiting", ms: 71),
+        // Four resolved stops so the preview exercises the overflow control;
+        // with three or fewer it never renders and the path goes unreviewed.
+        GateEvent(ts: now - 96000, action: "block", mode: "block-critical",
+                  sessionID: "8ed32708", sessionName: "search indexing",
+                  commandRaw: "npx vitest run --coverage",
+                  commandDisplay: "npx vitest run --coverage",
+                  classification: GateClassification(source: "builtin", rule: "vitest",
+                      shape: "vitest run", samples: nil, observedPeak: nil,
+                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
+                  reasons: ["swap 39% of RAM size", "paging 138 MB/s"],
+                  retryStatus: "not_waiting", ms: 69),
+        GateEvent(ts: now - 180000, action: "block", mode: "block-critical",
+                  sessionID: "dd187cea", sessionName: "checkout redesign",
+                  commandRaw: "pnpm install --frozen-lockfile",
+                  commandDisplay: "pnpm install --frozen-lockfile",
+                  classification: GateClassification(source: "builtin", rule: "pnpm … install",
+                      shape: "pnpm install", samples: nil, observedPeak: nil,
+                      blockEligible: true), legacy: false, level: "CRITICAL", score: 9,
+                  reasons: ["heavy thrashing 301 MB/s", "load 44 on 8 cores"],
+                  retryStatus: "not_waiting", ms: 81),
+        GateEvent(ts: now - 250000, action: "block", mode: "block-critical",
+                  sessionID: "70c9a8bb", sessionName: nil,
+                  commandRaw: "turbo run build", commandDisplay: "turbo run build",
+                  classification: GateClassification(source: "builtin", rule: "turbo … build",
+                      shape: "turbo build", samples: nil, observedPeak: nil,
+                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
+                  reasons: ["swap 44% of RAM size", "paging 85 MB/s"],
+                  retryStatus: "not_waiting", ms: 66),
         GateEvent(ts: now - 900, action: "warn", mode: "block-critical",
                   sessionID: "8d63269a", sessionName: "api error handling",
                   commandRaw: "~/.claude/skills/codex/scripts/codex.sh run ABC-4573",
@@ -1634,7 +1686,9 @@ func renderPreview(to path: String) {
                        mode: "block-critical", since: now - 3 * 86400,
                        historyFrom: now - 3 * 86400, historyTo: now - 900,
                        complete: false, truncated: true, evaluated: 525,
-                       warned: 54, stopped: 3, errors: 0, events: events,
+                       // Must equal the number of block events below, or the
+                       // preview shows a header count contradicting its own list.
+                       warned: 54, stopped: 6, errors: 0, events: events,
                        pending: [
                         PendingRetry(ts: now - 3800, sessionID: "829922b2",
                                      sessionName: nil,
