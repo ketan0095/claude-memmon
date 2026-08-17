@@ -39,6 +39,8 @@ done
 # builds used different labels; matching on the plist CONTENTS rather than a
 # hardcoded list means an upgrade never leaves a second sampler running against
 # the same history file, and needs no list to be kept up to date.
+# Runs before the uninstall branch on purpose, so `--uninstall` also sweeps
+# agents left behind by an earlier label.
 if [[ -d "$AGENTS" ]]; then
   for PL in "$AGENTS"/*.plist; do
     [[ -e "$PL" ]] || continue

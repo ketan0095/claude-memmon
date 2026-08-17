@@ -35,7 +35,23 @@ func relative(_ ts: Double) -> String {
     let s = Int(Date().timeIntervalSince1970 - ts)
     if s < 60 { return "\(s)s ago" }
     if s < 3600 { return "\(s / 60)m ago" }
-    return "\(s / 3600)h ago"
+    if s < 86400 { return "\(s / 3600)h ago" }
+    return "\(s / 86400)d ago"
+}
+
+func eventTime(_ ts: Double) -> String {
+    let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: ts))
+}
+
+func retainedDate(_ ts: Double, includeTime: Bool = false) -> String {
+    let f = DateFormatter(); f.dateFormat = includeTime ? "d MMM, HH:mm" : "d MMM"
+    return f.string(from: Date(timeIntervalSince1970: ts))
+}
+
+func eventClock(_ ts: Double) -> String {
+    let f = DateFormatter(); f.dateFormat = "HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: ts))
 }
 
 // MARK: - palette
@@ -131,9 +147,30 @@ struct WT: Identifiable {
     var procs: Int, orphans: Int
 }
 
-struct Blk: Identifiable {
+struct GateClassification {
+    var source: String, rule: String, shape: String
+    var samples: Int?
+    var observedPeak: Double?
+    var blockEligible: Bool
+}
+
+struct GateEvent: Identifiable {
     let id = UUID()
-    var session: String, cmd: String, ts: Double
+    var ts: Double, action: String, mode: String
+    var sessionID: String, sessionName: String?
+    var commandRaw: String, commandDisplay: String
+    var classification: GateClassification?
+    var legacy: Bool
+    var level: String, score: Int?, reasons: [String]
+    var retryStatus: String
+    var ms: Int
+}
+
+struct PendingRetry: Identifiable {
+    let id = UUID()
+    var ts: Double, sessionID: String, sessionName: String?
+    var commandRaw: String, commandDisplay: String, pressureLevel: String
+    var eventRetained: Bool
 }
 
 struct App: Identifiable {
@@ -143,19 +180,16 @@ struct App: Identifiable {
     var procs: Int
 }
 
-struct GateSess: Identifiable {
-    let id = UUID()
-    var name: String
-    var n: Int, warn: Int, block: Int
-}
-
 struct GateStats {
+    var installed = false
     var paused = false
     var pausedUntil: Double? = nil
-    var total = 0, allow = 0, warn = 0, block = 0, error = 0
-    var healthy = true
-    var spanS = 0, p50 = 0, p95 = 0
-    var sessions: [GateSess] = []
+    var mode = "block-critical"
+    var since = 0.0, historyFrom = 0.0, historyTo: Double? = nil
+    var complete = false, truncated = false
+    var evaluated = 0, warned = 0, stopped = 0, errors = 0
+    var events: [GateEvent] = []
+    var pending: [PendingRetry] = []
 }
 
 struct Snap {
@@ -164,7 +198,7 @@ struct Snap {
     var level = "HEALTHY", reasons: [String] = [], headroom: Double? = nil
     var score = 0
     var advice = "", nextLevel: String? = nil, toNext: Int? = nil
-    var sessions: [Sess] = [], worktrees: [WT] = [], blocked: [Blk] = []
+    var sessions: [Sess] = [], worktrees: [WT] = []
     var orphanTotal = 0.0, orphanCount = 0
     var idleSpares = 0, idleSpareMem = 0.0
     var apps: [App] = []
@@ -213,6 +247,12 @@ final class Model: ObservableObject {
     }
 
     static func decode(_ j: [String: Any]) -> Snap {
+        func number(_ value: Any?) -> Double {
+            (value as? NSNumber)?.doubleValue ?? 0
+        }
+        func integer(_ value: Any?) -> Int {
+            (value as? NSNumber)?.intValue ?? 0
+        }
         var s = Snap()
         if let vm = j["vm"] as? [String: Any] {
             s.ramUsed = vm["ram_used"] as? Double ?? 0
@@ -280,11 +320,6 @@ final class Model: ObservableObject {
                procs: d["n"] as? Int ?? 0,
                orphans: d["orphans"] as? Int ?? 0)
         }
-        s.blocked = (j["blocked"] as? [[String: Any]] ?? []).map { d in
-            Blk(session: d["session"] as? String ?? "?",
-                cmd: d["cmd"] as? String ?? "",
-                ts: d["ts"] as? Double ?? 0)
-        }
         s.orphanTotal = j["orphan_total"] as? Double ?? 0
         s.orphanCount = (j["orphans"] as? [[String: Any]])?.count ?? 0
         // Non-Claude memory feeds the verdict, so it has to be visible. A
@@ -296,22 +331,71 @@ final class Model: ObservableObject {
                        procs: d["n"] as? Int ?? 0)
         }.sorted { $0.mem > $1.mem }
         if let g = j["gate"] as? [String: Any] {
+            s.gate.installed = g["installed"] as? Bool ?? false
             s.gate.paused = g["paused"] as? Bool ?? false
-            s.gate.pausedUntil = g["paused_until"] as? Double
-            s.gate.total = g["total"] as? Int ?? 0
-            s.gate.allow = g["allow"] as? Int ?? 0
-            s.gate.warn = g["warn"] as? Int ?? 0
-            s.gate.block = g["block"] as? Int ?? 0
-            s.gate.error = g["error"] as? Int ?? 0
-            s.gate.healthy = g["healthy"] as? Bool ?? true
-            s.gate.spanS = g["span_s"] as? Int ?? 0
-            s.gate.p50 = g["p50_ms"] as? Int ?? 0
-            s.gate.p95 = g["p95_ms"] as? Int ?? 0
-            s.gate.sessions = (g["sessions"] as? [[String: Any]] ?? []).map {
-                GateSess(name: $0["name"] as? String ?? "?",
-                         n: $0["n"] as? Int ?? 0,
-                         warn: $0["warn"] as? Int ?? 0,
-                         block: $0["block"] as? Int ?? 0)
+            if let until = g["paused_until"], !(until is NSNull) {
+                s.gate.pausedUntil = number(until)
+            }
+            if let policy = g["policy"] as? [String: Any] {
+                s.gate.mode = policy["mode"] as? String ?? "block-critical"
+            }
+            if let counts = g["counts"] as? [String: Any] {
+                s.gate.since = number(counts["since"])
+                s.gate.complete = counts["complete"] as? Bool ?? false
+                s.gate.evaluated = integer(counts["evaluated"])
+                s.gate.warned = integer(counts["warned"])
+                s.gate.stopped = integer(counts["stopped"])
+                s.gate.errors = integer(counts["errors"])
+            }
+            if let history = g["history"] as? [String: Any] {
+                s.gate.historyFrom = number(history["from"])
+                if let to = history["to"], !(to is NSNull) {
+                    s.gate.historyTo = number(to)
+                }
+                s.gate.truncated = history["truncated"] as? Bool ?? false
+                s.gate.events = (history["events"] as? [[String: Any]] ?? []).map { d in
+                    let session = d["session"] as? [String: Any] ?? [:]
+                    let command = d["command"] as? [String: Any] ?? [:]
+                    let pressure = d["pressure"] as? [String: Any] ?? [:]
+                    var match: GateClassification?
+                    if let c = d["classification"] as? [String: Any] {
+                        match = GateClassification(
+                            source: c["source"] as? String ?? "none",
+                            rule: c["rule"] as? String ?? "",
+                            shape: c["shape"] as? String ?? "",
+                            samples: c["samples"] is NSNull ? nil : integer(c["samples"]),
+                            observedPeak: c["observed_peak_bytes"] is NSNull
+                                ? nil : number(c["observed_peak_bytes"]),
+                            blockEligible: c["block_eligible"] as? Bool ?? false)
+                    }
+                    return GateEvent(
+                        ts: number(d["ts"]),
+                        action: d["action"] as? String ?? "warn",
+                        mode: d["mode"] as? String ?? "block-critical",
+                        sessionID: session["id"] as? String ?? "",
+                        sessionName: session["name"] as? String,
+                        commandRaw: command["raw"] as? String ?? "",
+                        commandDisplay: command["display"] as? String ?? "",
+                        classification: match,
+                        legacy: (d["legacy"] as? Bool) ?? (match == nil),
+                        level: pressure["level"] as? String ?? "?",
+                        score: pressure["score"] is NSNull ? nil : integer(pressure["score"]),
+                        reasons: pressure["reasons"] as? [String] ?? [],
+                        retryStatus: d["retry_status"] as? String ?? "not_waiting",
+                        ms: integer(d["ms"]))
+                }
+            }
+            s.gate.pending = (g["pending_retry"] as? [[String: Any]] ?? []).map { d in
+                let session = d["session"] as? [String: Any] ?? [:]
+                let command = d["command"] as? [String: Any] ?? [:]
+                return PendingRetry(
+                    ts: number(d["ts"]),
+                    sessionID: session["id"] as? String ?? "",
+                    sessionName: session["name"] as? String,
+                    commandRaw: command["raw"] as? String ?? "",
+                    commandDisplay: command["display"] as? String ?? "",
+                    pressureLevel: d["pressure_level"] as? String ?? "?",
+                    eventRetained: d["event_retained"] as? Bool ?? false)
             }
         }
         if let ov = j["overhead"] as? [String: Any] {
@@ -344,6 +428,7 @@ struct Badge: View {
             .font(.system(size: 9, weight: .heavy, design: .rounded))
             .tracking(0.4)
             .foregroundColor(color)
+            .lineLimit(1).minimumScaleFactor(0.72)
             .padding(.horizontal, 7).padding(.vertical, 3)
             .background(Capsule().fill(color.opacity(0.16)))
     }
@@ -658,6 +743,149 @@ struct FooterButton: View {
     }
 }
 
+struct DecisionRow: View {
+    var level: String, result: String
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(level)
+                .font(.system(size: 8.5, weight: .heavy, design: .rounded))
+                .foregroundColor(P.tint(level)).frame(width: 66, alignment: .leading)
+            Text(result).font(.system(size: 9.5)).foregroundColor(P.dim)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+struct GateEventCard: View {
+    var event: GateEvent
+    @State private var expanded = false
+
+    private var stopped: Bool { event.action == "block" }
+    private var tint: Color { stopped ? P.red : P.amber }
+    private var sessionLabel: String {
+        event.sessionName ?? (event.sessionID.isEmpty ? "Unknown session" : event.sessionID)
+    }
+    private var matchLabel: String {
+        guard let c = event.classification else { return "Rule match not recorded" }
+        if c.source == "learned" {
+            let observed = c.samples.map { " · \($0) observations" } ?? ""
+            return "Learned rule: \(c.rule)\(observed) · warning only"
+        }
+        return "Built-in rule: \(c.rule)"
+    }
+    private var fullMatchLabel: String {
+        guard event.classification != nil else {
+            return "Not recorded — this event predates rule tracking"
+        }
+        return matchLabel
+    }
+    private var outcome: String {
+        if stopped {
+            return "Stopped before running · "
+                + (event.retryStatus == "waiting" ? "waiting to retry" : "not waiting to retry")
+        }
+        return "Warning added to the session’s context; command ran"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: expanded ? 8 : 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text(stopped ? "■" : "▲")
+                    .font(.system(size: 8, weight: .black)).foregroundColor(tint)
+                Text(stopped ? "STOPPED · COMMAND DID NOT RUN" : "WARNED · COMMAND RAN")
+                    .font(.system(size: 8.5, weight: .heavy, design: .rounded))
+                    .tracking(0.25).foregroundColor(tint)
+                Spacer(minLength: 4)
+                Text(eventTime(event.ts)).font(.system(size: 8.5)).foregroundColor(P.faint)
+            }
+
+            Text(event.commandDisplay)
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundColor(P.text)
+                .lineLimit(expanded ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+
+            if expanded {
+                eventDetail("Session", sessionLabel)
+                eventDetail("Command match", fullMatchLabel)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Memory at \(eventClock(event.ts))")
+                        .font(.system(size: 8, weight: .heavy)).foregroundColor(P.faint)
+                    Text(event.level)
+                        .font(.system(size: 9.5, weight: .heavy, design: .rounded))
+                        .foregroundColor(P.tint(event.level))
+                    ForEach(Array(event.reasons.enumerated()), id: \.offset) { _, reason in
+                        Text(reason).font(.system(size: 9.5)).foregroundColor(P.dim)
+                    }
+                }
+                eventDetail("Outcome", outcome)
+            } else {
+                Text("Session \(sessionLabel) · \(relative(event.ts))")
+                    .font(.system(size: 8.5)).foregroundColor(P.faint).lineLimit(1)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text("\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
+                        .font(.system(size: 8.5)).foregroundColor(P.dim)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 2)
+                    Chevron(open: false)
+                }
+                if stopped && event.retryStatus == "waiting" {
+                    Text("WAITING TO RETRY")
+                        .font(.system(size: 8, weight: .heavy, design: .rounded))
+                        .foregroundColor(P.red)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(P.red.opacity(0.14)))
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(0.62), lineWidth: 1))
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } }
+    }
+
+    private func eventDetail(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.system(size: 8, weight: .heavy)).foregroundColor(P.faint)
+            Text(value).font(.system(size: 9.5)).foregroundColor(P.dim)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct MissingGateEventCard: View {
+    var item: PendingRetry
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Text("■").font(.system(size: 8, weight: .black)).foregroundColor(P.red)
+                Text("STOPPED · COMMAND DID NOT RUN")
+                    .font(.system(size: 8.5, weight: .heavy, design: .rounded))
+                    .foregroundColor(P.red)
+                Spacer()
+                Text(eventTime(item.ts)).font(.system(size: 8.5)).foregroundColor(P.faint)
+            }
+            Text(item.commandDisplay)
+                .font(.system(size: 9.5, design: .monospaced)).foregroundColor(P.text)
+                .lineLimit(2).textSelection(.enabled)
+            Text("Session \(item.sessionName ?? item.sessionID) · \(relative(item.ts))")
+                .font(.system(size: 8.5)).foregroundColor(P.faint)
+            Text("Stopped earlier · event details are no longer retained")
+                .font(.system(size: 8.5)).foregroundColor(P.dim)
+            Text("WAITING TO RETRY")
+                .font(.system(size: 8, weight: .heavy, design: .rounded))
+                .foregroundColor(P.red)
+        }
+        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+    }
+}
+
 // MARK: - main view
 
 struct ContentView: View {
@@ -679,7 +907,12 @@ struct ContentView: View {
     @State var openWorktrees = false
     @State var openPool = false
     @State var openApps = false
-    @State var openGate = false
+    @State var openGate = true
+    // Reference material, not status: you read the rule list once and then know
+    // it. Left open it re-imposed ~150pt above the RAM/Swap tiles on every
+    // popover open, which is the opposite of what those tiles are for.
+    @State var openMatchRules = false
+    @State var showAllWarnings = false
     @State var expandedSessions: Set<String> = []
 
     private var s: Snap { model.snap }
@@ -729,7 +962,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("memmon").font(.system(size: 14, weight: .bold))
                     .foregroundColor(P.text)
-                Text("Memory Monitor").font(.system(size: 9.5))
+                Text("Memory & command protection").font(.system(size: 9.5))
                     .foregroundColor(P.faint)
             }
             Spacer()
@@ -749,6 +982,7 @@ struct ContentView: View {
     private var body_: some View {
         VStack(alignment: .leading, spacing: 11) {
             verdict
+            gateSection
             HStack(spacing: 10) {
                 StatTile(icon: "cpu.fill", label: "RAM",
                          value: String(format: "%.0f", s.ramUsed / s.ramTotal * 100),
@@ -763,8 +997,6 @@ struct ContentView: View {
                          tint: s.swapUsed > s.ramTotal ? P.red : P.swap,
                          badge: s.swapUsed > s.ramTotal ? "over" : nil)
             }
-            if s.gate.total > 0 { gateSection }
-            if !s.blocked.isEmpty { blockedCard }
             if s.orphanTotal > 0 { orphanCard }
 
             if !s.sessions.isEmpty {
@@ -852,19 +1084,18 @@ struct ContentView: View {
                     Image(systemName: s.level == "HEALTHY"
                           ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 11, weight: .bold)).foregroundColor(tint)
-                    Text(s.level).font(.system(size: 12, weight: .heavy, design: .rounded))
+                    Text("MEMORY NOW · \(s.level)")
+                        .font(.system(size: 12, weight: .heavy, design: .rounded))
                         .foregroundColor(tint)
+                        .lineLimit(1).minimumScaleFactor(0.75)
                     Spacer()
                     // Only once something is actually wrong. A red "~19 min left"
                     // sitting on a green HEALTHY card contradicts itself, and the
                     // projection is too noisy to be worth alarming about while
                     // the machine is fine.
                     if let h = s.headroom, h < 120, s.level != "HEALTHY" {
-                        Badge(text: String(format: "~%.0f min left", h), color: P.red)
-                    } else if let n = s.nextLevel, let t = s.toNext {
-                        Text("\(t) pt → \(n)")
-                            .font(.system(size: 9, weight: .medium, design: .rounded))
-                            .foregroundColor(P.faint)
+                        Badge(text: String(format: "~%.0f min to low headroom", h),
+                              color: P.red)
                     }
                 }
                 LevelTrack(score: s.score, level: s.level)
@@ -872,7 +1103,7 @@ struct ContentView: View {
                 Text(s.advice).font(.system(size: 10)).foregroundColor(P.dim)
                     .fixedSize(horizontal: false, vertical: true)
                 if !s.reasons.isEmpty {
-                    Text("because: " + s.reasons.joined(separator: " · "))
+                    Text("Memory signals now: " + s.reasons.joined(separator: " · "))
                         .font(.system(size: 9)).foregroundColor(P.faint)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -881,88 +1112,178 @@ struct ContentView: View {
     }
 
 
-    /// What the gate has done to your sessions. Deliberately avoids the words
-    /// "evaluated / advised / allowed" — the distinction that matters is whether
-    /// a command was stopped, and only one of those three ever stops anything.
+    private var recentWarnings: [GateEvent] {
+        s.gate.events.filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
+    }
+    private var stoppedEvents: [GateEvent] {
+        let stopped = s.gate.events.filter { $0.action == "block" }
+        return stopped.sorted {
+            if ($0.retryStatus == "waiting") != ($1.retryStatus == "waiting") {
+                return $0.retryStatus == "waiting"
+            }
+            return $0.ts > $1.ts
+        }
+    }
+
+    private var policyCopy: String {
+        if s.gate.paused {
+            return "Command protection is paused. Every command runs without a memory check. History below is unchanged."
+        }
+        switch s.gate.mode {
+        case "block":
+            return "Current policy: WATCH warns; DANGER or CRITICAL stops before running."
+        case "warn":
+            return "Current policy: WATCH, DANGER, or CRITICAL warns; commands are never stopped."
+        default:
+            return "Current policy: WATCH or DANGER warns; CRITICAL stops before running."
+        }
+    }
+
+    private func policyResult(_ level: String) -> String {
+        if s.gate.paused { return "runs without a memory check" }
+        if level == "HEALTHY" { return "runs silently" }
+        if s.gate.mode == "warn" { return "warned; command ran" }
+        if s.gate.mode == "block" && (level == "DANGER" || level == "CRITICAL") {
+            return "stopped before running"
+        }
+        if s.gate.mode == "block-critical" && level == "CRITICAL" {
+            return "stopped before running"
+        }
+        return "warned; command ran"
+    }
+
+    private var retryCopy: String {
+        if s.gate.paused {
+            return "Protection is paused; retrying now will run without a memory check."
+        }
+        if s.level == "HEALTHY" {
+            return "Memory is HEALTHY now — waiting commands can be retried."
+        }
+        let stops = (s.level == "CRITICAL" && s.gate.mode != "warn")
+            || (s.level == "DANGER" && s.gate.mode == "block")
+        return stops
+            ? "If memory stays \(s.level), a retry will be stopped again."
+            : "If memory stays \(s.level), a retry will be warned and will run."
+    }
+
     private var gateSection: some View {
         let g = s.gate
-        return Section(title: "Session gate", count: g.total,
-                       tint: g.paused ? P.amber
-                             : (g.block > 0 ? P.red : (g.healthy ? P.dim : P.amber)),
-                       open: Binding(get: { previewOpenGate || openGate },
-                                    set: { openGate = $0 })) {
-            VStack(alignment: .leading, spacing: 8) {
-                // State first, and the control next to it: whether the gate is
-                // running at all outranks any statistic below.
-                HStack(spacing: 7) {
-                    Circle().fill(g.paused ? P.amber : P.green)
-                        .frame(width: 6, height: 6)
-                    Text(g.paused ? "Paused" : "Active")
-                        .font(.system(size: 11, weight: .semibold))
+        let isOpen = previewOpenGate || openGate
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 5) {
+                Button { withAnimation(.easeInOut(duration: 0.16)) { openGate.toggle() } } label: {
+                    HStack(spacing: 5) {
+                        Chevron(open: isOpen)
+                        Text("COMMAND WARNINGS & STOPS")
+                            .font(.system(size: 8.2, weight: .heavy, design: .rounded))
+                            .tracking(0.45).foregroundColor(P.dim)
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                Spacer(minLength: 3)
+                if g.installed {
+                    Circle().fill(g.paused ? P.amber : P.green).frame(width: 6, height: 6)
+                    Text(g.paused ? "PAUSED" : "ACTIVE")
+                        .font(.system(size: 8.5, weight: .heavy, design: .rounded))
                         .foregroundColor(g.paused ? P.amber : P.green)
-                    if g.paused, let u = g.pausedUntil {
-                        Text("· resumes \(clockOf(u))")
-                            .font(.system(size: 9)).foregroundColor(P.faint)
-                    } else if g.paused {
-                        Text("· until you resume it")
-                            .font(.system(size: 9)).foregroundColor(P.faint)
-                    }
-                    Spacer(minLength: 4)
                     FooterButton(icon: g.paused ? "play.fill" : "pause.fill",
                                  label: g.paused ? "Resume" : "Pause",
                                  tint: g.paused ? P.green : P.dim) {
                         onToggleGate(!g.paused)
                     }
+                    .help(g.paused ? "Resume command warnings and stops"
+                                   : "Pause command warnings and stops")
                 }
-                if g.paused {
-                    Text("Nothing is being checked, warned or stopped. "
-                         + "Costs ~4ms per command instead of ~57ms.")
+            }
+
+            if !isOpen {
+                if !g.installed {
+                    Text("Command protection is not installed")
                         .font(.system(size: 9)).foregroundColor(P.faint)
+                } else if g.paused {
+                    Text("Every command currently runs without a memory check")
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                } else {
+                    Text("Retained since \(retainedDate(g.since)) · \(g.warned) warned and ran · \(g.stopped) stopped")
+                        .font(.system(size: 9)).foregroundColor(P.faint)
+                    if !g.complete {
+                        Text("Older activity may be missing")
+                            .font(.system(size: 8.5)).foregroundColor(P.faint)
+                    }
+                }
+            } else if !g.installed {
+                Text("Command protection is not installed. Memory monitoring is active; commands are never warned or stopped.")
+                    .font(.system(size: 9.5)).foregroundColor(P.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 9) {
+                    if g.paused {
+                        Text(policyCopy).font(.system(size: 9.5)).foregroundColor(P.amber)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Only commands that match a memory-intensive rule are checked.")
+                            .font(.system(size: 9.5)).foregroundColor(P.dim)
+                        Text(policyCopy).font(.system(size: 9.5, weight: .medium))
+                            .foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Text("MATCHED COMMAND + MEMORY THEN → RESULT")
+                        .font(.system(size: 8, weight: .heavy, design: .rounded))
+                        .tracking(0.45).foregroundColor(P.faint)
+                    VStack(spacing: 3) {
+                        DecisionRow(level: "HEALTHY", result: policyResult("HEALTHY"))
+                        DecisionRow(level: "WATCH", result: policyResult("WATCH"))
+                        DecisionRow(level: "DANGER", result: policyResult("DANGER"))
+                        DecisionRow(level: "CRITICAL", result: policyResult("CRITICAL"))
+                    }
+
+                    Button { withAnimation(.easeInOut(duration: 0.16)) {
+                        openMatchRules.toggle()
+                    }} label: {
+                        HStack {
+                            Text("WHAT COMMANDS MATCH?")
+                                .font(.system(size: 8, weight: .heavy, design: .rounded))
+                                .tracking(0.45).foregroundColor(P.faint)
+                            Spacer()
+                            Chevron(open: openMatchRules)
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                    if openMatchRules {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Package tasks: typecheck, build, test, install, dev, lint")
+                            Text("Tools: tsc, Vitest, Jest, Playwright, pytest, Cargo, Gradle, Bazel, Xcodebuild, webpack, make, Next, Expo, Docker, Colima")
+                            Text("Verified commands learned from this Mac are labelled “Learned”.")
+                            Text("Other commands run without a memory check.")
+                        }
+                        .font(.system(size: 9)).foregroundColor(P.dim)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                HStack(spacing: 8) {
-                    gateStat("\(g.allow)", "ran silently", P.green)
-                    gateStat("\(g.warn)", "warned, still ran", P.amber)
-                    gateStat("\(g.block)", "stopped",
-                             g.block > 0 ? P.red : P.faint)
-                }
-                Text(g.block == 0
-                     ? "Nothing has ever been stopped — the gate has not cost anyone a command."
-                     : "\(g.block) command(s) were refused and never ran.")
-                    .font(.system(size: 9.5))
-                    .foregroundColor(g.block == 0 ? P.green : P.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("checked \(g.total) heavy command(s) over \(durS(g.spanS)) · "
-                     + "adds \(g.p50)ms typical, \(g.p95)ms p95 · "
-                     + "light commands never reach it (~6ms)")
-                    .font(.system(size: 9)).foregroundColor(P.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-                if !g.healthy {
-                    Text("⚠ the gate errored \(g.error) time(s) and fell open")
-                        .font(.system(size: 9.5)).foregroundColor(P.amber)
-                }
-                if !g.sessions.isEmpty {
-                    Divider().overlay(P.stroke)
-                    ForEach(g.sessions) { gs in
-                        HStack(spacing: 6) {
-                            Text(gs.name).font(.system(size: 9.5))
-                                .foregroundColor(P.dim).lineLimit(1)
-                            Spacer(minLength: 4)
-                            // "checked" alone reads as "every Bash call", which
-                            // is ~0.7% of the truth — only heavy commands reach
-                            // the memory check at all.
-                            Text("\(gs.n) heavy commands checked")
-                                .font(.system(size: 9))
-                                .foregroundColor(P.faint)
-                                .lineLimit(1).fixedSize()
-                            if gs.warn > 0 {
-                                Text("\(gs.warn) warned").font(.system(size: 9))
-                                    .foregroundColor(P.amber)
-                            }
-                            if gs.block > 0 {
-                                Text("\(gs.block) stopped").font(.system(size: 9))
-                                    .foregroundColor(P.red)
-                            }
+                    }
+
+                    if g.errors > 0 {
+                        Text("Command protection failed open \(g.errors) times. Those commands ran.")
+                            .font(.system(size: 9.5)).foregroundColor(P.amber)
+                    }
+
+                    if g.warned == 0 && g.stopped == 0 && g.pending.isEmpty {
+                        Text("No warnings or stops since \(retainedDate(g.since, includeTime: true)).")
+                            .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.green)
+                        Text("Matched commands run silently while memory is HEALTHY.\nAt WATCH or DANGER they run with a warning.\nAt CRITICAL they are stopped before running.")
+                            .font(.system(size: 9)).foregroundColor(P.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        stoppedHistory
+                        warningHistory
+                    }
+
+                    if g.evaluated > 0 {
+                        Text("Retained activity since \(retainedDate(g.since, includeTime: true)).")
+                            .font(.system(size: 8.5)).foregroundColor(P.faint)
+                        if !g.complete {
+                            Text("Older activity may be missing.")
+                                .font(.system(size: 8.5)).foregroundColor(P.faint)
+                        }
+                        if let to = g.historyTo {
+                            Text("Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate(to, includeTime: true)).")
+                                .font(.system(size: 8.5)).foregroundColor(P.faint)
                         }
                     }
                 }
@@ -970,45 +1291,60 @@ struct ContentView: View {
         }
     }
 
-    private func gateStat(_ value: String, _ label: String,
-                          _ tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(value).font(.system(size: 17, weight: .bold, design: .rounded))
-                .foregroundColor(tint)
-            Text(label).font(.system(size: 8)).foregroundColor(P.faint)
-                .lineLimit(1).minimumScaleFactor(0.8)
+    private var stoppedHistory: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("STOPPED BEFORE RUNNING")
+                    .font(.system(size: 8, weight: .heavy, design: .rounded))
+                    .tracking(0.45).foregroundColor(P.red)
+                Spacer()
+                Text("\(s.gate.stopped)").font(.system(size: 9, weight: .bold))
+                    .foregroundColor(P.red)
+            }
+            if !s.gate.pending.isEmpty {
+                Text("\(s.gate.pending.count) waiting to retry")
+                    .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.red)
+                Text(retryCopy).font(.system(size: 9)).foregroundColor(
+                    s.level == "HEALTHY" || s.gate.paused ? P.green : P.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(stoppedEvents) { GateEventCard(event: $0) }
+            ForEach(s.gate.pending.filter { !$0.eventRetained }) {
+                MissingGateEventCard(item: $0)
+            }
+            if stoppedEvents.isEmpty && s.gate.pending.isEmpty {
+                Text("No commands have been stopped since \(retainedDate(s.gate.since)).")
+                    .font(.system(size: 9)).foregroundColor(P.faint)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6).padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 9).fill(P.card))
     }
 
-    private var blockedCard: some View {
-        let clear = s.level == "HEALTHY" || s.level == "WATCH"
-        return Card(tint: (clear ? P.green : P.amber).opacity(0.45)) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: clear ? "arrow.clockwise.circle.fill"
-                                            : "pause.circle.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(clear ? P.green : P.amber)
-                    Text("\(s.blocked.count) blocked command\(s.blocked.count == 1 ? "" : "s")")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(clear ? P.green : P.amber)
-                    Spacer()
+    private var warningHistory: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("WARNED — COMMAND RAN")
+                    .font(.system(size: 8, weight: .heavy, design: .rounded))
+                    .tracking(0.45).foregroundColor(P.amber)
+                Spacer()
+                Text("\(s.gate.warned)").font(.system(size: 9, weight: .bold))
+                    .foregroundColor(P.amber)
+            }
+            if showAllWarnings {
+                LazyVStack(spacing: 7) {
+                    ForEach(recentWarnings) { GateEventCard(event: $0) }
                 }
-                ForEach(s.blocked.suffix(3)) { b in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(b.cmd).font(.system(size: 9.5, design: .monospaced))
-                            .foregroundColor(P.dim).lineLimit(1)
-                        Text("\(b.session) · \(relative(b.ts))")
-                            .font(.system(size: 8.5)).foregroundColor(P.faint)
-                    }
+            } else {
+                ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0) }
+            }
+            if recentWarnings.count > 3 {
+                Button(showAllWarnings
+                       ? "Show only 3 recent warnings"
+                       : "Show all \(s.gate.warned) retained warnings") {
+                    withAnimation(.easeInOut(duration: 0.16)) { showAllWarnings.toggle() }
                 }
-                Text(clear ? "Memory is clear — safe to re-run these now"
-                           : "Still under pressure — wait before re-running")
-                    .font(.system(size: 9.5))
-                    .foregroundColor(clear ? P.green : P.amber)
+                .buttonStyle(.plain)
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundColor(P.amber)
             }
         }
     }
@@ -1180,6 +1516,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 // the state you cannot reproduce on demand.
 
 let PREVIEW_PAUSED = CommandLine.arguments.contains("--paused")
+let PREVIEW_EMPTY = CommandLine.arguments.contains("--empty")
+let PREVIEW_NOT_INSTALLED = CommandLine.arguments.contains("--not-installed")
 
 @MainActor
 func renderPreview(to path: String) {
@@ -1232,21 +1570,93 @@ func renderPreview(to path: String) {
         WT(name: "web-search", tag: "tsc typecheck",
            mem: 12.0 * GB, ram: 5.2 * GB, swap: 6.8 * GB, procs: 7, orphans: 0),
     ]
-    s.blocked = [
-        Blk(session: "docs sweep", cmd: "pnpm typecheck",
-            ts: Date().timeIntervalSince1970 - 400),
-        Blk(session: "search indexing", cmd: "turbo run build --filter dashboard",
-            ts: Date().timeIntervalSince1970 - 1200),
-    ]
     s.orphanTotal = 3.6 * GB; s.orphanCount = 2
     s.idleSpares = 2; s.idleSpareMem = 186 * MB
-    s.gate = GateStats(paused: PREVIEW_PAUSED, pausedUntil: PREVIEW_PAUSED ? Date().timeIntervalSince1970 + 7200 : nil,
-                       total: 48, allow: 30, warn: 18, block: 0, error: 0,
-                       healthy: true, spanS: 63720, p50: 80, p95: 145,
-                       sessions: [
-                        GateSess(name: "checkout redesign", n: 16, warn: 1, block: 0),
-                        GateSess(name: "docs sweep", n: 9, warn: 5, block: 0),
+    let now = Date().timeIntervalSince1970
+    let builtin = GateClassification(source: "builtin", rule: "pnpm … typecheck",
+                                     shape: "pnpm typecheck", samples: nil,
+                                     observedPeak: nil, blockEligible: true)
+    let learned = GateClassification(source: "learned", rule: "codex.sh run",
+                                     shape: "codex.sh run", samples: 13,
+                                     observedPeak: 3.4 * GB, blockEligible: false)
+    let events = [
+        GateEvent(ts: now - 3800, action: "block", mode: "block-critical",
+                  sessionID: "829922b2", sessionName: nil,
+                  commandRaw: "/usr/bin/python3 ~/.claude/skills/linear/scripts/linear.py issue-get ABC-4573 --json",
+                  commandDisplay: "python3 …/linear.py issue-get ABC-4573 --json",
+                  classification: nil, legacy: true, level: "CRITICAL", score: 7,
+                  reasons: ["swap 31% of RAM size", "heavy thrashing 289 MB/s",
+                            "swap growing 5094 MB/min"],
+                  retryStatus: "waiting", ms: 74),
+        GateEvent(ts: now - 7200, action: "block", mode: "block-critical",
+                  sessionID: "4dcb56b8", sessionName: "docs sweep",
+                  commandRaw: "pnpm --filter dashboard typecheck",
+                  commandDisplay: "pnpm --filter dashboard typecheck",
+                  classification: builtin, legacy: false, level: "CRITICAL", score: 8,
+                  reasons: ["heavy thrashing 210 MB/s", "load 29 on 8 cores"],
+                  retryStatus: "waiting", ms: 78),
+        GateEvent(ts: now - 11000, action: "block", mode: "block-critical",
+                  sessionID: "73082786", sessionName: "checkout redesign",
+                  commandRaw: "docker compose build", commandDisplay: "docker compose build",
+                  classification: GateClassification(source: "builtin", rule: "docker compose build",
+                      shape: "docker compose build", samples: nil, observedPeak: nil,
+                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
+                  reasons: ["swap growing 1330 MB/min"], retryStatus: "not_waiting", ms: 71),
+        GateEvent(ts: now - 900, action: "warn", mode: "block-critical",
+                  sessionID: "8d63269a", sessionName: "api error handling",
+                  commandRaw: "~/.claude/skills/codex/scripts/codex.sh run ABC-4573",
+                  commandDisplay: "codex.sh run ABC-4573", classification: learned,
+                  legacy: false, level: "DANGER", score: 5,
+                  reasons: ["paging 73 MB/s", "swap growing 1947 MB/min"],
+                  retryStatus: "not_waiting", ms: 76),
+        GateEvent(ts: now - 3 * 86400, action: "warn", mode: "block-critical",
+                  sessionID: "73082786", sessionName: nil,
+                  commandRaw: "cat vitest.config.ts", commandDisplay: "cat vitest.config.ts",
+                  classification: nil, legacy: true, level: "WATCH", score: 3,
+                  reasons: ["swap growing 382 MB/min", "load 23"],
+                  retryStatus: "not_waiting", ms: 72),
+        GateEvent(ts: now - 2 * 86400, action: "warn", mode: "block-critical",
+                  sessionID: "4dcb56b8", sessionName: "docs sweep",
+                  commandRaw: "pnpm --filter dashboard typecheck",
+                  commandDisplay: "pnpm --filter dashboard typecheck",
+                  classification: builtin, legacy: false, level: "WATCH", score: 2,
+                  reasons: ["load 24 on 8 cores"], retryStatus: "not_waiting", ms: 73),
+        GateEvent(ts: now - 3600, action: "warn", mode: "block-critical",
+                  sessionID: "a12e419f", sessionName: "search indexing",
+                  commandRaw: "npx vitest run", commandDisplay: "npx vitest run",
+                  classification: GateClassification(source: "builtin", rule: "vitest",
+                      shape: "npx vitest", samples: nil, observedPeak: nil,
+                      blockEligible: true), legacy: false, level: "DANGER", score: 4,
+                  reasons: ["paging 56 MB/s"], retryStatus: "not_waiting", ms: 70),
+    ]
+    s.gate = GateStats(installed: true, paused: PREVIEW_PAUSED,
+                       pausedUntil: PREVIEW_PAUSED ? now + 7200 : nil,
+                       mode: "block-critical", since: now - 3 * 86400,
+                       historyFrom: now - 3 * 86400, historyTo: now - 900,
+                       complete: false, truncated: true, evaluated: 525,
+                       warned: 54, stopped: 3, errors: 0, events: events,
+                       pending: [
+                        PendingRetry(ts: now - 3800, sessionID: "829922b2",
+                                     sessionName: nil,
+                                     commandRaw: events[0].commandRaw,
+                                     commandDisplay: events[0].commandDisplay,
+                                     pressureLevel: "CRITICAL", eventRetained: true),
+                        PendingRetry(ts: now - 7200, sessionID: "4dcb56b8",
+                                     sessionName: "docs sweep",
+                                     commandRaw: events[1].commandRaw,
+                                     commandDisplay: events[1].commandDisplay,
+                                     pressureLevel: "CRITICAL", eventRetained: true),
                        ])
+    if PREVIEW_EMPTY {
+        s.gate.since = now - 600
+        s.gate.historyFrom = s.gate.since
+        s.gate.historyTo = nil
+        s.gate.evaluated = 0; s.gate.warned = 0; s.gate.stopped = 0
+        s.gate.events = []; s.gate.pending = []
+    }
+    if PREVIEW_NOT_INSTALLED {
+        s.gate.installed = false; s.gate.paused = false
+    }
     m.snap = s; m.loaded = true; m.lastSync = Date()
 
     let view = ContentView(model: m, onQuit: {}, onReap: {},

@@ -413,12 +413,14 @@ SERVICE_ALIAS = {"Docker VM": "Docker"}
 PROFILE = os.path.join(STATE_DIR, "profile.json")
 SHELL_STATE = os.path.join(STATE_DIR, "learned.zsh")
 PAUSE = os.path.join(STATE_DIR, "paused.json")
+PROFILE_VERSION = 2
 # A command has to cost this much before it is worth gating.
 LEARN_HEAVY_AT = 1500 * MB
 # Peaks below this are noise from whatever else the session was doing.
 LEARN_MIN_SAMPLES = 2
 
-_CMD_NOISE = re.compile(r"""^(sudo|nohup|time|env|exec|bash|sh|zsh|/bin/\w+)$""")
+_CMD_NOISE = re.compile(
+    r"""^(sudo|nohup|time|timeout|caffeinate|env|exec|command|bash|sh|zsh)$""")
 # Can never be the thing holding gigabytes; recording them only adds noise.
 _TRIVIAL = {"cd", "echo", "export", "true", "false", ":", "printf", "pwd",
             # Splitting on ';' turns `for x in …; do …; done` into fragments
@@ -431,13 +433,138 @@ _TRIVIAL = {"cd", "echo", "export", "true", "false", ":", "printf", "pwd",
             # one coincidence add 60ms to every file copy.
             "cp", "mv", "rm", "ln", "mkdir", "touch", "chmod", "chown",
             "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr",
-            "grep", "rg", "sed", "awk", "find", "which", "date", "sleep",
+            "grep", "rg", "sed", "awk", "find", "which", "date", "sleep", "ps",
             "kill", "pgrep", "pkill", "open", "diff", "basename", "dirname"}
+_SHELL_WORDS = {"for", "do", "done", "while", "if", "then", "fi", "else",
+                "elif", "case", "esac", "function", "return", "local", "in",
+                "select", "until", "coproc", "time", "!", "{"}
+# These are real executables, but the current sampler cannot distinguish their
+# own cost from the already-running session around them. Learning one would turn
+# cheap control/API/read operations into warnings. Built-in pytest/node tooling
+# is still classified explicitly below.
+_NEVER_LEARN = {"git", "caffeinate", "python", "python3", "node", "ruby",
+                "perl", "curl", "wget", "ssh", "scp", "rsync"}
 _VERBS = {"build", "test", "typecheck", "install", "dev", "lint", "check",
           "compile", "start", "bundle", "package", "e2e"}
 # Transparent: `turbo run typecheck` is a typecheck, not a "run". Used only when
 # nothing more specific follows, so `codex.sh run` still keeps its subcommand.
 _PASSTHROUGH = {"run", "watch", "exec"}
+
+
+def _without_heredoc_bodies(cmd: str) -> str:
+    """Remove here-document data so examples/prompts cannot become commands."""
+    def delimiters(line: str) -> list[tuple[str, bool]]:
+        found, i, quote = [], 0, ""
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                if ch == quote:
+                    quote = ""
+                elif ch == "\\" and quote == '"':
+                    i += 1
+                i += 1
+                continue
+            if ch in "'\"":
+                quote = ch; i += 1; continue
+            if ch == "\\":
+                i += 2; continue
+            if line[i:i + 2] != "<<":
+                i += 1; continue
+            i += 2
+            strip_tabs = i < len(line) and line[i] == "-"
+            i += int(strip_tabs)
+            while i < len(line) and line[i] in " \t":
+                i += 1
+            q = line[i] if i < len(line) and line[i] in "'\"" else ""
+            i += int(bool(q))
+            start = i
+            while i < len(line) and ((q and line[i] != q)
+                                     or (not q and line[i] not in " \t;|&<>()\r\n")):
+                i += 1
+            delim = line[start:i]
+            if delim:
+                found.append((delim, strip_tabs))
+            if q and i < len(line):
+                i += 1
+        return found
+
+    kept, pending = [], []
+    for line in (cmd or "").splitlines(keepends=True):
+        if pending:
+            delim, strip_tabs = pending[0]
+            candidate = line.rstrip("\r\n")
+            if strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == delim:
+                pending.pop(0)
+                kept.append("\n")
+            continue
+        kept.append(line)
+        pending.extend(delimiters(line))
+    return "".join(kept)
+
+
+def shell_commands(cmd: str) -> list[list[str]]:
+    """Return shell command segments without splitting quoted metacharacters.
+
+    This is intentionally a small shell lexer, not a shell evaluator. `shlex`
+    gives us the property the gate needs: a `|`, `;`, `&&`, or `||` inside a
+    quoted grep pattern remains an argument, while a real operator starts the
+    next executable position. A parse failure returns no commands, which keeps
+    the gate fail-open.
+    """
+    try:
+        import shlex                 # heavy-path only; keep gate startup lean
+        lex = shlex.shlex(_without_heredoc_bodies(cmd), posix=True,
+                         punctuation_chars=";&|(){}\n")
+        lex.commenters = ""
+        lex.whitespace = " \t\r"   # newline is a command separator, not space
+        lex.whitespace_split = True
+        toks = list(lex)
+    except Exception:
+        return []
+
+    out, current = [], []
+    for tok in toks:
+        if tok and all(ch in ";&|(){}\n" for ch in tok):
+            if current:
+                out.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        out.append(current)
+    return out[:16]
+
+
+def _command_tokens(tokens: list[str]) -> list[str]:
+    """Remove shell syntax, assignments, and transparent launch wrappers."""
+    toks = list(tokens)
+    while toks and (toks[0] in _SHELL_WORDS
+                    or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0])):
+        toks.pop(0)
+    # A wrapper can itself be preceded by assignments or options. We only need
+    # the executable position; ambiguity means no match, never a guess.
+    while toks and _CMD_NOISE.match(os.path.basename(toks[0])):
+        wrapper = os.path.basename(toks.pop(0))
+        while toks and (toks[0].startswith("-")
+                        or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0])):
+            toks.pop(0)
+        if wrapper in ("time", "timeout") and toks and re.fullmatch(r"[0-9.]+", toks[0]):
+            toks.pop(0)
+    return toks
+
+
+def _plausible_shape(shape: str) -> bool:
+    parts = shape.split()
+    if not parts or len(parts) > 2:
+        return False
+    exe = parts[0]
+    if (exe in _TRIVIAL or exe in _NEVER_LEARN or exe in _SHELL_WORDS
+            or "…" in shape or not any(c.islower() for c in exe)
+            or not re.fullmatch(r"[A-Za-z0-9_.@+-]{2,64}", exe)):
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,64}", p) for p in parts[1:])
 
 
 def normalise_cmd(cmd: str) -> list[str]:
@@ -451,12 +578,8 @@ def normalise_cmd(cmd: str) -> list[str]:
     Returns one shape per chained segment, because `cd x && pnpm build` is two
     commands and only the second one matters."""
     shapes = []
-    for segment in re.split(r"&&|\|\||;|\|", cmd or ""):
-        toks = segment.strip().split()
-        # Drop wrappers and leading VAR=value assignments.
-        while toks and (_CMD_NOISE.match(os.path.basename(toks[0]))
-                        or re.match(r"^[A-Za-z_][\w]*=", toks[0])):
-            toks.pop(0)
+    for segment in shell_commands(cmd):
+        toks = _command_tokens(segment)
         if not toks:
             continue
         exe = os.path.basename(toks[0])
@@ -472,19 +595,41 @@ def normalise_cmd(cmd: str) -> list[str]:
             sub = next((t for t in rest if t in _PASSTHROUGH), "")
         if not sub:
             sub = next((t for t in rest if not t.startswith("-")), "")
-        if sub and len(sub) < 32 and "/" not in sub:
-            shapes.append(f"{exe} {sub}")
-        else:
-            shapes.append(exe)
+        shape = f"{exe} {sub}" if sub and len(sub) < 32 and "/" not in sub else exe
+        if _plausible_shape(shape):
+            shapes.append(shape)
     return shapes[:4]
 
 
 def load_profile() -> dict:
+    """Load the v2 profile, quarantining the unsafe unversioned learner once."""
     try:
         with open(PROFILE) as fh:
-            return json.load(fh)
+            raw = json.load(fh)
     except Exception:
         return {}
+    if raw.get("version") == PROFILE_VERSION and isinstance(raw.get("commands"), dict):
+        return raw["commands"]
+
+    # v1 learned from quote-broken display strings and published first-token
+    # globs such as *git* and *python3*. It cannot be repaired safely: retain it
+    # for inspection, start clean, and immediately clear the shell prefilter.
+    try:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        os.replace(PROFILE, f"{PROFILE}.quarantined-v1-{stamp}")
+        save_profile({})
+        _write_learned_glob({})
+    except Exception:
+        pass
+    return {}
+
+
+def save_profile(prof: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PROFILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"version": PROFILE_VERSION, "commands": prof}, fh)
+    os.replace(tmp, PROFILE)
 
 
 def profile_says_heavy(cmd: str) -> bool:
@@ -515,11 +660,12 @@ def learn(snap: dict) -> None:
     prof = load_profile()
     changed = False
     for s in snap.get("sessions") or []:
-        doing = s.get("doing") or ""
-        m = re.match(r"\[shell\]\s*(.+)", doing)
-        if not m:
+        # `doing` is presentation text: paths are shortened and it is truncated.
+        # Only the untouched active Bash detail is trusted as learning input.
+        command = s.get("learning_cmd") or ""
+        if not command:
             continue
-        for shape in normalise_cmd(m.group(1)):
+        for shape in normalise_cmd(command):
             e = prof.setdefault(shape, {"n": 0, "peak": 0, "last": 0})
             e["n"] += 1
             e["peak"] = max(e["peak"], s.get("mem", 0))
@@ -531,10 +677,7 @@ def learn(snap: dict) -> None:
     cutoff = time.time() - 30 * 86400
     prof = {k: v for k, v in prof.items() if v.get("last", 0) >= cutoff}
     try:
-        tmp = PROFILE + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(prof, fh)
-        os.replace(tmp, PROFILE)
+        save_profile(prof)
         _write_learned_glob(prof)
     except Exception:
         pass
@@ -566,14 +709,18 @@ def _write_learned_glob(prof: dict | None = None) -> None:
     heavy = sorted(k for k, v in prof.items()
                    if v.get("n", 0) >= LEARN_MIN_SAMPLES
                    and v.get("peak", 0) >= LEARN_HEAVY_AT)
-    # Only tokens that can safely become a glob, deduped. A token like "." or
-    # "until" would publish `*.*` and send every command to Python.
-    toks = []
+    # Publish the full learned shape (`*codex.sh*run*`), never its first token.
+    # A first-token *python3* or *git* glob was broad enough to erase the fast
+    # path for unrelated work.
+    pats_out = []
     for k in heavy:
-        t = k.split()[0]
-        if re.fullmatch(r"[\w.@+-]{3,}", t) and not t.startswith(".") and t not in toks:
-            toks.append(t)
-    pats = "|".join(f"*{t}*" for t in sorted(toks))
+        if not _plausible_shape(k):
+            continue
+        words = k.split()
+        pat = "*" + "*".join(words) + "*"
+        if pat not in pats_out:
+            pats_out.append(pat)
+    pats = "|".join(sorted(pats_out))
     paused = pause_until()
     tmp = SHELL_STATE + ".tmp"
     with open(tmp, "w") as fh:
@@ -694,7 +841,10 @@ def read_sessions() -> list[dict]:
                 d = json.load(fh)
         except Exception:
             continue
-        doing = d.get("detail") or d.get("displayIntent") or d.get("intent") or ""
+        raw_detail = str(d.get("detail") or "")
+        learning_cmd = (raw_detail[len("[shell]"):].strip()
+                        if raw_detail.startswith("[shell]") else "")
+        doing = raw_detail or d.get("displayIntent") or d.get("intent") or ""
         fan = d.get("fan") or []
         if fan and isinstance(fan, list):
             label = (fan[0] or {}).get("label")
@@ -718,6 +868,7 @@ def read_sessions() -> list[dict]:
             "name": name,
             "state": d.get("state") or "?",
             "doing": doing,
+            "learning_cmd": learning_cmd,
             "cwd": d.get("cwd") or "",
             "session_id": d.get("sessionId") or "",
             "updated": os.path.getmtime(path),
@@ -1736,41 +1887,142 @@ def reap(snap: dict, apply: bool) -> str:
 
 # -------------------------------------------------------------------- the gate
 
-# Commands worth gating: each can add gigabytes. Everything else runs freely —
-# blocking a `git status` because a build is running would be useless friction.
-# Flags may sit between the launcher and the verb — `pnpm --filter web build`,
-# `pnpm -r build`, `turbo watch dev`, `pnpm --dir=packages/call build:all`. The
-# earlier form bound the verb adjacent to the launcher and so missed every one of
-# those, including `pnpm --filter <pkg> typecheck`, which is the exact command
-# the gate's own block message tells you to run instead.
-# Up to four intervening tokens, non-greedy, so a flag AND its separate value
-# are skipped: `pnpm --filter dashboard typecheck` has two tokens before the verb.
-_LAUNCHER = r"(?:pnpm|npm|yarn|bun|turbo)(?:\s+[-\w:=@/.]+){0,4}?"
-_VERB = r"(?:typecheck|build|test|install|dev|lint)[\w:-]*"
-HEAVY_CMD = re.compile(
-    rf"{_LAUNCHER}\s+(?:run\s+|watch\s+)?{_VERB}\b"
-    r"|\btsc\b|\bvitest\b|\bjest\b|\bplaywright\b|\bgradlew?\b|\bbazel\b|\bxcodebuild\b"
-    r"|docker\s+(?:compose\s+)?(?:up|build|run)\b|\bcolima\s+start\b"
-    r"|next\s+build\b|expo\s+(?:start|run)\b|cargo\s+(?:build|test)\b|\bwebpack\b"
-    r"|\bmake\b|\bpytest\b"
-)
+# Commands worth gating: each can add gigabytes. Classification is deliberately
+# position-aware. A tool name inside `cat vitest.config.ts`, an echo string, a
+# grep pattern, or a path is data, not an executable.
+_PACKAGE_LAUNCHERS = {"pnpm", "npm", "yarn", "bun", "turbo"}
+_PACKAGE_VERBS = {"typecheck", "build", "test", "install", "dev", "lint"}
+_OPTION_TAKES_VALUE = {"--filter", "--dir", "--cwd", "--workspace", "-w", "-C",
+                       "--scope", "--since", "--concurrency"}
+_DIRECT_TOOLS = {"tsc", "vitest", "jest", "playwright", "pytest", "gradle",
+                 "gradlew", "bazel", "xcodebuild", "webpack", "make"}
+
+
+def _classification(source: str = "none", rule: str | None = None,
+                    shape: str | None = None, samples: int | None = None,
+                    peak: int | None = None, block_eligible: bool = False) -> dict:
+    return {
+        "matched": source != "none", "source": source, "rule": rule,
+        "shape": shape, "samples": samples, "observed_peak_bytes": peak,
+        "block_eligible": block_eligible,
+    }
+
+
+def _skip_options(args: list[str], start: int = 0) -> int:
+    i = start
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return i + 1
+        if not arg.startswith("-"):
+            return i
+        name = arg.split("=", 1)[0]
+        i += 2 if name in _OPTION_TAKES_VALUE and "=" not in arg else 1
+    return i
+
+
+def _builtin_for_tokens(tokens: list[str]) -> dict | None:
+    toks = _command_tokens(tokens)
+    if not toks:
+        return None
+    exe = os.path.basename(toks[0]).lower()
+    args = toks[1:]
+
+    if exe in _DIRECT_TOOLS:
+        return _classification("builtin", exe, exe, block_eligible=True)
+
+    if exe in _PACKAGE_LAUNCHERS:
+        i = _skip_options(args)
+        # `run` and `watch` are transparent package-runner subcommands; options
+        # may appear on either side of them.
+        if i < len(args) and args[i].lower() in ("run", "watch"):
+            i = _skip_options(args, i + 1)
+        if i < len(args):
+            verb = args[i].lower().split(":", 1)[0]
+            if verb in _PACKAGE_VERBS:
+                return _classification("builtin", f"{exe} … {verb}",
+                                       f"{exe} {verb}", block_eligible=True)
+            if verb in _DIRECT_TOOLS:
+                return _classification("builtin", verb, f"{exe} {verb}",
+                                       block_eligible=True)
+
+    if exe == "npx":
+        i = _skip_options(args)
+        if i < len(args):
+            tool = os.path.basename(args[i]).lower()
+            if tool in _DIRECT_TOOLS:
+                return _classification("builtin", tool, f"npx {tool}",
+                                       block_eligible=True)
+
+    if exe == "docker":
+        i = _skip_options(args)
+        words = [a.lower() for a in args[i:i + 3]]
+        if words and words[0] == "compose":
+            words = words[1:]
+        if words and words[0] in ("up", "build", "run"):
+            is_compose = bool(args[i:i + 1]) and args[i].lower() == "compose"
+            rule = "docker " + ("compose " if is_compose else "") + words[0]
+            return _classification("builtin", rule, rule, block_eligible=True)
+
+    if exe == "cargo" and args and args[0].lower() in ("build", "test"):
+        rule = f"cargo {args[0].lower()}"
+        return _classification("builtin", rule, rule, block_eligible=True)
+    if exe == "colima" and args and args[0].lower() == "start":
+        return _classification("builtin", "colima start", "colima start",
+                               block_eligible=True)
+    if exe == "next" and args and args[0].lower() == "build":
+        return _classification("builtin", "next build", "next build",
+                               block_eligible=True)
+    if exe == "expo" and args and args[0].lower() in ("start", "run"):
+        rule = f"expo {args[0].lower()}"
+        return _classification("builtin", rule, rule, block_eligible=True)
+    return None
+
+
+def classify_command(cmd: str, profile: dict | None = None) -> dict:
+    """Describe why a command is checked, or return source=none.
+
+    Built-ins are block-eligible. Learned rules are always warning-only: the
+    sampler's evidence can add a useful caution but can never refuse work.
+    """
+    commands = shell_commands(cmd)
+    for tokens in commands:
+        if hit := _builtin_for_tokens(tokens):
+            return hit
+
+    prof = load_profile() if profile is None else profile
+    for shape in normalise_cmd(cmd):
+        entry = prof.get(shape) or {}
+        if (entry.get("n", 0) >= LEARN_MIN_SAMPLES
+                and entry.get("peak", 0) >= LEARN_HEAVY_AT):
+            return _classification("learned", shape, shape,
+                                   entry.get("n"), entry.get("peak"), False)
+    shape = next(iter(normalise_cmd(cmd)), None)
+    return _classification(shape=shape)
 
 
 def is_heavy(cmd: str) -> bool:
-    """What this machine has observed beats what I guessed.
+    """Compatibility predicate; new callers should retain classify_command()."""
+    return bool(classify_command(cmd)["matched"])
 
-    The regex only ever encoded JavaScript-monorepo tooling; it cannot know that
-    `codex.sh run` on this machine spawns an 8 GB build, and it would be wrong
-    about a Rust or Python workflow entirely."""
-    return profile_says_heavy(cmd) or bool(HEAVY_CMD.search(cmd or ""))
+
+class _PositionAwareHeavyMatcher:
+    """Compatibility for diagnostics that previously called HEAVY_CMD.search."""
+    def search(self, cmd: str):
+        return next((hit for tokens in shell_commands(cmd)
+                     if (hit := _builtin_for_tokens(tokens))), None)
+
+
+HEAVY_CMD = _PositionAwareHeavyMatcher()
 
 
 def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
-                  mode: str) -> tuple[str, str]:
+                  mode: str, classification: dict | None = None) -> tuple[str, str]:
     """Pure decision, so it can be tested without provoking real memory pressure.
 
     Returns (action, message) where action is allow | warn | block."""
-    if mode == "off" or tool != "Bash" or not is_heavy(cmd):
+    classification = classification or classify_command(cmd)
+    if mode == "off" or tool != "Bash" or not classification["matched"]:
         return "allow", ""
 
     level = pres.get("level", "HEALTHY")
@@ -1810,8 +2062,9 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
         bits.append(f"At the current rate memory runs out in ~{room:.0f} min.")
 
     # "warn" never blocks, whatever the level — that is the point of the mode.
-    blocking = (mode in ("block", "block-critical") and level == "CRITICAL") \
-        or (mode == "block" and level == "DANGER")
+    blocking = classification.get("block_eligible", False) and (
+        (mode in ("block", "block-critical") and level == "CRITICAL")
+        or (mode == "block" and level == "DANGER"))
     if blocking:
         bits.append(
             "Do NOT start this command now — it would likely freeze the machine "
@@ -1833,11 +2086,44 @@ PENDING = os.path.join(STATE_DIR, "blocked.json")
 def session_name_for(session_id: str) -> str:
     """Job short id is the first segment of the session uuid."""
     short = (session_id or "")[:8]
+    return lookup_session_name(short) or short
+
+
+def lookup_session_name(session_id: str) -> str | None:
+    """Name at this instant, or None; historical callers must not re-resolve."""
+    short = (session_id or "")[:8]
     try:
         with open(os.path.join(JOBS_DIR, short, "state.json")) as fh:
-            return json.load(fh).get("name") or short
+            state = json.load(fh)
+        if state.get("name"):
+            return state["name"]
+        words = str(state.get("intent") or "").split()
+        return " ".join(words[:5]) if words else None
     except Exception:
-        return short
+        return None
+
+
+def display_command(cmd: str) -> str:
+    """Compact presentation copy while retaining `cmd` unchanged in the event."""
+    text = " ".join((cmd or "").split())
+    # A leading directory change is context, not the operation the user needs to
+    # recognise. Only remove it when it is its own `&&` segment.
+    text = re.sub(r"^cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*&&\s*", "", text, count=1)
+    if HOME:
+        text = text.replace(HOME + "/", "~/")
+    return text
+
+
+def gate_installed() -> bool:
+    """True only when a PreToolUse hook points at memmon-gate."""
+    try:
+        with open(os.path.join(HOME, ".claude", "settings.json")) as fh:
+            settings = json.load(fh)
+        return any("memmon-gate" in hook.get("command", "")
+                   for entry in settings.get("hooks", {}).get("PreToolUse", [])
+                   for hook in entry.get("hooks", []))
+    except Exception:
+        return False
 
 
 def _read_gate_rows(limit: int | None = 400) -> list[dict]:
@@ -1860,44 +2146,91 @@ def _read_gate_rows(limit: int | None = 400) -> list[dict]:
 
 
 def gate_stats(limit: int | None = None) -> dict:
-    """Summary of what the gate has actually done, for display in the UI.
-
-    Reads the whole log rather than a fixed window: the file is already bounded
-    by _trim_lines, and a fixed window made the headline count freeze at exactly
-    the window size, which reads as a stalled tool rather than a capped view."""
+    """Retained decisions plus inspectable warning/stop events for the UI."""
     rows = _read_gate_rows(limit)
-    if not rows:
-        return {"total": 0}
-
     acts = defaultdict(int)
-    per = defaultdict(lambda: {"n": 0, "warn": 0, "block": 0})
     for r in rows:
-        a = r.get("action", "?")
-        acts[a] += 1
-        sid = r.get("session") or ""
-        if not sid:
-            continue
-        per[sid]["n"] += 1
-        if a in ("warn", "block"):
-            per[sid][a] += 1
+        acts[r.get("action", "?")] += 1
     lat = sorted(r.get("ms", 0) for r in rows if r.get("action") != "error")
-    sessions = sorted(
-        ({"name": session_name_for(k), **v} for k, v in per.items()),
-        key=lambda s: -s["n"])[:4]
     paused = pause_until()
-    return {
+    mode = os.environ.get("MEMMON_GATE", "block-critical")
+    if mode not in ("block-critical", "block", "warn", "off"):
+        mode = "block-critical"
+    pending = load_pending()
+    def is_pending(sid: str, cmd: str) -> bool:
+        return any((p.get("session_id") or "")[:8] == sid
+                   and (p.get("cmd", "") == cmd
+                        or p.get("cmd", "").startswith(cmd)
+                        or cmd.startswith(p.get("cmd", "")))
+                   for p in pending if cmd and p.get("cmd"))
+
+    events = []
+    for r in rows:
+        if r.get("action") not in ("warn", "block"):
+            continue
+        sid = (r.get("session") or "")[:8]
+        cmd = r.get("cmd") or ""
+        classification = r.get("classification")
+        legacy = not isinstance(classification, dict)
+        events.append({
+            "ts": r.get("ts", 0), "action": r.get("action", "warn"),
+            "mode": r.get("mode") or "block-critical",
+            # Never resolve an old job here: a missing historical name must stay
+            # unknown rather than being explained with mutable current state.
+            "session": {"id": sid, "name": r.get("session_name")},
+            "command": {"raw": cmd,
+                        "display": r.get("cmd_display") or display_command(cmd)},
+            "classification": None if legacy else classification,
+            "legacy": legacy,
+            "pressure": {"level": r.get("level") or "?",
+                         "score": r.get("score"),
+                         "reasons": r.get("reasons") or []},
+            "retry_status": ("waiting" if is_pending(sid, cmd)
+                             else "not_waiting"),
+            "ms": r.get("ms", 0),
+        })
+
+    pending_json = [{
+        "ts": p.get("ts", 0),
+        "session": {"id": (p.get("session_id") or "")[:8],
+                    "name": p.get("session")},
+        "command": {"raw": p.get("cmd", ""),
+                    "display": display_command(p.get("cmd", ""))},
+        "pressure_level": p.get("level") or "?",
+        "event_retained": any(
+            e["retry_status"] == "waiting"
+            and e["session"]["id"] == (p.get("session_id") or "")[:8]
+            and (p.get("cmd", "") == e["command"]["raw"]
+                 or p.get("cmd", "").startswith(e["command"]["raw"])
+                 or e["command"]["raw"].startswith(p.get("cmd", "")))
+            for e in events),
+    } for p in pending]
+    first_ts = rows[0].get("ts", 0) if rows else time.time()
+    last_ts = rows[-1].get("ts", 0) if rows else None
+    evaluated = acts["allow"] + acts["warn"] + acts["block"]
+    result = {
+        "installed": gate_installed(),
         "paused": bool(paused),
         "paused_until": (None if paused in (0, float("inf")) else paused),
+        "policy": {"mode": mode},
+        "counts": {"since": first_ts, "complete": False,
+                   "evaluated": evaluated, "warned": acts["warn"],
+                   "stopped": acts["block"], "errors": acts["error"]},
+        "history": {"from": first_ts, "to": last_ts,
+                    "truncated": bool(rows), "evaluated": evaluated,
+                    "warned": acts["warn"], "stopped": acts["block"],
+                    "events": events},
+        "pending_retry": pending_json,
+        # Retained for the diagnostic CLI; the popover intentionally omits
+        # silent-pass counts and latency.
         "total": len(rows), "allow": acts["allow"], "warn": acts["warn"],
         "block": acts["block"], "error": acts["error"],
         "healthy": acts["error"] == 0,
-        "span_s": int(rows[-1].get("ts", 0) - rows[0].get("ts", 0)),
+        "span_s": int((last_ts or first_ts) - first_ts),
         "p50_ms": lat[len(lat) // 2] if lat else 0,
         "p95_ms": lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else 0,
-        "sessions": sessions,
-        "last_block": next((r for r in reversed(rows)
-                            if r.get("action") == "block"), None),
     }
+    return result
 
 
 def load_pending() -> list[dict]:
@@ -1966,7 +2299,8 @@ def gate() -> int:
                 _write_learned_glob()
             except Exception:
                 pass
-        if mode == "off" or tool != "Bash" or not is_heavy(cmd):
+        classification = classify_command(cmd)
+        if mode == "off" or tool != "Bash" or not classification["matched"]:
             return 0
 
         vm = read_vm(fast=True)
@@ -1977,20 +2311,26 @@ def gate() -> int:
         except Exception:
             cached = {}
 
-        action, msg = gate_decision(tool, cmd, pres, cached, mode)
+        action, msg = gate_decision(tool, cmd, pres, cached, mode, classification)
 
         # Rolling record of what every session asked to run and what we decided.
         # This is the only cross-session audit trail of the gate, and it is
         # written only for commands heavy enough to be evaluated.
         try:
             path = GATE_LOG
+            event_ts = time.time()
+            sid = payload.get("session_id", "")[:8]
             with open(path, "a") as fh:
                 fh.write(json.dumps({
-                    "ts": time.time(), "cmd": cmd[:200], "mode": mode,
+                    "ts": event_ts, "cmd": cmd, "cmd_display": display_command(cmd),
+                    "mode": mode,
                     "level": pres.get("level"), "action": action,
-                    "session": payload.get("session_id", "")[:8],
+                    "session": sid, "session_name": lookup_session_name(sid),
                     "cwd": payload.get("cwd", ""),
+                    "score": pres.get("score"),
                     "reasons": pres.get("reasons", []),
+                    "classification": {k: v for k, v in classification.items()
+                                       if k != "matched"},
                     # Measured, so "is this slowing anyone down" is answerable
                     # from data rather than from my estimate.
                     "ms": round((time.time() - t0) * 1000),
@@ -2263,17 +2603,16 @@ def main() -> int:
             print(f"STOPPED ({len(blocks)}) — these did not run:")
             for r in blocks:
                 print(f"  {time.strftime('%b %d %H:%M', time.localtime(r['ts']))}  "
-                      f"{clip(session_name_for(r.get('session', '')), 24)}")
+                      f"{clip(r.get('session_name') or r.get('session', '?'), 24)}")
                 print(f"      {r.get('cmd', '')[:90]}")
         else:
-            print("No command has ever been stopped — "
-                  "the gate has not cost anyone a command.")
+            print("No command was stopped in the retained gate history.")
         print()
         print("recent decisions:")
         print(f"  {'when':<9}{'session':<24}{'level':<9}{'action':<7}{'ms':>4}  cmd")
         for r in rows[-12:]:
             print(f"  {time.strftime('%H:%M:%S', time.localtime(r['ts'])):<9}"
-                  f"{clip(session_name_for(r.get('session', '')), 22):<24}"
+                  f"{clip(r.get('session_name') or r.get('session', '?'), 22):<24}"
                   f"{r.get('level', '?'):<9}{r.get('action', '?'):<7}"
                   f"{r.get('ms', 0):>4}  {r.get('cmd', '')[:38]}")
         return 0

@@ -25,25 +25,41 @@ after one near-freeze where two full-repo typechecks demanded ~34 GB at once.
 
 ### Reading the popover
 
-**Verdict card** — one line telling you whether it is safe to start work, and why.
+**Memory now** — one line telling you whether it is safe to start work, and why.
 The track underneath shows where the score sits between the four tiers, so the
 boundaries are visible rather than implied. The sentence names the actual
 offender (`web-checkout is running tsc typecheck, 21.7G across 12 processes`)
-rather than giving generic advice, and `because:` lists the signals that produced
-the verdict. `~6 min left` appears only when something is wrong — see the
-headroom caveat below.
+rather than giving generic advice, and `Memory signals now:` lists the signals
+that produced the verdict. `~6 min to low headroom` appears only when something
+is wrong — see the headroom caveat below.
+
+**Command warnings & stops** — the part of the tool that acts on your sessions,
+so it sits directly under the verdict. It answers four questions in order:
+
+- *Is protection on?* `ACTIVE` or `PAUSED`, with the Pause control next to it.
+  The section is always present, so pausing is always one click away.
+- *What gets checked?* Only commands matching a memory-intensive rule. Everything
+  else never reaches the check at all.
+- *What happens at each level?* A table: HEALTHY runs silently, WATCH and DANGER
+  warn but the command still runs, CRITICAL stops it before it runs. The table
+  reflects your actual policy, so it changes if you change the mode.
+- *What has it actually done?* Every warning and every stop is listed as an
+  event you can open.
+
+Each event names the command, the session, when it happened, and — the part that
+was missing before — **why**: which rule matched (`Built-in rule: vitest`,
+`Learned rule: codex.sh run · 13 observations · warning only`) and what memory
+was doing at that moment. So a stop reads as `Built-in rule: pnpm … typecheck +
+CRITICAL memory → stopped` rather than as an unexplained number.
+
+Stopped commands stay listed until they are safe to re-run, so nothing is
+silently lost. Events recorded before rules were tracked say so plainly rather
+than being re-explained with today's rules.
 
 **RAM and Swap tiles** — RAM is what is in memory; Swap is what has been written
 to disk. Swap is measured against *RAM size* (`1.21x`), not against the swapfile,
 because macOS grows the swapfile to match demand so the usual percentage is
 meaningless. `OVER` means swap now exceeds physical RAM.
-
-**Session gate** — what the gate has done to your sessions: how many commands ran
-untouched, how many got a warning and ran anyway, and how many were actually
-stopped. The wording is deliberate — a warning does not prevent anything.
-
-**Blocked commands** — anything the gate refused, so it is not silently lost. It
-tells you when it is safe to re-run them.
 
 **Reclaimable** — orphaned build processes whose parent died. Nothing else will
 ever clean these up; `Reap` kills them and never touches a live session.
@@ -100,7 +116,7 @@ and could name whose it was.
 ## Install
 
 ```bash
-git clone https://github.com/ketan0095/claude-memmon.git
+git clone https://github.com/ketan0095/memmon.git
 cd memmon
 ./install.sh --sampler --menubar --gate
 ```
