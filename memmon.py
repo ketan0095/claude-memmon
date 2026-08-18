@@ -206,6 +206,15 @@ def read_vm(fast: bool = False, header: str = "") -> dict:
             vm["wired"] = parse_size(m.group(2))
             vm["compressor"] = parse_size(m.group(3))
             vm["unused"] = parse_size(m.group(4)) if m.group(4) else 0
+            # top prints the "used" figure in whole gigabytes and TRUNCATES it,
+            # while giving "unused" to the megabyte. On a 16 GB machine sitting
+            # at 15.90 GiB it prints "15G" — understating by 0.9 GiB, always
+            # downward, on every sample. Derive it from the precise pair
+            # instead. Measured 2026-08-18: "15G used … 98M unused" against a
+            # true 15.904 GiB, and in 8,226 recorded samples the truncated
+            # field never once printed 16.
+            if m.group(4) and vm.get("ram_total"):
+                vm["ram_used"] = max(0, vm["ram_total"] - vm["unused"])
         m = re.search(r"Load Avg:\s+([\d.]+)", hdr)
         vm["load"] = float(m.group(1)) if m else 0.0
         m = re.search(r"Processes:\s+(\d+)", hdr)
