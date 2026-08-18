@@ -161,6 +161,9 @@ struct GateEvent: Identifiable {
     let id = UUID()
     var ts: Double, action: String, mode: String
     var sessionID: String, sessionName: String?
+    /// Recorded on the row at the time, so it stays true for a finished
+    /// session — unlike a name looked up now.
+    var cwd: String?
     var commandRaw: String, commandDisplay: String
     var classification: GateClassification?
     var legacy: Bool
@@ -378,6 +381,7 @@ final class Model: ObservableObject {
                         mode: d["mode"] as? String ?? "block-critical",
                         sessionID: session["id"] as? String ?? "",
                         sessionName: session["name"] as? String,
+                        cwd: session["cwd"] as? String,
                         commandRaw: command["raw"] as? String ?? "",
                         commandDisplay: command["display"] as? String ?? "",
                         classification: match,
@@ -758,9 +762,43 @@ struct GateEventCard: View {
 
     private var stopped: Bool { event.action == "block" }
     private var tint: Color { stopped ? P.red : P.amber }
-    private var sessionLabel: String {
-        event.sessionName ?? (event.sessionID.isEmpty ? "Unknown session" : event.sessionID)
+    /// A folder only identifies a session when it is the session's own working
+    /// directory. Scratch and job dirs are shared by every session, so naming a
+    /// card after one reads like a session name while identifying nothing.
+    private var folderName: String? {
+        guard let c = event.cwd, !c.isEmpty else { return nil }
+        let path = (c as NSString).standardizingPath
+        if path.hasPrefix("/tmp") || path.hasPrefix("/private/tmp")
+            || path.hasPrefix("/var") || path.hasPrefix("/private/var")
+            || path.contains("/.claude/jobs/") || path == "/" { return nil }
+        let base = (path as NSString).lastPathComponent
+        let generic: Set<String> = ["tmp", "temp", "var", "private", "src",
+                                    "dist", "build", "node_modules", "Users"]
+        if base.isEmpty || generic.contains(base) { return nil }
+        return base
     }
+    private var recordedName: String? {
+        guard let n = event.sessionName, !n.isEmpty else { return nil }
+        return n
+    }
+    /// Most rows never recorded a name, so the id alone is what used to show —
+    /// useless for finding the session it belongs to. A running session may be
+    /// named from live state: that is not history being rewritten, it is the
+    /// one case the reader can act on. Anything finished falls back to what the
+    /// row itself carried.
+    private var sessionLabel: String {
+        if let live = liveSession { return live.name }
+        if let n = recordedName { return n }
+        if let f = folderName { return f }
+        return event.sessionID.isEmpty ? "unknown session" : event.sessionID
+    }
+    private var sessionNote: String {
+        if liveSession != nil { return "running now" }
+        if recordedName != nil { return "not running" }
+        if folderName != nil { return "folder · session not running" }
+        return ""
+    }
+    private var sessionDot: Color? { liveSession != nil ? P.green : nil }
     private var matchLabel: String {
         guard let c = event.classification else { return "Rule match not recorded" }
         if c.source == "learned" {
@@ -803,7 +841,11 @@ struct GateEventCard: View {
                 .textSelection(.enabled)
 
             if expanded {
-                eventDetail("Session", sessionLabel)
+                eventDetail("Session", sessionNote.isEmpty
+                            ? sessionLabel : "\(sessionLabel) — \(sessionNote)")
+                if let c = event.cwd, !c.isEmpty {
+                    eventDetail("Working directory", c)
+                }
                 eventDetail("Command match", fullMatchLabel)
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -818,8 +860,17 @@ struct GateEventCard: View {
                 }
                 eventDetail("Outcome", outcome)
             } else {
-                Text("Session \(sessionLabel) · \(relative(event.ts))")
-                    .font(.system(size: 8.5)).foregroundColor(P.faint).lineLimit(1)
+                HStack(spacing: 4) {
+                    if let dot = sessionDot {
+                        Circle().fill(dot).frame(width: 5, height: 5)
+                    }
+                    Text(sessionLabel)
+                        .font(.system(size: 8.5, weight: liveSession != nil ? .semibold : .regular))
+                        .foregroundColor(liveSession != nil ? P.text : P.dim)
+                        .lineLimit(1).truncationMode(.middle)
+                    Text("· \(sessionNote) · \(relative(event.ts))")
+                        .font(.system(size: 8.5)).foregroundColor(P.faint).lineLimit(1)
+                }
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text("\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
                         .font(.system(size: 8.5)).foregroundColor(P.dim)
@@ -1497,6 +1548,7 @@ func renderPreview(to path: String) {
     let events = [
         GateEvent(ts: now - 3800, action: "block", mode: "block-critical",
                   sessionID: "829922b2", sessionName: nil,
+                  cwd: "/Users/me/code/Sophiie-Dev-Control",
                   commandRaw: "/usr/bin/python3 ~/.claude/skills/linear/scripts/linear.py issue-get ABC-4573 --json",
                   commandDisplay: "python3 …/linear.py issue-get ABC-4573 --json",
                   classification: nil, legacy: true, level: "CRITICAL", score: 7,
@@ -1504,7 +1556,8 @@ func renderPreview(to path: String) {
                             "swap growing 5094 MB/min"],
                   retryStatus: "waiting", ms: 74),
         GateEvent(ts: now - 7200, action: "block", mode: "block-critical",
-                  sessionID: "4dcb56b8", sessionName: "docs sweep",
+                  sessionID: "4dcb56b8", sessionName: nil,
+                  cwd: "/Users/me/code/docs",
                   commandRaw: "pnpm --filter dashboard typecheck",
                   commandDisplay: "pnpm --filter dashboard typecheck",
                   classification: builtin, legacy: false, level: "CRITICAL", score: 8,

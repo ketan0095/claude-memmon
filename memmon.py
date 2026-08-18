@@ -2186,7 +2186,13 @@ def gate_stats(limit: int | None = None) -> dict:
             "mode": r.get("mode") or "block-critical",
             # Never resolve an old job here: a missing historical name must stay
             # unknown rather than being explained with mutable current state.
-            "session": {"id": sid, "name": r.get("session_name")},
+            # cwd is exempt because it was recorded on the row itself, so it
+            # describes the session as it was, not as it is now. The UI uses it
+            # to label an event whose session never recorded a name — 76% of
+            # rows here — and only names a session outright when it is still
+            # running, which is the case the reader can actually act on.
+            "session": {"id": sid, "name": r.get("session_name"),
+                        "cwd": r.get("cwd")},
             "command": {"raw": cmd,
                         "display": r.get("cmd_display") or display_command(cmd)},
             "classification": None if legacy else classification,
