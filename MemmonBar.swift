@@ -1148,9 +1148,6 @@ struct ContentView: View {
     }
 
 
-    private var recentWarnings: [GateEvent] {
-        s.gate.events.filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
-    }
     // One recency-ordered list, capped. The cap is the whole point: the log
     // retains hundreds of stops and all but the newest few are history.
     private var recentStops: [GateEvent] {
@@ -1202,7 +1199,7 @@ struct ContentView: View {
                 Button { withAnimation(.easeInOut(duration: 0.16)) { openGate.toggle() } } label: {
                     HStack(spacing: 5) {
                         Chevron(open: isOpen)
-                        Text("COMMAND WARNINGS & STOPS")
+                        Text("COMMAND PROTECTION")
                             .font(.system(size: 8.2, weight: .heavy, design: .rounded))
                             .tracking(0.45).foregroundColor(P.dim)
                     }.contentShape(Rectangle())
@@ -1259,7 +1256,6 @@ struct ContentView: View {
                             .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.green)
                     } else {
                         stoppedHistory
-                        warningHistory
                     }
                 }
             }
@@ -1287,20 +1283,6 @@ struct ContentView: View {
                                   onAllowRetry: onAllowRetry)
                 }
             }
-        }
-    }
-
-    private var warningHistory: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("WARNED — COMMAND RAN")
-                    .font(.system(size: 8, weight: .heavy, design: .rounded))
-                    .tracking(0.45).foregroundColor(P.amber)
-                Spacer()
-                Text("\(s.gate.warned)").font(.system(size: 9, weight: .bold))
-                    .foregroundColor(P.amber)
-            }
-            ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0) }
         }
     }
 
