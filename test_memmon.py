@@ -194,5 +194,39 @@ printf 'saved prompt'
         self.assertIsNone(event["session"]["name"])
 
 
+class PendingPruneTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original = memmon.PENDING
+        memmon.PENDING = os.path.join(self.tmp.name, "blocked.json")
+        memmon.save_pending([
+            {"ts": 1, "session_id": "aaaaaaaa-1111-2222-3333-444444444444",
+             "session": "live one", "cmd": "pnpm build", "cwd": "", "level": "CRITICAL"},
+            {"ts": 2, "session_id": "bbbbbbbb-5555-6666-7777-888888888888",
+             "session": "gone", "cmd": "pnpm test", "cwd": "", "level": "CRITICAL"},
+        ])
+
+    def tearDown(self):
+        memmon.PENDING = self.original
+        self.tmp.cleanup()
+
+    def test_entries_whose_session_exited_are_dropped(self):
+        memmon._prune_pending([{"session_id": "aaaaaaaa-1111-2222-3333-444444444444",
+                                "short": "aaaaaaaa"}])
+        kept = memmon.load_pending()
+        self.assertEqual([i["cmd"] for i in kept], ["pnpm build"])
+
+    def test_short_id_alone_still_matches(self):
+        memmon._prune_pending([{"short": "bbbbbbbb"}])
+        self.assertEqual([i["cmd"] for i in memmon.load_pending()], ["pnpm test"])
+
+    def test_no_visible_sessions_never_empties_the_queue(self):
+        # A failed collection must not be read as "every session exited".
+        memmon._prune_pending([])
+        self.assertEqual(len(memmon.load_pending()), 2)
+        memmon._prune_pending([{"name": "no id recorded"}])
+        self.assertEqual(len(memmon.load_pending()), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

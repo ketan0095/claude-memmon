@@ -1705,6 +1705,29 @@ NOTIFY_PENDING_FRESH_S = 4 * 3600
 NOTIFY_COOLDOWN_S = 2 * 3600
 
 
+def _prune_pending(sessions: list[dict]) -> None:
+    """Drop blocked commands whose session no longer exists.
+
+    Nothing can ever re-run them — the session that owned the command is gone —
+    so they sit in the queue claiming to be waiting. On the machine this was
+    written for, 18 of 26 entries belonged to sessions that had already exited,
+    and 25 of 32 "waiting to retry" badges could never come true.
+
+    A session is matched on its id, not its name, which is mutable. Pruning is
+    skipped entirely when no sessions are visible, so one failed collection
+    cannot empty the queue."""
+    alive = {s["session_id"] for s in sessions if s.get("session_id")}
+    alive |= {s["short"] for s in sessions if s.get("short")}
+    if not alive:
+        return
+    items = load_pending()
+    kept = [i for i in items
+            if (i.get("session_id") or "") in alive
+            or (i.get("session_id") or "")[:8] in alive]
+    if len(kept) != len(items):
+        save_pending(kept)
+
+
 def _maybe_notify(row: dict) -> None:
     """Post at most one macOS notification per genuine, sustained recovery.
 
@@ -1769,6 +1792,11 @@ def log_sample(snap: dict) -> None:
         prev_run = 0
     row["_healthy_run"] = prev_run + 1 if row["pressure"] == "HEALTHY" else 0
 
+    # Prune before notifying, so the count is of commands that can still run.
+    try:
+        _prune_pending(snap.get("sessions") or [])
+    except Exception:
+        pass
     try:
         _maybe_notify(row)
     except Exception:
