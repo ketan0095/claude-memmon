@@ -260,6 +260,19 @@ memmon --on            resume the gate now
 memmon --clear-gate-log  reset the gate counters
 ```
 
+## Working out whether you need a bigger machine
+
+Once the sampler has a week of real working days, the history is enough to answer
+"is 16 GB actually enough for how I work" with measurements rather than impressions.
+
+[`docs/MEMORY-CASE-PROMPT.md`](docs/MEMORY-CASE-PROMPT.md) is a prompt to hand an agent
+that does exactly that against your own data. It matters mainly for what it tells the
+agent *not* to trust: the sampler can double-record minutes, some samples are partial
+reads taken while the machine was too busy to answer, the kernel's swap counters reset
+on reboot and occasionally report impossible values, and the gate log only retains a day
+or two — every one of those produced a wrong number before it was caught. It also starts
+by checking whether the machine can be upgraded at all, which on Apple Silicon it cannot.
+
 ## Two ways to measure memory, and why it matters
 
 Every process has two memory numbers, and they can differ by 50x.
