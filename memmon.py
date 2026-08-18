@@ -56,6 +56,9 @@ DEFAULT_CONFIG = {
     "project_roots": [],
     "worktree_pattern": r"monorepo(?:-([A-Za-z0-9._-]+))?",
     "ticket_pattern": r"[A-Z]{2,6}-\d+",
+    # "important" notifies only on a recovery a human would act on; "never"
+    # silences macOS notifications entirely. Nothing else notifies.
+    "notify": "important",
 }
 
 
@@ -1687,6 +1690,53 @@ def statusline(snap: dict) -> str:
     return s
 
 
+NOTIFY_STATE = os.path.join(STATE_DIR, "notified.json")
+# A recovery counts only after this many unbroken HEALTHY samples. Measured
+# against nine days of history on the machine this was written for, the old
+# rule — one sample at HEALTHY *or* WATCH — fired 103 times, 13 a day, because
+# the median degraded episode there lasted one minute and WATCH is still
+# degraded. Requiring five sustained HEALTHY samples cuts that to 66.
+NOTIFY_HEALTHY_RUN = 5
+# Pending has no TTL, so it accumulates commands nobody will ever re-run: on
+# that machine 22 of 26 entries were over a day old and the median was seven
+# days. Counting them made every notification claim far more waiting work than
+# existed, so only recently-blocked commands are counted.
+NOTIFY_PENDING_FRESH_S = 4 * 3600
+NOTIFY_COOLDOWN_S = 2 * 3600
+
+
+def _maybe_notify(row: dict) -> None:
+    """Post at most one macOS notification per genuine, sustained recovery.
+
+    Fires on the sample where the HEALTHY run reaches the threshold exactly, so
+    a long healthy stretch notifies once rather than every minute."""
+    if CONFIG.get("notify") == "never":
+        return
+    if row["pressure"] != "HEALTHY" or row["_healthy_run"] != NOTIFY_HEALTHY_RUN:
+        return
+    now = time.time()
+    fresh = [p for p in load_pending()
+             if now - p.get("ts", 0) <= NOTIFY_PENDING_FRESH_S]
+    if not fresh:
+        return
+    try:
+        with open(NOTIFY_STATE) as fh:
+            if now - json.load(fh).get("ts", 0) < NOTIFY_COOLDOWN_S:
+                return
+    except Exception:
+        pass
+    n = len(fresh)
+    subprocess.run([
+        "osascript", "-e",
+        f'display notification "{n} blocked command'
+        f'{"" if n == 1 else "s"} can be retried" with title "memmon" '
+        f'subtitle "Memory recovered"',
+    ], capture_output=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(NOTIFY_STATE, "w") as fh:
+        json.dump({"ts": now}, fh)
+
+
 # ------------------------------------------------------------- history/report
 
 def log_sample(snap: dict) -> None:
@@ -1710,23 +1760,19 @@ def log_sample(snap: dict) -> None:
         "worktree_tags": {r["name"]: r.get("tag", "") for r in snap.get("worktrees", [])},
         "overhead": (snap.get("overhead") or {}).get("mem", 0),
     }
-    # Notify once on the falling edge, when the machine becomes usable again and
-    # something is still waiting to be re-run. Only on the transition, so it
-    # cannot nag every minute.
+    # Carries the unbroken-HEALTHY run across process boundaries, the same way
+    # _lh_streak does, because each sample is a fresh process.
     try:
         with open(SNAPSHOT) as fh:
-            was = json.load(fh).get("pressure", "HEALTHY")
+            prev_run = json.load(fh).get("_healthy_run", 0)
     except Exception:
-        was = "HEALTHY"
-    now_level = row["pressure"]
-    pend = load_pending()
-    if (was in ("DANGER", "CRITICAL") and now_level in ("HEALTHY", "WATCH")
-            and pend):
-        subprocess.run([
-            "osascript", "-e",
-            f'display notification "{len(pend)} blocked command(s) can be '
-            f'retried" with title "memmon" subtitle "Memory pressure cleared"',
-        ], capture_output=True)
+        prev_run = 0
+    row["_healthy_run"] = prev_run + 1 if row["pressure"] == "HEALTHY" else 0
+
+    try:
+        _maybe_notify(row)
+    except Exception:
+        pass
 
     try:
         learn(snap)

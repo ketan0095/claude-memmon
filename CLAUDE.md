@@ -85,9 +85,12 @@ monitor sounds like it should need them.
   for the current user's own processes.
 - The menu-bar app is compiled locally by `swiftc` and is ad-hoc signed with no
   quarantine attribute, so Gatekeeper does not prompt.
-- **Notifications**: the sampler posts one via `osascript` when pressure clears
-  and blocked commands are waiting. macOS may ask to allow notifications the
-  first time. Declining costs only that notification.
+- **Notifications**: this is the only one the tool posts. The sampler sends it
+  via `osascript` after memory has been HEALTHY for five unbroken samples and a
+  command blocked in the last four hours is still waiting, at most once every
+  two hours. Set `{"notify": "never"}` in `~/.claude/memmon/config.json` to
+  silence it. macOS may ask to allow notifications the first time; declining
+  costs only that notification.
 
 Everything is local — no network calls, no telemetry.
 
