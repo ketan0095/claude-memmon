@@ -134,6 +134,9 @@ struct Sess: Identifiable {
     var total: Double, ram: Double, swap: Double
     var procs: Int, subActive: Int
     var root: Int
+    /// First 8 chars of the Claude session id — the only exact join to a
+    /// GateEvent, whose session field carries the same short form.
+    var shortID: String = ""
     var children: [Child] = []
     var agents: [Agent] = []       // active only — finished ones are noise
     var subFinished: Int = 0
@@ -300,6 +303,7 @@ final class Model: ObservableObject {
                 procs: d["nproc"] as? Int ?? 0,
                 subActive: subs.count,
                 root: d["root"] as? Int ?? 0,
+                shortID: d["short"] as? String ?? "",
                 children: kids.map {
                     Child(tag: $0["tag"] as? String ?? "?",
                           worktree: $0["worktree"] as? String ?? "",
@@ -743,21 +747,13 @@ struct FooterButton: View {
     }
 }
 
-struct DecisionRow: View {
-    var level: String, result: String
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(level)
-                .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                .foregroundColor(P.tint(level)).frame(width: 66, alignment: .leading)
-            Text(result).font(.system(size: 9.5)).foregroundColor(P.dim)
-            Spacer(minLength: 0)
-        }
-    }
-}
-
 struct GateEventCard: View {
     var event: GateEvent
+    /// Non-nil only when the session that owned this command is still running,
+    /// so the kill action can never target a dead or recycled pid.
+    var liveSession: Sess? = nil
+    var onStopSession: (Sess) -> Void = { _ in }
+    var onAllowRetry: () -> Void = {}
     @State private var expanded = false
 
     private var stopped: Bool { event.action == "block" }
@@ -839,6 +835,24 @@ struct GateEventCard: View {
                         .background(Capsule().fill(P.red.opacity(0.14)))
                 }
             }
+
+            if stopped && (liveSession != nil || event.retryStatus == "waiting") {
+                HStack(spacing: 6) {
+                    if let live = liveSession {
+                        FooterButton(icon: "stop.fill", label: "Stop session",
+                                     tint: P.red) { onStopSession(live) }
+                            .help("End \u{201C}\(live.name)\u{201D} and every process it started")
+                    }
+                    if event.retryStatus == "waiting" {
+                        FooterButton(icon: "play.fill", label: "Allow retries",
+                                     tint: P.green) { onAllowRetry() }
+                            .help("Pause memory checks for 15 minutes so waiting "
+                                + "commands can run. Applies to every session, "
+                                + "then re-arms on its own.")
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -857,35 +871,6 @@ struct GateEventCard: View {
     }
 }
 
-struct MissingGateEventCard: View {
-    var item: PendingRetry
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 5) {
-                Text("■").font(.system(size: 8, weight: .black)).foregroundColor(P.red)
-                Text("STOPPED · COMMAND DID NOT RUN")
-                    .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                    .foregroundColor(P.red)
-                Spacer()
-                Text(eventTime(item.ts)).font(.system(size: 8.5)).foregroundColor(P.faint)
-            }
-            Text(item.commandDisplay)
-                .font(.system(size: 9.5, design: .monospaced)).foregroundColor(P.text)
-                .lineLimit(2).textSelection(.enabled)
-            Text("Session \(item.sessionName ?? item.sessionID) · \(relative(item.ts))")
-                .font(.system(size: 8.5)).foregroundColor(P.faint)
-            Text("Stopped earlier · event details are no longer retained")
-                .font(.system(size: 8.5)).foregroundColor(P.dim)
-            Text("WAITING TO RETRY")
-                .font(.system(size: 8, weight: .heavy, design: .rounded))
-                .foregroundColor(P.red)
-        }
-        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
-    }
-}
-
 // MARK: - main view
 
 struct ContentView: View {
@@ -894,6 +879,7 @@ struct ContentView: View {
     var onReap: () -> Void
     var onEndSession: (Sess) -> Void = { _ in }
     var onToggleGate: (Bool) -> Void = { _ in }
+    var onAllowRetry: () -> Void = {}
     /// ImageRenderer cannot lay out a ScrollView offscreen — it renders empty.
     /// The preview drops the scroll container so the real content is exercised.
     var flattened = false
@@ -911,9 +897,7 @@ struct ContentView: View {
     // Reference material, not status: you read the rule list once and then know
     // it. Left open it re-imposed ~150pt above the RAM/Swap tiles on every
     // popover open, which is the opposite of what those tiles are for.
-    @State var openMatchRules = false
-    @State var showAllWarnings = false
-    @State var showAllStops = false
+
     @State var expandedSessions: Set<String> = []
 
     private var s: Snap { model.snap }
@@ -1116,19 +1100,18 @@ struct ContentView: View {
     private var recentWarnings: [GateEvent] {
         s.gate.events.filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
     }
-    // Stops split by whether they still represent unfinished work. A command
-    // that never ran and is still waiting is the one thing here nobody should
-    // have to expand a disclosure to find, so those are always listed in full.
-    // Everything else is history and is capped like the warnings are — an
-    // uncapped list grew with the log and pushed the rest of the popover down
-    // for no benefit, since an already-retried stop is not actionable.
-    private var pendingStops: [GateEvent] {
-        s.gate.events.filter { $0.action == "block" && $0.retryStatus == "waiting" }
-            .sorted { $0.ts > $1.ts }
+    // One recency-ordered list, capped. The cap is the whole point: the log
+    // retains hundreds of stops and all but the newest few are history.
+    private var recentStops: [GateEvent] {
+        s.gate.events.filter { $0.action == "block" }.sorted { $0.ts > $1.ts }
     }
-    private var resolvedStops: [GateEvent] {
-        s.gate.events.filter { $0.action == "block" && $0.retryStatus != "waiting" }
-            .sorted { $0.ts > $1.ts }
+    private static let stopsShown = 5
+
+    /// A gate event stores an 8-char session id; a killable session is matched
+    /// on that alone. No match means the session already exited.
+    private func liveSession(for e: GateEvent) -> Sess? {
+        guard !e.sessionID.isEmpty else { return nil }
+        return s.sessions.first { $0.shortID == e.sessionID && $0.root > 0 }
     }
 
     private var policyCopy: String {
@@ -1145,18 +1128,6 @@ struct ContentView: View {
         }
     }
 
-    private func policyResult(_ level: String) -> String {
-        if s.gate.paused { return "runs without a memory check" }
-        if level == "HEALTHY" { return "runs silently" }
-        if s.gate.mode == "warn" { return "warned; command ran" }
-        if s.gate.mode == "block" && (level == "DANGER" || level == "CRITICAL") {
-            return "stopped before running"
-        }
-        if s.gate.mode == "block-critical" && level == "CRITICAL" {
-            return "stopped before running"
-        }
-        return "warned; command ran"
-    }
 
     private var retryCopy: String {
         if s.gate.paused {
@@ -1225,43 +1196,6 @@ struct ContentView: View {
                     if g.paused {
                         Text(policyCopy).font(.system(size: 9.5)).foregroundColor(P.amber)
                             .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text("Only commands that match a memory-intensive rule are checked.")
-                            .font(.system(size: 9.5)).foregroundColor(P.dim)
-                        Text(policyCopy).font(.system(size: 9.5, weight: .medium))
-                            .foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Text("MATCHED COMMAND + MEMORY THEN → RESULT")
-                        .font(.system(size: 8, weight: .heavy, design: .rounded))
-                        .tracking(0.45).foregroundColor(P.faint)
-                    VStack(spacing: 3) {
-                        DecisionRow(level: "HEALTHY", result: policyResult("HEALTHY"))
-                        DecisionRow(level: "WATCH", result: policyResult("WATCH"))
-                        DecisionRow(level: "DANGER", result: policyResult("DANGER"))
-                        DecisionRow(level: "CRITICAL", result: policyResult("CRITICAL"))
-                    }
-
-                    Button { withAnimation(.easeInOut(duration: 0.16)) {
-                        openMatchRules.toggle()
-                    }} label: {
-                        HStack {
-                            Text("WHAT COMMANDS MATCH?")
-                                .font(.system(size: 8, weight: .heavy, design: .rounded))
-                                .tracking(0.45).foregroundColor(P.faint)
-                            Spacer()
-                            Chevron(open: openMatchRules)
-                        }.contentShape(Rectangle())
-                    }.buttonStyle(.plain)
-                    if openMatchRules {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Package tasks: typecheck, build, test, install, dev, lint")
-                            Text("Tools: tsc, Vitest, Jest, Playwright, pytest, Cargo, Gradle, Bazel, Xcodebuild, webpack, make, Next, Expo, Docker, Colima")
-                            Text("Verified commands learned from this Mac are labelled “Learned”.")
-                            Text("Other commands run without a memory check.")
-                        }
-                        .font(.system(size: 9)).foregroundColor(P.dim)
-                        .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if g.errors > 0 {
@@ -1269,28 +1203,12 @@ struct ContentView: View {
                             .font(.system(size: 9.5)).foregroundColor(P.amber)
                     }
 
-                    if g.warned == 0 && g.stopped == 0 && g.pending.isEmpty {
-                        Text("No warnings or stops since \(retainedDate(g.since, includeTime: true)).")
+                    if g.warned == 0 && g.stopped == 0 {
+                        Text("No warnings or stops since \(retainedDate(g.since)).")
                             .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.green)
-                        Text("Matched commands run silently while memory is HEALTHY.\nAt WATCH or DANGER they run with a warning.\nAt CRITICAL they are stopped before running.")
-                            .font(.system(size: 9)).foregroundColor(P.dim)
-                            .fixedSize(horizontal: false, vertical: true)
                     } else {
                         stoppedHistory
                         warningHistory
-                    }
-
-                    if g.evaluated > 0 {
-                        Text("Retained activity since \(retainedDate(g.since, includeTime: true)).")
-                            .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        if !g.complete {
-                            Text("Older activity may be missing.")
-                                .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        }
-                        if let to = g.historyTo {
-                            Text("Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate(to, includeTime: true)).")
-                                .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        }
                     }
                 }
             }
@@ -1307,38 +1225,16 @@ struct ContentView: View {
                 Text("\(s.gate.stopped)").font(.system(size: 9, weight: .bold))
                     .foregroundColor(P.red)
             }
-            if !s.gate.pending.isEmpty {
-                Text("\(s.gate.pending.count) waiting to retry")
-                    .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.red)
-                Text(retryCopy).font(.system(size: 9)).foregroundColor(
-                    s.level == "HEALTHY" || s.gate.paused ? P.green : P.amber)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            // Unfinished work first, never truncated.
-            ForEach(pendingStops) { GateEventCard(event: $0) }
-            ForEach(s.gate.pending.filter { !$0.eventRetained }) {
-                MissingGateEventCard(item: $0)
-            }
-            if showAllStops {
-                LazyVStack(spacing: 7) {
-                    ForEach(resolvedStops) { GateEventCard(event: $0) }
-                }
-            } else {
-                ForEach(Array(resolvedStops.prefix(3))) { GateEventCard(event: $0) }
-            }
-            if resolvedStops.count > 3 {
-                Button(showAllStops
-                       ? "Show only 3 recent stops"
-                       : "Show all \(resolvedStops.count) earlier stops") {
-                    withAnimation(.easeInOut(duration: 0.16)) { showAllStops.toggle() }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundColor(P.red)
-            }
-            if pendingStops.isEmpty && resolvedStops.isEmpty && s.gate.pending.isEmpty {
-                Text("No commands have been stopped since \(retainedDate(s.gate.since)).")
+            if recentStops.isEmpty {
+                Text("Nothing stopped since \(retainedDate(s.gate.since)).")
                     .font(.system(size: 9)).foregroundColor(P.faint)
+            } else {
+                ForEach(Array(recentStops.prefix(Self.stopsShown))) { ev in
+                    GateEventCard(event: ev,
+                                  liveSession: liveSession(for: ev),
+                                  onStopSession: onEndSession,
+                                  onAllowRetry: onAllowRetry)
+                }
             }
         }
     }
@@ -1353,23 +1249,7 @@ struct ContentView: View {
                 Text("\(s.gate.warned)").font(.system(size: 9, weight: .bold))
                     .foregroundColor(P.amber)
             }
-            if showAllWarnings {
-                LazyVStack(spacing: 7) {
-                    ForEach(recentWarnings) { GateEventCard(event: $0) }
-                }
-            } else {
-                ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0) }
-            }
-            if recentWarnings.count > 3 {
-                Button(showAllWarnings
-                       ? "Show only 3 recent warnings"
-                       : "Show all \(s.gate.warned) retained warnings") {
-                    withAnimation(.easeInOut(duration: 0.16)) { showAllWarnings.toggle() }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundColor(P.amber)
-            }
+            ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0) }
         }
     }
 
@@ -1447,7 +1327,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                   onEndSession: { [weak self] s in
                                       self?.endSession(s) },
                                   onToggleGate: { [weak self] pause in
-                                      self?.toggleGate(pause) }))
+                                      self?.toggleGate(pause) },
+                                  onAllowRetry: { [weak self] in
+                                      self?.allowRetry() }))
 
         statusItem.button?.action = #selector(toggle)
         statusItem.button?.target = self
@@ -1507,6 +1389,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertSecondButtonReturn else { return }
         model.run(["--end-session", "\(s.root)", "--apply"])
+        model.refresh()
+    }
+
+    /// A timed pause rather than the indefinite one, because this is invoked
+    /// from a single stopped command: the intent is "let this through", not
+    /// "disarm the gate". It re-arms itself, so a forgotten click cannot leave
+    /// the machine unprotected.
+    func allowRetry() {
+        model.run(["--off", "15m"])
         model.refresh()
     }
 
@@ -1578,11 +1469,11 @@ func renderPreview(to path: String) {
         Sess(name: "docs sweep", state: "blocked",
              doing: "waiting on the codegen step",
              total: 1.4 * GB, ram: 1.0 * GB, swap: 0.4 * GB, procs: 7,
-             subActive: 0, root: 57020),
+             subActive: 0, root: 57020, shortID: "4dcb56b8"),
         Sess(name: "checkout redesign", state: "done",
              doing: "audit complete; 2 checks running",
              total: 653 * MB, ram: 352 * MB, swap: 301 * MB, procs: 4,
-             subActive: 2, root: 17525),
+             subActive: 2, root: 17525, shortID: "73082786"),
         Sess(name: "pr #412 review", state: "terminal",
              doing: "reviewing the checkout diff",
              total: 505 * MB, ram: 240 * MB, swap: 265 * MB, procs: 4,
@@ -1626,8 +1517,7 @@ func renderPreview(to path: String) {
                       shape: "docker compose build", samples: nil, observedPeak: nil,
                       blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
                   reasons: ["swap growing 1330 MB/min"], retryStatus: "not_waiting", ms: 71),
-        // Four resolved stops so the preview exercises the overflow control;
-        // with three or fewer it never renders and the path goes unreviewed.
+        // More stops than the cap, so the render proves the list truncates.
         GateEvent(ts: now - 96000, action: "block", mode: "block-critical",
                   sessionID: "8ed32708", sessionName: "search indexing",
                   commandRaw: "npx vitest run --coverage",
