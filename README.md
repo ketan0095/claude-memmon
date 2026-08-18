@@ -149,10 +149,10 @@ first, is idempotent, and preserves any hooks you already have.
 
 ## Giving this to someone else
 
-**They need access first.** This repo is private, so `git clone` fails for anyone
-who is not a collaborator — it asks for a username and gives up. Either add them
-on GitHub (Settings → Collaborators) or make the repo public. Nothing else in
-this section matters until that is done.
+**Access.** The repo is public, so `git clone` works for anyone and there is
+nothing to grant. If you ever make it private again this becomes the first step:
+a non-collaborator's clone fails by asking for a username and giving up, so add
+them under Settings → Collaborators before anything else here matters.
 
 **Tell them what they are agreeing to.** This is not a passive monitor. Installed
 with all flags it changes four things outside its own directory, and a reasonable
