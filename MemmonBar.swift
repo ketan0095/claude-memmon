@@ -349,7 +349,7 @@ struct Owner: Identifiable {
         switch kind {
         case "service": return "Not assigned to a session"
         case "codex-app": return "Shared process — memory not split by thread"
-        case "codex-ui": return "Runs in the Codex daemon"
+        case "codex-ui": return "Frontend only — no stop action"
         default: return agentLabel
         }
     }
@@ -397,11 +397,6 @@ struct Owner: Identifiable {
         o.instances = (d["instances"] as? [[String: Any]])?.compactMap { i in
             int(i["pid"]).map { AppInstanceInfo(pid: $0, launchDate: launchDate(i["launch_date"])) }
         }
-        if let conv = d["conversation"] as? [String: Any] {
-            o.jobs.append(OwnerJob(id: "\(id)#conversation", kind: "conversation", label: "conversation",
-                                   footprint: num(conv["footprint_bytes"]),
-                                   memberCount: int(conv["member_count"]), token: nil, action: nil))
-        }
         o.sharedWith = strs(d["shared_with"])
         o.stopCommand = str(d["stop_command"])
         o.usedBy = strs(d["used_by"])
@@ -423,6 +418,8 @@ func launchDate(_ v: Any?) -> Double? {
 struct OwnersSnap {
     var ts: Double?, source: String?, inventory: String?, cpuWindow: Double?
     var inventoryReason: String?, hiddenProcesses: Int?
+    /// memmon's own totals for the collapsed Unattributed row.
+    var unattributed: [String: Any]?
     var system = SystemInfo()
     var protection: Protection?
     var gate = GateStats()
@@ -443,6 +440,7 @@ struct OwnersSnap {
         s.ts = num(j["ts"]); s.source = str(j["source"])
         s.inventory = str(j["inventory"]); s.cpuWindow = num(j["cpu_window_s"])
         s.inventoryReason = str(j["inventory_reason"]); s.hiddenProcesses = int(j["hidden_process_count"])
+        s.unattributed = j["unattributed"] as? [String: Any]
         if let y = j["system"] as? [String: Any] {
             s.system = SystemInfo(ramBytes: num(y["ram_bytes"]), usedBytes: num(y["used_bytes"]),
                                   pressureLevel: str(y["pressure_level"]),
@@ -474,11 +472,20 @@ struct OwnersSnap {
         g.confidence = "unknown"
         g.group = unknown
         g.footprint = sum(unknown.map { $0.footprint })
-        g.cpu = sum(unknown.map { $0.cpu })
+        // A partial sum would understate the row, so CPU shows only when every
+        // unattributed tree was measured.
+        let cpus = unknown.compactMap { $0.cpu }
+        g.cpu = cpus.count == unknown.count ? cpus.reduce(0, +) : nil
         g.cpuReason = unknown.first { $0.cpu == nil }?.cpuReason ?? "not measured"
         g.growth = nil
         g.growthReason = "not tracked"
         g.memberCount = unknown.reduce(0) { $0 + ($1.memberCount ?? 1) }
+        if let u = unattributed {
+            g.footprint = num(u["footprint_bytes"]) ?? g.footprint
+            g.memberCount = int(u["member_count"]) ?? g.memberCount
+            g.growth = num(u["growth_bytes_per_10min"])
+            g.growthReason = str(u["growth_reason"]) ?? "not enough history"
+        }
         out.append(g)
         return out
     }
@@ -1786,7 +1793,9 @@ struct ConfirmOverlay: View {
                            title: "\(plural(n, "process", "processes")) still running",
                            target: label,
                            sub: "\(exited) of \(exited + n) exited · \(n) still running after 10 s",
-                           message: "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost.",
+                           message: "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost."
+                               + (owner.agent == "codex" && isEndSession
+                                  ? " A Codex terminal stopped this way may need `reset` afterwards." : ""),
                            safe: isEndSession ? nil : (keepsConversation ? "The conversation keeps running either way." : nil),
                            safeButton: "Leave running", safeSpoken: "Leave the \(plural(n, "remaining process", "remaining processes")) running",
                            actButton: "Force stop", actSpoken: "Force stop the \(plural(n, "remaining process", "remaining processes"))",
@@ -2160,6 +2169,7 @@ struct ContentView: View {
             column
                 .blur(radius: model.confirm == nil ? 0 : 4)
                 .allowsHitTesting(model.confirm == nil)
+                .disabled(model.confirm != nil)
                 .accessibilityHidden(model.confirm != nil)
             if let request = model.confirm {
                 P.scrim.transition(.opacity)
@@ -3099,6 +3109,20 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
             case "keys":
                 report["phase_before"] = phase(model)
                 report["focus"] = model.overlayFocus ?? NSNull()
+                // Tab and shift-Tab must cycle inside the overlay; a nil focus
+                // would mean it went to the dimmed list behind it.
+                var trail: [Any] = []
+                for shift in [false, false, false, true, true] {
+                    guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                                                   modifierFlags: shift ? [.shift] : [], timestamp: 0,
+                                                   windowNumber: w.windowNumber, context: nil,
+                                                   characters: "\t", charactersIgnoringModifiers: "\t",
+                                                   isARepeat: false, keyCode: 48) else { continue }
+                    w.sendEvent(e)
+                    spin(0.15)
+                    trail.append(model.overlayFocus ?? NSNull())
+                }
+                report["tab_trail"] = trail
                 key("\r", 36, in: w)
                 spin(0.3)
                 report["after_return_phase"] = phase(model)
@@ -3131,7 +3155,10 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 }
                 report["before"] = freshness()
                 model.startTicking(every: 0.1)
-                clockOverride = (clockOverride ?? nowTs()) + 95
+                clockOverride = (clockOverride ?? nowTs()) + 5
+                spin(0.5)
+                report["after_5s"] = freshness()
+                clockOverride = (clockOverride ?? nowTs()) + 90
                 spin(0.5)
                 report["after"] = freshness()
                 report["ticks"] = model.tick

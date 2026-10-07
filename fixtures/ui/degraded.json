@@ -35,6 +35,16 @@
    "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
    "jobs": [
     {
+     "job_id": "48211.1791449000.318442",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 1288490188,
+     "member_count": 3,
+     "token": null
+    },
+    {
      "job_id": "48302.1791449100.120044",
      "kind": "build",
      "label": "typecheck",
@@ -55,10 +65,6 @@
      "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLXNlcnZlciIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODI2MCwic3RhcnQiOlsxNzkxNDQ5MDUwLDUwMDEwMF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
     }
    ],
-   "conversation": {
-    "member_count": 3,
-    "footprint_bytes": 1288490188
-   },
    "actions": [
     "end-session"
    ],
@@ -181,11 +187,17 @@
     ]
    },
    "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY29kZXg6Zml4dHVyZS1iIiwib3duZXJfcm9vdCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInRhcmdldCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
-   "conversation": {
-    "member_count": 2,
-    "footprint_bytes": 536870912
-   },
    "jobs": [
+    {
+     "job_id": "7310.1791449800.1200",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 536870912,
+     "member_count": 2,
+     "token": null
+    },
     {
      "job_id": "7333.1791449820.4000",
      "kind": "test",

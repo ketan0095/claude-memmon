@@ -403,6 +403,18 @@ class AccessibilityTests(unittest.TestCase):
         spoken = " ".join(r["value"] for r in a11y("outcome-stopped.json"))
         self.assertIn("5 of 5 processes exited", spoken)
 
+    def test_contract_shapes_conversation_job_codex_frontend_and_unattributed(self):
+        detail = labels(a11y("session-detail.json"))
+        self.assertIn("Conversation, 1.2 GB · stays open when you stop a build", detail)
+        self.assertFalse(any(l.startswith("Stop job: Conversation") for l in detail))
+        shared = labels(a11y("shared-detail.json"))
+        pointer = next(l for l in shared if l.startswith("Docs pass,"))
+        self.assertIn("Codex thread · runs in the Codex daemon", pointer)
+        self.assertIn("ownership confidence: shared", pointer)
+        growth = labels(a11y("growth-sort.json"))
+        unattributed = next(l for l in growth if l.startswith("Unattributed,"))
+        self.assertIn("growth not available, not enough history, 1.8 GB", unattributed)
+
     def test_degraded_inventory_offers_no_stop_buttons(self):
         found = labels(a11y("degraded.json"))
         self.assertFalse(any(l.startswith(("Stop build", "Stop server", "End session")) for l in found))
@@ -436,6 +448,8 @@ class HostedPopoverTests(unittest.TestCase):
     def test_confirm_starts_on_cancel_ignores_return_and_esc_dismisses(self):
         r = self.host("keys", "confirm-stop.json")
         self.assertEqual((r["phase_before"], r["focus"]), ("ask", "safe"))
+        # Tab and shift-Tab never leave the overlay's two buttons.
+        self.assertEqual(r["tab_trail"], ["act", "safe", "act", "safe", "act"])
         self.assertEqual(r["after_return_phase"], "ask")
         self.assertEqual(r["after_return_actions"], [])
         self.assertEqual(r["after_esc_phase"], "closed")
@@ -444,6 +458,7 @@ class HostedPopoverTests(unittest.TestCase):
     def test_partial_starts_on_leave_running_and_return_never_forces(self):
         r = self.host("keys", "outcome-partial.json")
         self.assertEqual((r["phase_before"], r["focus"]), ("partial", "safe"))
+        self.assertTrue(all(f in ("safe", "act") for f in r["tab_trail"]), r["tab_trail"])
         self.assertNotIn("force", r["after_return_actions"])
         self.assertEqual(r["after_return_phase"], "partial")
         self.assertEqual(r["after_esc_phase"], "closed")
@@ -463,6 +478,7 @@ class HostedPopoverTests(unittest.TestCase):
     def test_freshness_ticker_marks_a_live_sample_stale_after_95_s(self):
         r = self.host("ticker", "overview.json")
         self.assertEqual(r["before"], "Sampled 2s ago by the live reader")
+        self.assertEqual(r["after_5s"], "Sampled 7s ago by the live reader")
         self.assertTrue(r["after"].endswith(", stale"), r["after"])
         self.assertGreaterEqual(r["ticks"], 1)
 
