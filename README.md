@@ -451,9 +451,13 @@ nearest one wins.
 | Codex daemon / app-server | the shared server that hosts interactive threads | shared |
 | Codex terminal frontend | an interactive `codex` with no children — a pointer to the daemon | inferred |
 | Managed job | the child of a live `memmon run` lease | exact |
-| App | an executable inside an `Applications/<Name>.app` bundle; one row, every instance | exact |
-| VM / container service | the Virtualization VM process, Lima/Colima, qemu | shared |
+| App | an executable in `Contents/MacOS` of an `Applications/<Name>.app` (the outermost bundle, helpers included); one row, every instance | exact |
+| VM / container service | Docker Desktop or OrbStack (quit as an app), or the Virtualization VM process, Lima/Colima, qemu (a copyable stop command) | shared |
 | Unattributed | any other top-level process tree | unknown |
+
+A language runtime that merely lives inside an app bundle — Python inside
+Xcode's `Python3.framework` — does not make its programs part of that app, and
+memmon's own process is never counted inside the app it runs in.
 
 Memory is each process's footprint (what Activity Monitor and `top` call MEM),
 summed over the owner. It is read with libproc, about 4 ms for every process on
