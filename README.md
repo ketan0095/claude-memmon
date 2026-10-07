@@ -321,9 +321,14 @@ memmon --pressure      crash-risk verdict only (fast, no top)
 memmon --report        per-app / per-worktree averages from history
 memmon --blocked       commands the gate refused that nobody has re-run
 memmon --gate-log      gate impact: what was evaluated, advised, blocked
-memmon --reap          orphaned build processes (add --apply to kill)
+memmon owners          every process, partitioned into exactly one owner
+memmon owners --json   the same as schema 2 JSON (what the menu bar reads)
+memmon act ACTION --target TOKEN   identity-checked stop (see below)
+memmon reap [--apply]  orphaned build processes; --apply stops at partial
+memmon reap --force TOKEN   SIGKILL exactly the survivors a partial reap named
+memmon --reap          same as `memmon reap` (add --apply to stop them)
 memmon --reap-spares   idle prewarms >4h (claimed sessions never touched)
-memmon --end-session PID   terminate a session by root pid (--apply to do it)
+memmon --end-session PID   end a session by root pid (--apply to do it)
 memmon --wait-safe     block until memory pressure clears
 memmon --json          machine-readable snapshot
 memmon --statusline    one compact line, for a shell/Claude statusline
@@ -442,6 +447,84 @@ Before this check the pool looked like "14 idle prewarms holding 2.7 GB" when it
 was really 2 idle prewarms holding 186 MB plus six working sessions, one of them
 22 hours old. `--reap-spares` excludes claimed sessions unconditionally.
 
+## Owners and targeted stops
+
+`memmon owners` answers "whose is this?" for every process you can see. Each
+process belongs to exactly one owner, so nothing is counted twice, and when one
+owner runs inside another (a session started from another session's shell) the
+nearest one wins.
+
+| Owner | Found by | Confidence |
+|---|---|---|
+| Claude session | `~/.claude/sessions/<pid>.json`, checked against the process start time | exact |
+| Codex `exec` | a `codex exec` process; its thread from the rollout file it holds open | inferred |
+| Codex daemon / app-server | the shared server that hosts interactive threads | shared |
+| Codex terminal frontend | an interactive `codex` with no children — a pointer to the daemon | inferred |
+| Managed job | the child of a live `memmon run` lease | exact |
+| App | an executable inside an `Applications/<Name>.app` bundle; one row, every instance | exact |
+| VM / container service | the Virtualization VM process, Lima/Colima, qemu | shared |
+| Unattributed | any other top-level process tree | unknown |
+
+Memory is each process's footprint (what Activity Monitor and `top` call MEM),
+summed over the owner. It is read with libproc, about 4 ms for every process on
+the machine, instead of `top`'s ~0.6 s. Other users' and root's processes cannot
+be read without privileges; they are listed as "not itemised", never as zero.
+A number memmon could not read is shown as `—` with the reason, never as 0.
+
+CPU needs two samples. The popover takes them a second apart; the sampler keeps
+a baseline so the next tick can measure against it. Growth per 10 minutes needs
+at least 5 samples over 10 minutes with no gap longer than 3 minutes, so a
+freshly started owner, or one seen across a sleep, says "not enough history".
+
+### Stopping something
+
+`memmon act` is the only part of memmon that sends a signal, and the menu bar
+goes through it too. Each action takes a token from `memmon owners --json` that
+names the exact processes it was shown, and expires after 120 seconds:
+
+| Action | Stops | Keeps running |
+|---|---|---|
+| `stop-job` / `stop-server` | one build, test or dev server inside a session | the session's conversation and every other owner |
+| `stop-managed-job` | the child of a `memmon run`; its wrapper then exits 143 | the wrapper and everything else |
+| `end-session` | a Claude session or a `codex exec`, down to any nested session | nested sessions (reported as kept) |
+| `verify-app` | nothing — checks every instance of an app before the menu bar quits it | — |
+
+Every signal goes to one process at a time, immediately after re-reading that
+process's identity (PID plus start time to the microsecond) and finding it
+unchanged. There is no process-group kill. A PID that was reused, or a process
+that moved to another owner, is refused rather than signalled. One residual
+race remains and is stated rather than hidden: a process that exits and has its
+PID reused in the instant between that re-read and the signal would be signalled.
+
+It is graceful first. Everything gets SIGTERM; memmon then watches for up to 10
+seconds, catching any child forked in the meantime, and reports exactly what is
+still alive. Nothing is force-killed automatically. If something survives, the
+result is `partial` with a force token naming only those survivors, and only
+`memmon act force --target <token>` sends SIGKILL to them — after re-reading each
+one again. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial),
+4 (refused) or 1 (error), and it reports memory in use before and after as a
+measurement: other apps change it too, so it is never a promise of what was freed.
+
+`MEMMON_INVENTORY=top` forces the old `ps`/`top` inventory. memmon also falls
+back to it on its own if libproc ever fails its self-check; in that mode every
+action is refused, because one-second start times are not an identity.
+
+### Behaviour change: `reap --apply` stops at partial
+
+`memmon reap --apply` used to send SIGTERM, wait two seconds and SIGKILL whatever
+was left — including, if a PID had been reused in those two seconds, a process
+that was not the orphan at all. It now uses the same engine as `memmon act`:
+each orphan is re-checked against the orphan rule and must still be unattributed,
+gets SIGTERM, and anything that survives is listed with a command:
+
+```
+memmon reap --force <token>
+```
+
+That token names only the processes that survived, by identity, and expires
+after 120 seconds. Orphans that appeared after the first run are never touched
+by it. `--reap-spares --apply` goes through the same engine.
+
 ## Crash prediction
 
 `HEALTHY → WATCH → DANGER → CRITICAL`, scored from:
@@ -467,7 +550,8 @@ consults when deciding whether to start killing processes. It is the only
 free-memory number worth scoring.
 
 The `~N min left` badge projects when that figure reaches **20%**, at the current
-rate of decline. Two samples, 60 seconds apart:
+rate of decline. It is a trend estimate of when free memory reaches that floor —
+not a time until the machine freezes, which nothing on macOS can predict. Two samples, 60 seconds apart:
 
 ```
 headroom_min = (current % − 20) ÷ (percentage points lost per minute)
@@ -519,8 +603,9 @@ With `--gate`, a session about to run something heavy is told what the rest of t
 machine is doing:
 
 > System memory pressure is CRITICAL (swap 1.3x RAM size · heavy thrashing 210 MB/s).
-> web-checkout is holding 23.0G of build processes. At the current rate memory runs out
-> in ~4 min. Do NOT start this command now… scope it down (`pnpm --filter <pkg>`).
+> web-checkout is holding 23.0G of build processes. At the current rate, about 4 min
+> until free memory reaches the 20 % floor (trend estimate). Do NOT start this command
+> now… scope it down (`pnpm --filter <pkg>`).
 
 ### What a session actually sees
 
@@ -558,7 +643,8 @@ On a block, the session receives this on stderr, as the tool result:
 
 > System memory pressure is CRITICAL (swap 1.3x RAM size · heavy thrashing
 > 210 MB/s). web-checkout is holding 23.0G of build processes. At the
-> current rate memory runs out in ~4 min. Do NOT start this command now — it
+> current rate, about 4 min until free memory reaches the 20 % floor (trend
+> estimate). Do NOT start this command now — it
 > would likely freeze the machine and lose work in every session. Either wait and
 > retry, or scope it down (for example `pnpm --filter <package> typecheck`
 > instead of a full-repo run). Check with `memmon --once`.
@@ -646,6 +732,9 @@ Everything lives in `~/.claude/memmon/`. Nothing is written to `/tmp`.
 | `gate.jsonl` | last 500 entries past 256 KB |
 | `latest.json`, `blocked.json` | fixed / last 50 |
 | `sampler.err` | last 200 lines past 1 MB |
+| `owners-history.json` | 60 samples × 200 owners, under ~600 KB |
+| `cpu-baseline.json` | one sample of up to 4,096 processes |
+| `runner/coord/actions.lock` | empty; the lock that serialises every stop |
 
 Worst case ~13 MB, self-limiting. Trimming is by row count, not age — an age
 cutoff further out than the size gate removes nothing, so the file gets rewritten
