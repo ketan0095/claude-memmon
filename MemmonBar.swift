@@ -987,7 +987,22 @@ final class Model: ObservableObject {
 
     var appControl: AppControl = SystemApps()
     /// Off for fixtures: a rendered or audited state must never call memmon.
+    /// Confirmed actions are recorded in `actionLog` instead.
     var live = true
+    var actionLog: [String] = []
+    /// Which overlay button holds keyboard focus, as reported by the overlay.
+    var overlayFocus: String?
+    private var ticker: Timer?
+
+    /// Keeps "Sampled Ns ago" honest while the popover stays open.
+    func startTicking(every seconds: Double = 5) {
+        ticker?.invalidate()
+        ticker = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in
+            self?.tick += 1
+        }
+    }
+
+    func stopTicking() { ticker?.invalidate(); ticker = nil }
 
     var loaded: Bool { snap != nil }
 
@@ -1049,6 +1064,7 @@ final class Model: ObservableObject {
 
     func perform() {
         guard var c = confirm else { return }
+        guard live else { actionLog.append("perform"); return }
         switch c.kind {
         case .stopCommand:
             confirm = nil
@@ -1076,6 +1092,7 @@ final class Model: ObservableObject {
 
     func force() {
         guard var c = confirm else { return }
+        guard live else { actionLog.append("force"); return }
         switch c.phase {
         case .partial(let o):
             guard let tok = o.forceToken else { confirm = nil; return }
@@ -1735,6 +1752,7 @@ struct ConfirmOverlay: View {
     var onCancel: () -> Void
     var onConfirm: () -> Void
     var onForce: () -> Void
+    var onFocus: (String?) -> Void = { _ in }
 
     enum Field: Hashable { case safe, act }
     @FocusState private var focus: Field?
@@ -1919,15 +1937,20 @@ struct ConfirmOverlay: View {
             } else {
                 HStack(spacing: 8) {
                     Spacer(minLength: 0)
+                    // Explicitly focusable: with Keyboard navigation off (the
+                    // macOS default) a button never takes focus otherwise, so
+                    // focus could not start on the safe choice.
                     ActionButton(title: c.safeButton, action: onCancel)
                         .accessibilityLabel(c.safeSpoken)
                         .keyboardShortcut(.cancelAction)
+                        .focusable()
                         .focused($focus, equals: .safe)
                     if let act = c.actButton {
                         ActionButton(title: act, variant: c.actVariant) {
                             if case .ask = request.phase { onConfirm() } else { onForce() }
                         }
                         .accessibilityLabel(c.actSpoken)
+                        .focusable()
                         .focused($focus, equals: .act)
                     }
                 }
@@ -1939,6 +1962,7 @@ struct ConfirmOverlay: View {
         .background(RoundedRectangle(cornerRadius: 17).fill(P.panel))
         .overlay(RoundedRectangle(cornerRadius: 17).stroke(P.border, lineWidth: 1))
         .onAppear { focus = .safe }
+        .task(id: focus) { onFocus(focus.map { $0 == .safe ? "safe" : "act" }) }
         .onExitCommand { if !working { onCancel() } }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(c.title)
@@ -2142,7 +2166,8 @@ struct ContentView: View {
                 ConfirmOverlay(request: request,
                                onCancel: { withAnimation(motion(0.12)) { model.cancel() } },
                                onConfirm: { model.perform() },
-                               onForce: { model.force() })
+                               onForce: { model.force() },
+                               onFocus: { model.overlayFocus = $0 })
                     .padding(.horizontal, 14).padding(.top, 96)
                     .transition(.opacity)
             }
@@ -2721,21 +2746,27 @@ struct ContentView: View {
 
 // MARK: - app
 
+/// The popover's content, shared by the app and the hosted-view self-test.
+/// The popover follows the view's own height, capped at 620 pt.
+@discardableResult
+func configurePopover(_ popover: NSPopover, model: Model, onQuit: @escaping () -> Void)
+    -> NSHostingController<ContentView> {
+    let host = NSHostingController(rootView: ContentView(model: model, onQuit: onQuit))
+    host.sizingOptions = [.preferredContentSize]
+    popover.contentViewController = host
+    return host
+}
+
 final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let popover = NSPopover()
     let model = Model()
     let cache = NSString(string: "~/.claude/memmon/latest.json").expandingTildeInPath
-    var ticker: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let host = NSHostingController(rootView: ContentView(model: model,
-                                                             onQuit: { NSApp.terminate(nil) }))
-        // The popover follows the view's own height, capped at 620 pt.
-        host.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = host
+        configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -2756,15 +2787,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             model.refresh()          // sync on open — the only expensive work
-            // Keeps "Sampled Ns ago" honest while the popover stays open.
-            ticker = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-                self?.model.tick += 1
-            }
+            model.startTicking()
         }
     }
 
     func popoverDidClose(_ note: Notification) {
-        ticker?.invalidate(); ticker = nil
+        model.stopTicking()
         updateTitleFromCache()
     }
 
@@ -2968,23 +2996,135 @@ final class A11yDump: NSObject, NSApplicationDelegate {
     }
 
     func walk(_ element: Any, _ depth: Int) {
-        guard depth < 40, let e = element as? NSAccessibilityElementProtocol else { return }
-        let o = e as AnyObject
-        // KVC rather than the typed accessors: a progress element reports a
-        // number where the protocol promises a string.
-        func attribute(_ key: String) -> String {
-            guard let n = o as? NSObject, n.responds(to: Selector(key)),
-                  let v = n.value(forKey: key) else { return "" }
-            return "\(v)"
+        for row in axRows(element) {
+            print(([String(row.depth), row.role, row.label, row.value, row.described]).joined(separator: "\t"))
         }
-        let role = attribute("accessibilityRole")
-        let label = attribute("accessibilityLabel")
-        let value = attribute("accessibilityValue")
-        // SwiftUI files a textual accessibilityValue here, which VoiceOver reads.
-        let described = attribute("accessibilityValueDescription")
-        let clean = { (s: String) in s.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " ") }
-        print("\(depth)\t\(role)\t\(clean(label))\t\(clean(value))\t\(clean(described))")
-        for c in (o.accessibilityChildren?() ?? nil) ?? [] { walk(c, depth + 1) }
+    }
+}
+
+struct AXRow { var depth: Int, role: String, label: String, value: String, described: String }
+
+/// Flattens the accessibility tree under `element`, depth first.
+func axRows(_ element: Any, _ depth: Int = 0) -> [AXRow] {
+    guard depth < 40, let e = element as? NSAccessibilityElementProtocol else { return [] }
+    let o = e as AnyObject
+    // KVC rather than the typed accessors: a progress element reports a
+    // number where the protocol promises a string.
+    func attribute(_ key: String) -> String {
+        guard let n = o as? NSObject, n.responds(to: Selector(key)),
+              let v = n.value(forKey: key) else { return "" }
+        return "\(v)".replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " ")
+    }
+    // SwiftUI files a textual accessibilityValue under ValueDescription,
+    // which is what VoiceOver reads.
+    var rows = [AXRow(depth: depth, role: attribute("accessibilityRole"),
+                      label: attribute("accessibilityLabel"), value: attribute("accessibilityValue"),
+                      described: attribute("accessibilityValueDescription"))]
+    for c in (o.accessibilityChildren?() ?? nil) ?? [] { rows += axRows(c, depth + 1) }
+    return rows
+}
+
+final class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
+/// Hosts the real popover root (scrolling, adaptive height, live overlay) in an
+/// offscreen window and drives it: sizes, keyboard focus, Esc and Return, and
+/// the freshness ticker. The window is never ordered on screen and the app
+/// never activates, so nothing takes focus from the user.
+final class HostSelftest: NSObject, NSApplicationDelegate {
+    let check: String
+    var window: NSWindow?
+    var popover: NSPopover?
+    init(check: String) { self.check = check }
+
+    func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+
+    func key(_ chars: String, _ code: UInt16, in w: NSWindow) {
+        guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                                       windowNumber: w.windowNumber, context: nil, characters: chars,
+                                       charactersIgnoringModifiers: chars, isARepeat: false,
+                                       keyCode: code) else { return }
+        w.sendEvent(e)
+    }
+
+    /// A second offscreen window to anchor the popover to.
+    func probeAnchor() -> NSView {
+        let anchorWindow = KeyableWindow(contentRect: NSRect(x: -21000, y: -21000, width: 20, height: 20),
+                                         styleMask: [.borderless], backing: .buffered, defer: false)
+        anchors.append(anchorWindow)
+        // NSPopover only opens from a view in a visible window. This one is
+        // ordered in far off every display and the app never activates.
+        anchorWindow.orderFrontRegardless()
+        return anchorWindow.contentView!
+    }
+    var anchors: [NSWindow] = []
+
+    func phase(_ m: Model) -> String {
+        switch m.confirm?.phase {
+        case nil: return "closed"
+        case .ask?: return "ask"
+        case .working?: return "working"
+        case .partial?: return "partial"
+        case .appPartial?: return "app_partial"
+        }
+    }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        MainActor.assumeIsolated {
+            let (model, _) = prepareFixture()
+            let pop = NSPopover()
+            let host = configurePopover(pop, model: model, onQuit: {})
+            popover = pop
+            let w = KeyableWindow(contentRect: NSRect(x: -20000, y: -20000, width: 380, height: 900),
+                                  styleMask: [.borderless], backing: .buffered, defer: false)
+            w.contentView = host.view
+            window = w
+            NSApp.setValue(true, forKey: "accessibilityEnhancedUserInterface")
+            spin(0.6)
+            var report: [String: Any] = ["check": check]
+            switch check {
+            case "size":
+                let fit = host.view.fittingSize
+                report["fitting"] = [fit.width, fit.height]
+                report["preferred"] = [host.preferredContentSize.width, host.preferredContentSize.height]
+                report["popover_unshown"] = [pop.contentSize.width, pop.contentSize.height]
+                pop.show(relativeTo: .zero, of: probeAnchor(), preferredEdge: .minY)
+                spin(0.4)
+                report["popover_shown"] = pop.isShown
+                report["popover"] = [pop.contentSize.width, pop.contentSize.height]
+                let frame = host.view.window?.frame ?? .zero
+                report["popover_on_a_display"] = NSScreen.screens.contains { $0.frame.intersects(frame) }
+                pop.close()
+            case "keys":
+                report["phase_before"] = phase(model)
+                report["focus"] = model.overlayFocus ?? NSNull()
+                key("\r", 36, in: w)
+                spin(0.3)
+                report["after_return_phase"] = phase(model)
+                report["after_return_actions"] = model.actionLog
+                key("\u{1b}", 53, in: w)
+                spin(0.4)
+                report["after_esc_phase"] = phase(model)
+                report["actions"] = model.actionLog
+            case "ticker":
+                func freshness() -> String {
+                    axRows(host.view).first { $0.label.hasPrefix("Sampled") || $0.label.hasPrefix("Sample time") }?.label ?? ""
+                }
+                report["before"] = freshness()
+                model.startTicking(every: 0.1)
+                clockOverride = (clockOverride ?? nowTs()) + 95
+                spin(0.5)
+                report["after"] = freshness()
+                report["ticks"] = model.tick
+                model.stopTicking()
+            default:
+                fail("unknown check \(check)")
+            }
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
     }
 }
 
@@ -3125,6 +3265,13 @@ if let out = argValue("--render") {
     _ = NSApplication.shared          // AppKit must exist for text rendering
     MainActor.assumeIsolated { renderFixture(to: out) }
     exit(0)
+}
+if let check = argValue("--selftest-host") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    let selftest = HostSelftest(check: check)
+    app.delegate = selftest
+    app.run()
 }
 if ARGS.contains("--a11y-dump") {
     let app = NSApplication.shared

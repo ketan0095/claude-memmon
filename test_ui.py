@@ -415,5 +415,46 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Force quit the 1 remaining instance", labels(rows))
 
 
+class HostedPopoverTests(unittest.TestCase):
+    """The real popover root, hosted offscreen: size, keyboard and ticker."""
+
+    def host(self, check, fixture):
+        return run_json("--selftest-host", check, "--fixture", str(FIXTURES / fixture))
+
+    def test_height_adapts_and_the_popover_follows_it(self):
+        small = self.host("size", "small.json")
+        large = self.host("size", "overview.json")
+        for r in (small, large):
+            self.assertEqual(r["preferred"][0], 380)
+            self.assertLessEqual(r["preferred"][1], 620)
+            self.assertTrue(r["popover_shown"])
+            self.assertEqual(r["popover"], r["preferred"])
+            self.assertFalse(r["popover_on_a_display"])
+        self.assertEqual(large["preferred"][1], 620)
+        self.assertLess(small["preferred"][1], large["preferred"][1])
+
+    def test_confirm_starts_on_cancel_ignores_return_and_esc_dismisses(self):
+        r = self.host("keys", "confirm-stop.json")
+        self.assertEqual((r["phase_before"], r["focus"]), ("ask", "safe"))
+        self.assertEqual(r["after_return_phase"], "ask")
+        self.assertEqual(r["after_return_actions"], [])
+        self.assertEqual(r["after_esc_phase"], "closed")
+        self.assertEqual(r["actions"], [])
+
+    def test_partial_starts_on_leave_running_and_return_never_forces(self):
+        r = self.host("keys", "outcome-partial.json")
+        self.assertEqual((r["phase_before"], r["focus"]), ("partial", "safe"))
+        self.assertNotIn("force", r["after_return_actions"])
+        self.assertEqual(r["after_return_phase"], "partial")
+        self.assertEqual(r["after_esc_phase"], "closed")
+        self.assertEqual(r["actions"], [])
+
+    def test_freshness_ticker_marks_a_live_sample_stale_after_95_s(self):
+        r = self.host("ticker", "overview.json")
+        self.assertEqual(r["before"], "Sampled 2s ago by the live reader")
+        self.assertTrue(r["after"].endswith(", stale"), r["after"])
+        self.assertGreaterEqual(r["ticks"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
