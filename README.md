@@ -119,7 +119,7 @@ and could name whose it was.
 ## Install
 
 ```bash
-git clone https://github.com/ketan0095/memmon.git
+git clone https://github.com/ketan0095/claude-memmon.git memmon
 cd memmon
 ./install.sh --sampler --menubar --gate
 ```
@@ -149,10 +149,83 @@ first, is idempotent, and preserves any hooks you already have.
 
 ## Giving this to someone else
 
-**They need access first.** This repo is private, so `git clone` fails for anyone
-who is not a collaborator — it asks for a username and gives up. Either add them
-on GitHub (Settings → Collaborators) or make the repo public. Nothing else in
-this section matters until that is done.
+### Shared heavy-job runner (Claude, Codex and terminal)
+
+The Bash gate decides whether a command can start under memory pressure. It
+does not coordinate two agents that both decide to start at the same time.
+For foreground builds, tests and typechecks, opt in to the shared runner:
+
+```bash
+memmon run --label "api typecheck" -- pnpm --filter api typecheck
+memmon run --label "targeted tests" --timeout 900 -- pnpm test --project api
+memmon jobs
+memmon jobs --json
+```
+
+All callers on the same Mac/user share the default `heavy` slot. Only one
+wrapped command holds that slot at a time. The runner also checks live memory
+pressure before launching: HEALTHY/WATCH can start; DANGER/CRITICAL wait. Each
+wait is bounded (600 seconds by default), with progress on stderr every 15
+seconds explaining the resource owner or pressure level. The terminal dashboard
+and menu-bar popover show running and waiting jobs when refreshed. `jobs --json`
+returns `{ "schema_version": 1, "jobs": [...] }`; each row includes a run ID,
+resource, label, working directory, wrapper/child PIDs, state, reason and age.
+
+**Use it from both agents:** replace the command the agent would execute with
+`memmon run --label "<task>" -- <that command>`. Codex can call this directly
+through its shell tool; no Claude hook is involved. Existing/unwrapped commands
+are not intercepted or retroactively queued. Do not wrap the entire agent
+session, a dev server, an interactive command, or an existing resource governor.
+Avoid nested runners: they fail immediately rather than deadlocking. A
+`--resource call-rig` slot can serialize a separate foreground resource, but
+different resource names do not serialize each other and no slot locks files.
+
+The wait timeout limits **acquisition**, not command runtime. Commands inherit
+stdin/stdout/stderr, receive literal arguments (no implicit shell), and preserve
+their exit status. Exit `124` means the wait expired without starting; `125`
+means runner/pressure failure; `126`/`127` mean launch failure/missing executable;
+cancellation returns `128 + signal`. A child can also return those same codes,
+so use the accompanying stderr message to distinguish runner failures.
+
+Kernel locks release on process exit and need no stale PID deletion or lease
+expiry. The direct command inherits its resource lock: even SIGKILL of the
+wrapper does not admit another command while that child is alive. Catchable
+cancellation is forwarded to the launched command's own process group; after
+five seconds a still-running direct child is killed. Detached/background jobs
+that close inherited descriptors are outside this contract. Acquisition is not
+FIFO; contending jobs retry until their individual deadline.
+
+Runner metadata is local under `~/.claude/memmon/runner`. It records labels and
+working directories, **not command arguments**; avoid secrets in labels. Stale
+records are ignored using kernel locks and pruned on the next run. Persistent
+empty `*.lock` files are intentional: deleting an in-use lock file can break
+exclusivity. `memmon --off` pauses the Bash gate; it does not disable explicit
+runner coordination or its pressure check. This release does not implement a
+workflow-progress watchdog or account/model routing.
+
+### Updating an existing installation
+
+From a clean checkout of the version/branch you intend to install:
+
+```bash
+git pull --ff-only
+/usr/bin/python3 -m unittest discover -v
+./install.sh --sampler --menubar --gate
+memmon jobs
+memmon --once
+memmon --gate-log
+```
+
+Use only the optional install flags you want. The installer updates local code,
+rebuilds the menu-bar app, preserves history, and avoids adding a duplicate
+hook. It does not update teammates automatically; each teammate installs the
+reviewed revision on their own Mac. There is no hosted service or cross-machine
+queue.
+
+### Access and first installation
+
+The upstream repository is public, so teammates can clone it directly. If you
+distribute a private fork, give teammates access to that fork before installation.
 
 **Tell them what they are agreeing to.** This is not a passive monitor. Installed
 with all flags it changes four things outside its own directory, and a reasonable
@@ -178,7 +251,7 @@ Full Disk Access. Everything comes from `top`, `ps`, `sysctl`, `vm_stat` and
 
 ### The process, start to finish
 
-1. Give them repo access.
+1. Share the repository URL and the reviewed branch or revision to install.
 2. They clone and run `./install.sh` with the flags they want — or open Claude
    Code in the directory and say *"Read CLAUDE.md and install memmon."*
    [`CLAUDE.md`](CLAUDE.md) tells the agent to confirm the settings.json and

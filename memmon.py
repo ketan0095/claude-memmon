@@ -1151,6 +1151,7 @@ def app_group(cmd: str) -> str:
 
 
 def collect() -> dict:
+    from memmon_runner import jobs
     ps = read_ps()
     top, top_header = read_top()
     vm = read_vm(header=top_header)
@@ -1392,6 +1393,7 @@ def collect() -> dict:
         "pressure": pressure(vm),
         "blocked": load_pending(),
         "gate": gate_stats(),
+        "jobs": jobs(STATE_DIR),
         "sessions": live_sessions,
         "idle_sessions": [s for s in sessions if not s.get("alive")],
         "orphans": orphans,
@@ -1514,6 +1516,14 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
                   if room is not None and room < 120 else "")
         L.append(col(f" {'':<10}{p.get('advice', '')}{room_s}", "grey", on))
     L.append("")
+
+    # ---- explicitly managed commands (Claude, Codex or terminal)
+    if snap.get("jobs"):
+        L.append(col(" MANAGED JOBS", "bold", on))
+        for job in snap["jobs"]:
+            L.append(clip(f"  {job['resource']} · {job['state']} · {job['label']} "
+                          f"({job['elapsed_seconds']}s) — {job['reason']}", w))
+        L.append("")
 
     # ---- sessions
     L.append(col(" CLAUDE SESSIONS".ljust(w, " "), "bold", on))
@@ -2449,12 +2459,17 @@ def wait_safe(timeout: int) -> int:
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
+    # Dispatch before scanning flags: a wrapped command may itself use --gate.
+    if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs"):
+        from memmon_runner import cli
+        return cli(sys.argv[1:], STATE_DIR, lambda: pressure(read_vm(fast=True)))
     # Short-circuit before the parser exists: gate() runs on every Bash tool call
     # and has no use for 24 argument definitions.
     if "--gate" in sys.argv:
         return gate()
     import argparse
-    ap = argparse.ArgumentParser(prog="memmon", add_help=True)
+    ap = argparse.ArgumentParser(prog="memmon", add_help=True,
+                                 epilog="Also: memmon run --help | memmon jobs --help")
     ap.add_argument("--once", action="store_true", help="one snapshot then exit")
     ap.add_argument("--json", action="store_true", help="machine-readable snapshot")
     ap.add_argument("--statusline", action="store_true", help="one compact line")

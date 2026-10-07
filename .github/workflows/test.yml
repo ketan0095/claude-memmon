@@ -1,0 +1,17 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate and runner regression tests
+        run: /usr/bin/python3 -m unittest discover -v
+      - name: Installer syntax
+        run: bash -n install.sh
+      - name: Compile menu-bar app
+        run: swiftc -O -o /tmp/MemmonBar MemmonBar.swift -framework Cocoa
