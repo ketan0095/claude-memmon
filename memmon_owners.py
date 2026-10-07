@@ -667,7 +667,8 @@ def write_json_atomic(path: str, value) -> None:
                                dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump(value, fh, separators=(",", ":"))
+            # dumps, not dump: only the one-shot path uses the C encoder.
+            fh.write(json.dumps(value, separators=(",", ":")))
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -688,7 +689,10 @@ def update_history(hist: dict, fps: dict, ts: float) -> dict:
         samples = (row.get("samples") or []) + [[round(ts, 1), fp]]
         owners[oid] = {"last_seen": round(ts, 1), "samples": samples[-HISTORY_MAX_SAMPLES:]}
     if len(owners) > HISTORY_MAX_OWNERS:
-        keep = sorted(owners, key=lambda k: -owners[k].get("last_seen", 0))
+        # Most recently seen first; among owners seen in the same tick, the
+        # largest keep their history.
+        keep = sorted(owners, key=lambda k: (-owners[k].get("last_seen", 0),
+                                             -(owners[k]["samples"] or [[0, 0]])[-1][1]))
         owners = {k: owners[k] for k in keep[:HISTORY_MAX_OWNERS]}
     return {"version": 1, "owners": owners}
 

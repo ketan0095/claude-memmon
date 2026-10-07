@@ -385,6 +385,12 @@ class HistoryTests(OwnerBase):
         self.assertEqual(len(hist["owners"]), 200)
         self.assertNotIn("a", hist["owners"])          # least recently seen goes
         self.assertIn("o204", hist["owners"])
+        crowd = {f"small{i}": i for i in range(250)}
+        crowd["big"] = 10**12
+        hist = mo.update_history({}, crowd, T0)       # all seen in one tick
+        self.assertEqual(len(hist["owners"]), 200)
+        self.assertIn("big", hist["owners"])
+        self.assertNotIn("small0", hist["owners"])
 
     def test_history_written_atomically_and_small(self):
         path = memmon.OWNERS_HISTORY
