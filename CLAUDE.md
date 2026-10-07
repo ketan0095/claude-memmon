@@ -107,7 +107,25 @@ It **fails open on everything**. Malformed input, missing files, any exception â
 exit 0, and the failure is recorded so a silently-broken gate is visible in
 `memmon --gate-log` rather than looking like a quiet machine.
 
-Tell the user how to turn it off instantly: `export MEMMON_GATE=off`.
+Tell the user how to turn it off instantly: `memmon --off` (or `--off 8h`).
+An export in another terminal does not change an already-running Claude process.
+
+## Coordinating heavy jobs across agents
+
+Use `memmon run --label "<task>" -- <command> <args>` for foreground builds,
+typechecks and tests that should share one machine-wide slot. Claude, Codex and
+terminal commands use the same runner. `memmon jobs` explains who is running or
+waiting; the menu-bar dashboard shows those jobs too.
+
+Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit 124
+means the command never started. Do not replace this with a `pgrep` waiting loop,
+wrap the same command twice, or wrap an entire multi-hour agent session. Only
+wrapped jobs coordinate; existing jobs and other resource governors remain
+independent. A runner slot is not a worktree lock or permission to edit files.
+
+The runner starts only at HEALTHY/WATCH pressure, independent of the Bash gate
+mode or pause switch. It preserves output and exit status. Use it for foreground,
+non-interactive commands, not dev servers, daemon launchers or interactive shells.
 
 ## Showing it in the terminal
 

@@ -12,3 +12,4 @@ config.json
 sampler.err
 
 .DS_Store
+__pycache__/

@@ -79,6 +79,7 @@ if len(kept) != len(pre):
 PY
   fi
   rm -rf "$PLIST" "$BAR_PLIST" "$BIN" "$DEST" "$APP" \
+         "$DEST_DIR/memmon_runner.py" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
   exit 0
@@ -103,7 +104,12 @@ fi
 mkdir -p "$DEST_DIR" "$BIN_DIR"
 # Copy rather than symlink: the source may live in a git worktree that gets
 # deleted, and the monitor has to keep working after that.
-cp "$SRC_DIR/memmon.py" "$DEST"
+# Publish the dependency before the entrypoint, without exposing partial files
+# to an already-running sampler or another CLI invocation during an upgrade.
+cp "$SRC_DIR/memmon_runner.py" "$DEST_DIR/.memmon_runner.py.$$"
+mv -f "$DEST_DIR/.memmon_runner.py.$$" "$DEST_DIR/memmon_runner.py"
+cp "$SRC_DIR/memmon.py" "$DEST_DIR/.memmon.py.$$"
+mv -f "$DEST_DIR/.memmon.py.$$" "$DEST"
 chmod +x "$DEST"
 cp "$SRC_DIR/memmon-gate.sh" "$GATE"
 chmod +x "$GATE"

@@ -192,6 +192,11 @@ struct GateStats {
     var pending: [PendingRetry] = []
 }
 
+struct ManagedJob: Identifiable {
+    var id: String, resource: String, label: String, state: String, reason: String
+    var elapsed: Int
+}
+
 struct Snap {
     var ramUsed = 0.0, ramTotal = 1.0, swapUsed = 0.0, swapTotal = 1.0
     var free = 0.0, load = 0.0, compressed = 0.0
@@ -203,6 +208,7 @@ struct Snap {
     var idleSpares = 0, idleSpareMem = 0.0
     var apps: [App] = []
     var gate = GateStats()
+    var jobs: [ManagedJob] = []
 }
 
 final class Model: ObservableObject {
@@ -271,6 +277,14 @@ final class Model: ObservableObject {
             s.advice = p["advice"] as? String ?? ""
             s.nextLevel = p["next_level"] as? String
             s.toNext = p["to_next"] as? Int
+        }
+        s.jobs = (j["jobs"] as? [[String: Any]] ?? []).map { d in
+            ManagedJob(id: d["id"] as? String ?? UUID().uuidString,
+                       resource: d["resource"] as? String ?? "heavy",
+                       label: d["label"] as? String ?? "command",
+                       state: d["state"] as? String ?? "unknown",
+                       reason: d["reason"] as? String ?? "",
+                       elapsed: integer(d["elapsed_seconds"]))
         }
         s.sessions = (j["sessions"] as? [[String: Any]] ?? []).map { d in
             let subs = d["subagents_active"] as? [[String: Any]] ?? []
@@ -983,6 +997,24 @@ struct ContentView: View {
     private var body_: some View {
         VStack(alignment: .leading, spacing: 11) {
             verdict
+            if !s.jobs.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Managed jobs").font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(P.text)
+                    ForEach(s.jobs) { job in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(job.label) · \(job.state) · \(job.elapsed)s")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(P.text)
+                            Text("\(job.resource) — \(job.reason)")
+                                .font(.system(size: 10)).foregroundColor(P.dim)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12).background(P.card).cornerRadius(10)
+            }
+
             gateSection
             HStack(spacing: 10) {
                 StatTile(icon: "cpu.fill", label: "RAM",
@@ -999,6 +1031,7 @@ struct ContentView: View {
                          badge: s.swapUsed > s.ramTotal ? "over" : nil)
             }
             if s.orphanTotal > 0 { orphanCard }
+
 
             if !s.sessions.isEmpty {
                 Section(title: "Claude sessions", count: s.sessions.count,
@@ -1557,6 +1590,12 @@ func renderPreview(to path: String) {
     s.nextLevel = "CRITICAL"; s.toNext = 1
     s.advice = "web-checkout is running tsc typecheck (21.7G across 12 "
              + "processes). Let it finish before starting another build."
+    s.jobs = [
+        ManagedJob(id: "preview-running", resource: "heavy", label: "api typecheck",
+                   state: "running", reason: "command running", elapsed: 42),
+        ManagedJob(id: "preview-waiting", resource: "heavy", label: "targeted tests",
+                   state: "waiting", reason: "resource held by api typecheck (PID 99036)", elapsed: 12),
+    ]
     s.sessions = [
         Sess(name: "api error handling", state: "working",
              doing: "[agent] infra + flake audit",
