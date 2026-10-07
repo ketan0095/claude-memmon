@@ -1,0 +1,111 @@
+{
+ "_base": "overview.json",
+ "ts": 1791449800.0,
+ "source": "sampler",
+ "protection": {
+  "summary": "paused",
+  "gate": "paused",
+  "route": "off",
+  "unmanaged_heavy": 2
+ },
+ "gate": {
+  "installed": true,
+  "paused": true,
+  "paused_until": 1791457200.0,
+  "policy": {
+   "mode": "block-critical"
+  },
+  "counts": {
+   "since": 1791190800.0,
+   "complete": false,
+   "evaluated": 212,
+   "warned": 1,
+   "stopped": 1,
+   "errors": 0
+  },
+  "history": {
+   "from": 1791190800.0,
+   "to": 1791449760.0,
+   "truncated": false,
+   "events": [
+    {
+     "ts": 1791449760.0,
+     "action": "block",
+     "mode": "block-critical",
+     "session": {
+      "id": "fixture-a",
+      "name": "Checkout refactor"
+     },
+     "command": {
+      "raw": "pnpm typecheck",
+      "display": "pnpm typecheck"
+     },
+     "classification": {
+      "source": "builtin",
+      "rule": "pnpm … typecheck",
+      "shape": "pnpm typecheck",
+      "samples": null,
+      "observed_peak_bytes": null,
+      "block_eligible": true
+     },
+     "legacy": false,
+     "pressure": {
+      "level": "CRITICAL",
+      "score": 7,
+      "reasons": [
+       "swap growing 900 MB/min"
+      ]
+     },
+     "retry_status": "waiting",
+     "ms": 71
+    },
+    {
+     "ts": 1791444600.0,
+     "action": "warn",
+     "mode": "block-critical",
+     "session": {
+      "id": "fixture-b",
+      "name": "Billing API tests"
+     },
+     "command": {
+      "raw": "npx vitest run",
+      "display": "npx vitest run"
+     },
+     "classification": {
+      "source": "builtin",
+      "rule": "vitest",
+      "shape": "npx vitest",
+      "samples": null,
+      "observed_peak_bytes": null,
+      "block_eligible": true
+     },
+     "legacy": false,
+     "pressure": {
+      "level": "WATCH",
+      "score": 3,
+      "reasons": [
+       "paging 40 MB/s"
+      ]
+     },
+     "retry_status": "not_waiting",
+     "ms": 70
+    }
+   ]
+  },
+  "pending_retry": [
+   {
+    "ts": 1791449760.0,
+    "session": {
+     "id": "fixture-a",
+     "name": "Checkout refactor"
+    },
+    "command": {
+     "raw": "pnpm typecheck",
+     "display": "pnpm typecheck"
+    },
+    "pressure_level": "CRITICAL",
+    "event_retained": true
+   }
+  ]
+ }
+}

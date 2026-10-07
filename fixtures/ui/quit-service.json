@@ -1,0 +1,7 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "select": "service:vm:fixture",
+  "confirm": "quit-app"
+ }
+}

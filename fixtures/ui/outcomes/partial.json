@@ -1,0 +1,31 @@
+{
+ "exit": 3,
+ "stdout": {
+  "result": "partial",
+  "reason": "survivors",
+  "exited": 3,
+  "remaining": [
+   {
+    "pid": 48311,
+    "start": [
+     1791449101,
+     5
+    ],
+    "argv0": "node"
+   },
+   {
+    "pid": 48313,
+    "start": [
+     1791449101,
+     9
+    ],
+    "argv0": "node"
+   }
+  ],
+  "kept": [],
+  "force_token": "eyJ2IjoxLCJhY3Rpb24iOiJmb3JjZSIsInN1cnZpdm9ycyI6WzQ4MzExLDQ4MzEzXX0=",
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 39513699123,
+  "measured_at": 1791450000.0
+ }
+}
