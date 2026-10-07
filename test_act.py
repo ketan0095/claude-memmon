@@ -335,6 +335,22 @@ class RespawnTests(unittest.TestCase):
         self.assertEqual(again["result"], "already_exited")
         self.assertEqual({p for p, _ in self.src.signals}, {41001, 41002, 41010, 41011})
 
+    def test_r1_watch_runs_without_the_actions_lock(self):
+        # AD-S1-11: another action during the 20 s watch is served, not busy.
+        self.fixture(busy=True)
+        self.crash_on_term()
+        other_clock = FakeClock()
+        other = fake_engine(self.src, self.ctx, memmon.ACTIONS_LOCK, clock=lambda: T0 + 5,
+                            mono=other_clock.mono, sleep=other_clock.sleep)
+        seen = []
+        daemon = self.src.table[40000]
+        self.clock.at(self.clock.t + 5, lambda: seen.append(
+            other.run("end-session", tok("end-session", daemon, daemon))))
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual(out["result"], "stopped")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual((seen[0]["result"], seen[0]["reason"]), ("refused", "not_stoppable"))
+
     def test_r1_idle_worker_settles_early(self):
         self.fixture(busy=False)
         out = self.eng.run("end-session", self.token)

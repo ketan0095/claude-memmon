@@ -17,7 +17,6 @@ root return EPERM; they are `visible=False` and get no numbers at all.
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import errno
 import os
 import re
@@ -320,11 +319,19 @@ def _parse_size(tok: str) -> int | None:
         return None
 
 
+LIBPROC = "/usr/lib/libproc.dylib"
+
+
 def _load_libproc():
-    path = ctypes.util.find_library("proc")
-    if not path:
-        return None, None
-    lib = ctypes.CDLL(path, use_errno=True)
+    # The direct path skips importing ctypes.util (~12 ms per process).
+    try:
+        lib = ctypes.CDLL(LIBPROC, use_errno=True)
+    except OSError:
+        from ctypes.util import find_library
+        path = find_library("proc")
+        if not path:
+            return None, None
+        lib = ctypes.CDLL(path, use_errno=True)
     lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.proc_listallpids.restype = ctypes.c_int
     lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,

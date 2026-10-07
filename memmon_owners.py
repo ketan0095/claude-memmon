@@ -21,12 +21,9 @@ from __future__ import annotations
 
 import base64
 import calendar
-import hashlib
 import json
 import os
-import plistlib
 import re
-import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -300,6 +297,7 @@ _plist_cache: dict = {}
 
 def bundle_info(bundle: str) -> dict:
     if bundle not in _plist_cache:
+        import plistlib
         info = {}
         try:
             with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as fh:
@@ -500,6 +498,8 @@ def partition(inv, ctx: Context) -> Partition:
             oid, conf = f"job:{key}", "exact"
         elif kind == "app":
             bid = bundle_info(key)["bundle_id"]
+            if not bid:
+                import hashlib
             oid = "app:" + (bid or hashlib.sha1(key.encode()).hexdigest()[:12])
             conf = "exact"
         elif kind == "service":
@@ -833,6 +833,7 @@ def read_json(path: str, default):
 
 
 def write_json_atomic(path: str, value) -> None:
+    import tempfile
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
                                dir=os.path.dirname(path))

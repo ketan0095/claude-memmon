@@ -715,6 +715,26 @@ class OwnersCliTests(unittest.TestCase):
         self.assertIsNone(block["pressure_level"])
         self.assertIn("vm_stat exited 1", block["reason"])
 
+    def test_system_block_runs_vm_stat_once(self):
+        calls = []
+        real_run, real_sh = subprocess.run, memmon._sh
+
+        def run(cmd, **kw):
+            calls.append(cmd[0])
+            return real_run(cmd, **kw)
+
+        def sh(cmd, timeout=15):
+            calls.append(cmd[0])
+            return real_sh(cmd, timeout)
+        with mock.patch.object(memmon, "_page", None), \
+                mock.patch.object(memmon.subprocess, "run", run), \
+                mock.patch.object(memmon, "_sh", sh), \
+                mock.patch("memmon_procs.subprocess.run", run):
+            block = memmon.system_block()
+        self.assertEqual(calls.count("vm_stat"), 1, calls)
+        self.assertIsNotNone(block["used_bytes"])
+        self.assertIsNotNone(block["score_level"])
+
     def test_protection_states(self):
         with mock.patch.object(memmon, "gate_installed", return_value=False):
             self.assertEqual(memmon.protection_block(3)["summary"], "off")

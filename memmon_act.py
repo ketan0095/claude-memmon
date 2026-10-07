@@ -122,6 +122,7 @@ class Engine:
     respawn_window_s: float = RESPAWN_WINDOW_S
     after_capture: object = None                # test hook: (captured pids) -> None
     sent: list = field(default_factory=list)    # (pid, signal) actually sent
+    _pending_watch: object = None
 
     # ------------------------------------------------------------ signals
 
@@ -172,14 +173,20 @@ class Engine:
                 raise Refused("stale_token")
             if self.source.name == "degraded":
                 raise Refused("degraded_identity")
+            self._pending_watch = None
             with action_lock(self.lock_path, lock_fd, sleep=self.sleep, mono=self.mono):
                 if action == "verify-app":
                     return self._verify_app(body)
                 if action == "force":
                     return self._force(body, origin)
-                if action in PROCESS_ACTIONS:
-                    return self._process(action, body)
-                raise Refused("unknown_action")
+                if action not in PROCESS_ACTIONS:
+                    raise Refused("unknown_action")
+                out = self._process(action, body)
+            # The respawn watch only reads, so it runs after the lock is
+            # released: holding it would refuse other stops as busy for 20 s.
+            if self._pending_watch:
+                self._watch_respawn(out, *self._pending_watch)
+            return out
         except Refused as r:
             return outcome("refused", r.reason)
         except Exception as exc:
@@ -244,7 +251,7 @@ class Engine:
         base = watch.baseline(job_id) if watch else None
         out = self._graceful(inv, part, [tp.pid], owner_id, action, body, mine)
         if watch and out["result"] == "stopped":
-            self._watch_respawn(out, watch, job_id, (rp.pid, *rp.start), base)
+            self._pending_watch = (watch, job_id, (rp.pid, *rp.start), base)
         return out
 
     def _watch_respawn(self, out: dict, watch, job_id: str, old: tuple, base: dict):

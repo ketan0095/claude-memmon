@@ -179,7 +179,7 @@ def read_ps() -> dict[int, dict]:
     return procs
 
 
-def read_vm(fast: bool = False, header: str = "") -> dict:
+def read_vm(fast: bool = False, header: str = "", vm_stat_text: str | None = None) -> dict:
     """System-wide memory picture.
 
     free_pct is `kern.memorystatus_level` — NOT "unused RAM". macOS deliberately
@@ -234,7 +234,10 @@ def read_vm(fast: bool = False, header: str = "") -> dict:
     # Cumulative counters. Their *rate* is what predicts a freeze — a high
     # swapin rate means the working set no longer fits in RAM and the machine is
     # reading pages back as fast as it evicts them.
-    for line in _sh(["vm_stat"]).splitlines():
+    if vm_stat_text is None:
+        vm_stat_text = _sh(["vm_stat"])
+    page_size(vm_stat_text)
+    for line in vm_stat_text.splitlines():
         m = re.match(r'"?([^:"]+)"?:\s+(\d+)', line.strip())
         if not m:
             continue
@@ -275,15 +278,23 @@ STATE_LABEL = {"done": "completed", "stopped": "completed", "working": "working"
                "blocked": "idle", "terminal": "terminal"}
 
 
-def _page_size() -> int:
-    m = re.search(r"page size of (\d+) bytes", _sh(["vm_stat"]))
-    return int(m.group(1)) if m else os.sysconf("SC_PAGE_SIZE")
+_page: int | None = None
+
+
+def page_size(vm_stat_text: str | None = None) -> int:
+    """Read once per process, from whichever vm_stat output arrives first,
+    rather than spawning vm_stat at import just for its header."""
+    global _page
+    if _page is None:
+        text = vm_stat_text if vm_stat_text is not None else _sh(["vm_stat"])
+        m = re.search(r"page size of (\d+) bytes", text)
+        _page = int(m.group(1)) if m else os.sysconf("SC_PAGE_SIZE")
+    return _page
 
 
 # The free-% level the runway estimate projects toward. See pressure().
 HEADROOM_FLOOR = 20
 
-PAGE = _page_size()
 _prev_vm: dict = {}
 
 
@@ -315,9 +326,9 @@ def pressure(vm: dict) -> dict:
     dt = now - prev.get("_ts", 0) if prev else 0
     if prev and 2 <= dt <= 300:
         rates["swapin_mbs"] = max(0, vm.get("swapins", 0)
-                                  - prev.get("swapins", 0)) * PAGE / dt / 1e6
+                                  - prev.get("swapins", 0)) * page_size() / dt / 1e6
         rates["swapout_mbs"] = max(0, vm.get("swapouts", 0)
-                                   - prev.get("swapouts", 0)) * PAGE / dt / 1e6
+                                   - prev.get("swapouts", 0)) * page_size() / dt / 1e6
         rates["free_delta_min"] = (vm.get("free_pct", 0)
                                    - prev.get("free_pct", 0)) * 60.0 / dt
         rates["swap_growth_mbmin"] = (vm.get("swap_used", 0)
@@ -2550,12 +2561,21 @@ def system_block(reader=None) -> dict:
     import memmon_procs
     out = {"ram_bytes": None, "used_bytes": None, "pressure_level": None,
            "score_level": None, "reason": None}
+    shared = []
+
+    def vm_stat_once(cmd, **kw):
+        # One vm_stat serves both readers; the strict one still sees its
+        # failures as failures.
+        if not shared:
+            shared.append(subprocess.run(cmd, **kw))
+        return shared[0]
     try:
-        out.update((reader or memmon_procs.read_system_strict)())
+        out.update((reader or (lambda: memmon_procs.read_system_strict(run=vm_stat_once)))())
     except Exception as exc:
         out["reason"] = f"{type(exc).__name__}: {exc}"
+    text = shared[0].stdout if shared and shared[0].returncode == 0 else None
     try:
-        out["score_level"] = pressure(read_vm(fast=True))["level"]
+        out["score_level"] = pressure(read_vm(fast=True, vm_stat_text=text))["level"]
     except Exception:
         pass
     return out
