@@ -291,30 +291,78 @@ class PartitionTests(OwnerBase):
         app = next(r for r in rows.values() if r["kind"] == "codex-app")
         self.assertEqual(app["shared_with"], ["Billing cleanup"])
 
-    def test_gui_app_vm_carries_the_apps_quit_action(self):
-        # S1.6/M5a: a VM run by Docker Desktop quits with Docker Desktop; a VM
-        # paired with a Lima instance only gets a copyable command.
+    def test_gui_vm_app_is_a_shared_service_with_quit(self):
+        # AD-S1-8 / S1.6 M5a: Docker Desktop is a rule-6 shared service whose
+        # row quits the app; its launchd-spawned VM joins it. A Lima VM and a
+        # Lima helper keep no action (M5b: a copyable command at most).
         docker = make_bundle(self.root, "Docker", "com.docker.docker")
         vm = "/System/Library/Frameworks/Virtualization.framework/x/com.apple.Virtualization.VirtualMachine"
-        procs = [P(700, comm="com.docker.backend"), P(710, start=(T0, 0)),
-                 P(730, start=(T0 + 9000, 0), comm="limactl"),          # usernet helper
-                 P(720, start=(T0 + 5000, 0)), P(721, start=(T0 + 4998, 0), comm="limactl")]
-        _, inv, part = self.build(procs, paths={700: f"{docker}/Contents/MacOS/com.docker.backend",
-                                                710: vm, 720: vm},
+        procs = [P(700, comm="Docker"), P(701, ppid=700, comm="com.docker.backend"),
+                 P(710, start=(T0, 0)),
+                 P(720, start=(T0 + 5000, 0)), P(721, start=(T0 + 4998, 0), comm="limactl"),
+                 P(730, start=(T0 + 9000, 0), comm="limactl")]
+        paths = {700: f"{docker}/Contents/MacOS/Docker",
+                 701: f"{docker}/Contents/MacOS/com.docker.backend", 710: vm, 720: vm}
+        _, inv, part = self.build(procs, paths=paths,
                                   argv={721: ["limactl", "hostagent", "--pidfile",
                                               "/x/_lima/colima-dev/ha.pid", "colima-dev"]})
+        self.assert_partition(inv, part)
+        self.assertNotIn("app:com.docker.docker", part.owners)
+        svc = part.owners["service:vm:docker-desktop"]
+        self.assertEqual((svc.kind, svc.confidence), ("service", "shared"))
+        self.assertEqual(sorted(svc.members), [700, 701, 710])
         rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
-        app = rows["app:com.docker.docker"]
-        gui_vm = next(r for r in rows.values()
-                      if r["owner_id"].startswith("service:vm:virtualization-"))
-        self.assertEqual(gui_vm["actions"], ["quit-app"])
-        self.assertEqual(gui_vm["token"], app["token"])
-        self.assertEqual(gui_vm["quit_app_owner_id"], "app:com.docker.docker")
+        row = rows["service:vm:docker-desktop"]
+        self.assertEqual((row["title"], row["actions"], row["stop_command"]),
+                         ("Docker", ["quit-app"], None))
+        body = mo.decode_token(row["token"])
+        self.assertEqual((body["action"], body["bundle_id"]), ("quit-app", "com.docker.docker"))
+        self.assertEqual([i["pid"] for i in body["instances"]], [700])
         helper = rows["service:vm:lima-helper"]
         self.assertEqual((helper["actions"], helper["token"]), ([], None))
         lima = rows["service:vm:colima-dev"]
         self.assertEqual((lima["actions"], lima["token"], lima["stop_command"]),
                          ([], None, "colima stop -p dev"))
+
+    def test_app_membership_outermost_bundle_and_helper_layout(self):
+        chrome = "/Applications/Google Chrome.app"
+        helper = (f"{chrome}/Contents/Frameworks/Google Chrome Framework.framework/"
+                  "Versions/140.0/Helpers/Google Chrome Helper (Renderer).app/Contents/"
+                  "MacOS/Google Chrome Helper (Renderer)")
+        self.assertEqual(mo.app_bundle(f"{chrome}/Contents/MacOS/Google Chrome"), chrome)
+        self.assertEqual(mo.app_bundle(helper), chrome)
+        slack = "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper"
+        self.assertEqual(mo.app_bundle(slack), "/Applications/Slack.app")
+        xcode_python = ("/Applications/Xcode.app/Contents/Developer/Library/Frameworks/"
+                        "Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python")
+        self.assertIsNone(mo.app_bundle(xcode_python))
+        self.assertIsNone(mo.app_bundle("/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"))
+
+    def test_xcode_python_is_not_an_xcode_app_member(self):
+        xcode = make_bundle(self.root, "Xcode", "com.example.xcode")
+        py = (f"{xcode}/Contents/Developer/Library/Frameworks/Python3.framework/"
+              "Versions/3.9/Resources/Python.app/Contents/MacOS/Python")
+        procs = [P(800, comm="Xcode"), P(801, ppid=1, comm="Python")]
+        _, inv, part = self.build(procs, paths={800: f"{xcode}/Contents/MacOS/Xcode", 801: py})
+        self.assertEqual(part.owners[part.owner_of[800]].kind, "app")
+        self.assertEqual(part.owners[part.owner_of[801]].kind, "unknown")
+
+    def test_memmon_itself_is_never_in_a_quitable_app(self):
+        term = make_bundle(self.root, "Terminal", "com.example.terminal")
+        me = os.getpid()
+        procs = [P(900, comm="Terminal"), P(901, ppid=900, comm="zsh"),
+                 P(me, ppid=901, comm="Python"), P(902, ppid=me, comm="lsof")]
+        _, inv, part = self.build(procs, paths={900: f"{term}/Contents/MacOS/Terminal"})
+        self.assert_partition(inv, part)
+        mine = part.owners[part.owner_of[me]]
+        self.assertEqual((mine.kind, mine.root), ("unknown", me))
+        self.assertEqual(part.owner_of[902], mine.owner_id)
+        self.assertEqual(sorted(part.owners[part.owner_of[900]].members), [900, 901])
+
+    def test_real_memmon_process_is_never_an_app_member(self):
+        inv = mp.snapshot()
+        part = mo.partition(inv, self.ctx)
+        self.assertNotIn(part.owners[part.owner_of[os.getpid()]].kind, ("app", "service"))
 
     def test_python_app_bundle_outside_applications_is_not_an_app(self):
         path = ("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
@@ -495,6 +543,26 @@ class HistoryTests(OwnerBase):
         self.assertEqual(len(hist["owners"]), 200)
         self.assertIn("big", hist["owners"])
         self.assertNotIn("small0", hist["owners"])
+
+    def test_unattributed_share_one_history_series(self):
+        # AD-S1-10
+        procs = [self.claude(10, "0000a001", fp=100 * MB)] + [P(50 + i, fp=10 * MB)
+                                                             for i in range(5)]
+        _, inv, part = self.build(procs)
+        fps = mo.history_footprints(part, inv)
+        self.assertEqual(set(fps), {"claude:0000a001", mo.UNATTRIBUTED})
+        self.assertEqual(fps[mo.UNATTRIBUTED], 50 * MB)
+        now = inv.ts
+        hist = {"owners": {mo.UNATTRIBUTED: {"samples": [
+            [now - 720 + 120 * i, 50 * MB + i * 6 * MB] for i in range(7)]}}}
+        payload = self.payload(inv, part, history=hist)
+        agg = payload["unattributed"]
+        self.assertEqual((agg["owner_count"], agg["member_count"], agg["footprint_bytes"]),
+                         (5, 5, 50 * MB))
+        self.assertAlmostEqual(agg["growth_bytes_per_10min"], 30 * MB, delta=MB)
+        row = next(r for r in payload["owners"] if r["kind"] == "unknown")
+        self.assertEqual((row["growth_bytes_per_10min"], row["growth_reason"]),
+                         (None, "tracked as Unattributed"))
 
     def test_history_written_atomically_and_small(self):
         path = memmon.OWNERS_HISTORY

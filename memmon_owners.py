@@ -64,6 +64,9 @@ ROLLOUT_RE = re.compile(r"rollout-[0-9T:-]+-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$"
 LOCK_RE = re.compile(r"thread-writer-locks/([0-9a-f]{8}-[0-9a-f-]{27})\.lock$")
 EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)'")
 OWN_BUNDLE_IDS = {"dev.memmon.bar"}
+# Apps whose job is running a container VM are shared services (rule 6) that
+# can be quit as apps: quitting them stops the VM and every container in it.
+GUI_VM_APPS = {"com.docker.docker": "docker-desktop", "dev.kdrag0n.MacVirt": "orbstack"}
 
 
 # ------------------------------------------------------------------ tokens
@@ -258,15 +261,38 @@ def _codex_role(inv, pid: int) -> str | None:
     return "tui"
 
 
+HELPER_FRAMEWORK_RE = re.compile(r"^/Contents/Frameworks/[^/]+\.framework/")
+
+
+def app_bundle(path: str) -> str | None:
+    """The app an executable belongs to: the OUTERMOST <Name>.app under an
+    Applications folder, and only for an executable in a Contents/MacOS
+    directory (the app's own, or a nested helper app's).
+
+    A nested .app reached through a .framework counts only in the helper
+    layout, <App>.app/Contents/Frameworks/<F>.framework/…/<Helper>.app (as
+    Chrome ships its helpers). Any other framework-embedded .app is a language
+    runtime — Python.app inside Xcode's Python3.framework — and the program
+    it runs belongs to whoever started it, not to the outer app."""
+    m = APP_BUNDLE_RE.match(path or "")
+    if not m or not os.path.dirname(path).endswith("/Contents/MacOS"):
+        return None
+    inner = path[len(m.group(1)):]
+    fw = re.search(r"/[^/]+\.framework/", inner)
+    if fw and ".app/" in inner[fw.end():] and not HELPER_FRAMEWORK_RE.match(inner):
+        return None
+    return m.group(1)
+
+
 def _bundle_of(inv, pid: int) -> str | None:
     path = inv.path(pid) or ""
-    m = APP_BUNDLE_RE.match(path)
-    if not m:
+    bundle = app_bundle(path)
+    if not bundle:
         return None
     cmd = inv.cmdline(pid)
     if "ClaudeCode.app" in path or any(mk in cmd for mk in CLAUDE_RUNTIME):
         return None
-    return m.group(1)
+    return bundle
 
 
 _plist_cache: dict = {}
@@ -410,14 +436,23 @@ def partition(inv, ctx: Context) -> Partition:
         if not enclosed:
             rule[cpid] = ("job", row.get("id"), {"lease": row})
 
+    # memmon itself is never a member of someone else's owner: a quit-app on
+    # the terminal it runs in must not count it as that app's process.
+    if os.getpid() in procs and os.getpid() not in rule:
+        rule[os.getpid()] = ("unknown", None, {"self": True})
+
     for pid in procs:
         if pid in rule:
             continue
         bundle = _bundle_of(inv, pid)
         if bundle:
-            if bundle_info(bundle)["bundle_id"] in OWN_BUNDLE_IDS:
+            bid = bundle_info(bundle)["bundle_id"]
+            if bid in OWN_BUNDLE_IDS:
                 continue
-            rule[pid] = ("app", bundle, {})
+            if bid in GUI_VM_APPS:
+                rule[pid] = ("service", GUI_VM_APPS[bid], {"bundle": bundle})
+            else:
+                rule[pid] = ("app", bundle, {})
             continue
         svc = _service_name(inv, pid)
         if svc:
@@ -480,6 +515,8 @@ def partition(inv, ctx: Context) -> Partition:
                 owner.info["bundle"] = key
             if kind == "service":
                 owner.info["vm"] = info.get("vm", key)
+        if info.get("bundle"):
+            owner.info["bundle"] = info["bundle"]
         owner.roots.append(root)
         root_owner[root] = oid
     owner_of = {}
@@ -497,7 +534,10 @@ def _merge_vm_hosts(procs: dict, rule: dict) -> None:
     hostagent that started closest to it (within 60 s); that is a heuristic,
     which is why service owners are 'shared', never 'exact'."""
     hosts = [(procs[p].start[0], key) for p, (k, key, _) in rule.items()
-             if k == "service" and key not in GENERIC_SERVICES]
+             if k == "service" and key not in GENERIC_SERVICES
+             and key not in GUI_VM_APPS.values()]
+    gui = sorted({key for k, key, _ in rule.values()
+                  if k == "service" and key in GUI_VM_APPS.values()})
     for pid, (kind, key, info) in list(rule.items()):
         if kind != "service":
             continue
@@ -506,6 +546,9 @@ def _merge_vm_hosts(procs: dict, rule: dict) -> None:
                        default=None)
             if best and abs(best[0] - procs[pid].start[0]) <= 60:
                 rule[pid] = (kind, key, {**info, "vm": best[1]})
+            elif gui:
+                # Not a Lima instance's VM: Docker Desktop or OrbStack runs it.
+                rule[pid] = (kind, key, {**info, "vm": gui[0]})
             else:
                 rule[pid] = (kind, key, {**info,
                                          "vm": f"{key}-{procs[pid].start[0]}"})
@@ -606,9 +649,23 @@ def _sum(values) -> int | None:
     return sum(vals) if vals else None
 
 
+UNATTRIBUTED = "unattributed"
+
+
 def owner_footprints(part: Partition, inv) -> dict:
     return {oid: _sum(inv.procs[p].footprint for p in o.members)
             for oid, o in part.owners.items()}
+
+
+def history_footprints(part: Partition, inv) -> dict:
+    """What the sampler records: one series per attributed owner, and a single
+    series for everything unattributed (the UI shows those as one row), so
+    hundreds of short-lived roots cannot crowd real owners out of the cap."""
+    fps = owner_footprints(part, inv)
+    out = {oid: fp for oid, fp in fps.items() if part.owners[oid].kind != "unknown"}
+    out[UNATTRIBUTED] = _sum(fp for oid, fp in fps.items()
+                             if part.owners[oid].kind == "unknown")
+    return out
 
 
 def _cpu(members, cpu: dict) -> tuple:
@@ -639,6 +696,8 @@ def _titles(owner: Owner, inv, ctx: Context, codex: dict) -> None:
         owner.title = str(lease.get("label") or "Managed job")
     elif owner.kind == "app":
         owner.title = bundle_info(info["bundle"])["name"]
+    elif owner.kind == "service" and info.get("bundle"):
+        owner.title = bundle_info(info["bundle"])["name"]
     elif owner.kind == "service":
         owner.title = f"VM · {info['vm']}" if not info["vm"].startswith(
             ("virtualization-", "qemu-")) else "Container VM"
@@ -651,8 +710,8 @@ def codex_handles(roles: dict, ctx: Context) -> dict:
     """What each Codex process holds open, from one lsof over the candidates.
 
     pid -> {"thread": uuid of a writer lock or rollout it holds, "threads":
-    every such uuid, "addrs": its unix sockets, "peers": the sockets they
-    connect to}. Only an open handle counts: lock files outlive a killed TUI."""
+    every such uuid, "addrs": its daemon sockets (codex-daemon-<uid>,
+    app-server-control), "peers": the sockets its unix fds connect to}. Only an open handle counts: lock files outlive a killed TUI."""
     out: dict = {}
     pids = sorted(p for p, r in roles.items() if r in ("exec", "tui", "app-server"))
     if not pids or not ctx.lsof or not any(roles[p] != "app-server" for p in pids):
@@ -679,7 +738,7 @@ def codex_handles(roles: dict, ctx: Context) -> dict:
         elif tag == "n" and pid is not None:
             row = out[pid]
             if ftype == "unix":
-                if dev:
+                if dev and ("codex-daemon-" in val or "app-server-control" in val):
                     row["addrs"].append(dev)
                 if val.startswith("->"):
                     row["peers"].append(val[2:])
@@ -884,6 +943,8 @@ def _row_extra_title(rows: list) -> None:
     'started HH:MM' suffix so they can be told apart without a PID."""
     seen: dict = {}
     for r in rows:
+        if r["kind"] == "unknown":          # collapsed into one row by the UI
+            continue
         seen.setdefault((r["title"], r["project"], r["worktree"]), []).append(r)
     for group in seen.values():
         if len(group) < 2:
@@ -891,23 +952,6 @@ def _row_extra_title(rows: list) -> None:
         for r in group:
             started = time.strftime("%H:%M", time.localtime(r["root"]["start"][0]))
             r["title"] = f"{r['title']} · started {started}"
-
-
-GUI_VM_APPS = ("com.docker.docker", "dev.kdrag0n.MacVirt")     # Docker Desktop, OrbStack
-
-
-def _gui_vm_quit(rows: list) -> None:
-    """A VM started by Docker Desktop or OrbStack stops when that app quits,
-    so its service row carries the app's quit action and token. A VM paired
-    with a Lima instance is not theirs and keeps only its copyable command."""
-    apps = [r for r in rows if r["kind"] == "app" and r["token"]
-            and decode_token(r["token"]).get("bundle_id") in GUI_VM_APPS]
-    if not apps:
-        return
-    for r in rows:
-        if r["kind"] == "service" and r["owner_id"].startswith("service:vm:virtualization-"):
-            r.update(actions=["quit-app"], token=apps[0]["token"],
-                     quit_app_owner_id=apps[0]["owner_id"])
 
 
 def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
@@ -926,7 +970,10 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
         root = inv.procs[owner.root]
         fp = _sum(inv.procs[p].footprint for p in owner.members)
         cores, coverage = _cpu(owner.members, sample.cpu)
-        g, g_reason = growth((hist_owners.get(owner.owner_id) or {}).get("samples"), now)
+        if owner.kind == "unknown":
+            g, g_reason = None, "tracked as Unattributed"
+        else:
+            g, g_reason = growth((hist_owners.get(owner.owner_id) or {}).get("samples"), now)
         cwd = owner.info.get("cwd") or (inv.cwd(owner.root)
                                         if owner.kind in ("claude", "codex", "job") else None)
         project, worktree = git_place(cwd) if cwd else (None, None)
@@ -990,10 +1037,10 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
                                 "target": ident(root), "run_id": lease.get("id"),
                                 "snapshot_ts": round(inv.ts, 3)})
         instances = None
-        if owner.kind == "app":
+        if owner.info.get("bundle"):
             bundle = owner.info["bundle"]
             insts = sorted(r for r in owner.roots
-                           if inv.procs[r].ppid not in owner.roots
+                           if _bundle_of(inv, r) == bundle
                            and _bundle_of(inv, inv.procs[r].ppid) != bundle)
             instances = [{"pid": r, "start": list(inv.procs[r].start),
                           "launch_date": inv.procs[r].start[0] + inv.procs[r].start[1] / 1e6}
@@ -1027,13 +1074,13 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
             "token": token, "jobs": ([conversation] if conversation else []) + job_rows,
             "actions": actions, "instances": instances, "shared_with": shared_with,
             "stop_command": (stop_command_for(owner.info["vm"])
-                             if owner.kind == "service" else None),
-            "used_by": None, "quit_app_owner_id": None,
+                             if owner.kind == "service" and not owner.info.get("bundle")
+                             else None),
+            "used_by": None,
         }
         if owner.kind == "service" and used_by and owner.owner_id in used_by:
             row["used_by"] = used_by[owner.owner_id]
         rows.append(row)
-    _gui_vm_quit(rows)
     if used_by:
         titles = {r["owner_id"]: r["title"] for r in rows}
         for r in rows:
@@ -1041,6 +1088,8 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
                 r["used_by"] = sorted({titles.get(o, o) for o in r["used_by"]})
     _row_extra_title(rows)
     rows.sort(key=lambda r: (r["footprint_bytes"] is None, -(r["footprint_bytes"] or 0)))
+    unknown = [r for r in rows if r["kind"] == "unknown"]
+    ug, ug_reason = growth((hist_owners.get(UNATTRIBUTED) or {}).get("samples"), now)
     return {
         "schema_version": 2, "ts": round(inv.ts, 3), "source": source,
         "inventory": inv.kind,
@@ -1048,6 +1097,11 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
         "cpu_window_s": cpu_window_s,
         "system": system, "protection": protection, "gate": gate,
         "hidden_process_count": part.hidden,
+        "unattributed": {
+            "owner_count": len(unknown),
+            "member_count": sum(r["member_count"] for r in unknown),
+            "footprint_bytes": _sum(r["footprint_bytes"] for r in unknown),
+            "growth_bytes_per_10min": ug, "growth_reason": ug_reason},
         "owners": rows,
     }
 

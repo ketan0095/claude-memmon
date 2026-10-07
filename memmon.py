@@ -2630,14 +2630,10 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
 
 def _service_users(sample, oid: str):
     """Sessions that appear to use a VM: agent processes with a TCP connection
-    to a port the VM side listens on (Lima forwards, or a GUI app's backend).
-    Inferred, computed only on demand; None when it cannot be computed."""
-    part, inv = sample.part, sample.inv
+    to a port the VM side listens on (Lima's forwards, Docker Desktop's
+    backend). Inferred, computed only on demand; None when it cannot be."""
+    part = sample.part
     host = list(part.owners[oid].members)
-    for o in part.owners.values():
-        if o.kind == "app" and inv.path(o.root) and any(
-                n in inv.path(o.root) for n in ("/Docker.app/", "/OrbStack.app/")):
-            host += o.members
     agents = {p: o.owner_id for o in part.owners.values()
               if o.kind in ("claude", "codex") for p in o.members}
     if not host or not agents:
@@ -2687,7 +2683,7 @@ def owners_sampler_tick(source=None, ctx=None, clock=None, mono=None) -> dict | 
     cpu = {} if problem else memmon_procs.cpu_cores(base["procs"], inv,
                                                     int(base["mono_ns"]))
     hist = mo.update_history(mo.read_json(OWNERS_HISTORY, {}),
-                             mo.owner_footprints(part, inv), inv.ts)
+                             mo.history_footprints(part, inv), inv.ts)
     for oid, owner in part.owners.items():
         if oid in hist["owners"]:
             cores, cov = mo._cpu(owner.members, cpu)
