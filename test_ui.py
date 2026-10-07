@@ -19,6 +19,16 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent
+
+# py's real owners generator, present once the S1 Python lane is in this tree.
+try:
+    import memmon
+    import memmon_owners
+    import memmon_procs
+    import testkit
+    HAVE_GENERATOR = hasattr(memmon_owners, "owners_payload")
+except ImportError:
+    HAVE_GENERATOR = False
 FIXTURES = ROOT / "fixtures" / "ui"
 BIN = None
 _BUILD_DIR = None
@@ -56,8 +66,12 @@ def run_json(*args, timeout=60):
 
 
 def a11y(fixture, *flags):
+    return a11y_path(FIXTURES / fixture, *flags)
+
+
+def a11y_path(path, *flags):
     rows = []
-    for line in run_bin("--a11y-dump", "--fixture", str(FIXTURES / fixture), *flags).splitlines():
+    for line in run_bin("--a11y-dump", "--fixture", str(path), *flags).splitlines():
         parts = line.split("\t")
         if len(parts) >= 4 and parts[0].isdigit():
             parts += [""] * (5 - len(parts))
@@ -199,7 +213,7 @@ class QuitAppEngineTests(unittest.TestCase):
 
 
 def app_token(instances, bundle="com.example.containers"):
-    raw = {"v": 1, "action": "quit-app", "owner_id": "service:vm:fixture", "bundle_id": bundle,
+    raw = {"v": 1, "action": "quit-app", "owner_id": "service:vm:docker-desktop", "bundle_id": bundle,
            "instances": [{"pid": p, "start": [int(l), 0], "launch_date": l} for p, l in instances],
            "snapshot_ts": 1791449998.0}
     return base64.b64encode(json.dumps(raw).encode()).decode()
@@ -481,6 +495,79 @@ class HostedPopoverTests(unittest.TestCase):
         self.assertEqual(r["after_5s"], "Sampled 7s ago by the live reader")
         self.assertTrue(r["after"].endswith(", stale"), r["after"])
         self.assertGreaterEqual(r["ticks"], 1)
+
+
+@unittest.skipUnless(HAVE_GENERATOR, "memmon_owners/testkit absent: needs the merged S1 tree")
+class GeneratorContractTests(unittest.TestCase):
+    """Fixtures can drift from the contract, so one payload comes straight from
+    memmon_owners.owners_payload over a scripted process table."""
+
+    T0 = 1_791_400_000
+
+    def setUp(self):
+        self.state = testkit.TempState()
+        self.addCleanup(self.state.close)
+        self.out = tempfile.TemporaryDirectory()
+        self.addCleanup(self.out.cleanup)
+
+    def generated(self, view):
+        T0, MB, P = self.T0, testkit.MB, testkit.P
+        sessions = memmon.CLAUDE_SESSIONS_DIR
+        ctx = memmon_owners.Context(sessions_dir=sessions,
+                                    socks_dir=os.path.join(self.state.root, "socks"),
+                                    codex_home=os.path.join(self.state.root, "codex"),
+                                    classify=lambda c: memmon.classify_command(c, {}))
+        testkit.session_file(sessions, 10, T0 + 10, job_id="0000a001")
+
+        def shell(cmd):
+            return ["/bin/zsh", "-c", f"eval '{cmd}' < /dev/null"]
+
+        procs = [P(10, start=(T0 + 10, 0), comm="2.1.293"), P(11, ppid=10, pgid=10, comm="npm"),
+                 P(20, ppid=10, fp=10 * MB), P(21, ppid=20, pgid=20, fp=4000 * MB),
+                 P(30, ppid=10, fp=50 * MB), P(400, comm="node", fp=300 * MB)]
+        src = testkit.FakeSource(procs, argv={20: shell("pnpm --filter web typecheck"),
+                                              30: shell("pnpm dev")})
+        inv = memmon_procs.snapshot(src, clock=lambda: T0 + 5000, mono=lambda: 10 ** 12)
+        part = memmon_owners.partition(inv, ctx)
+        payload = memmon_owners.owners_payload(
+            memmon_owners.Sample(inv, part, {10: 0.1}, "warming up"), ctx, now=inv.ts,
+            system={"ram_bytes": 48 << 30, "used_bytes": 30 << 30, "pressure_level": "normal",
+                    "score_level": "HEALTHY", "ncpu": 18, "cpu_cores": None, "reason": None})
+        payload["_now"] = payload["ts"] + 2
+        payload["_view"] = view
+        path = Path(self.out.name) / "generated.json"
+        path.write_text(json.dumps(payload))
+        session = next(r for r in payload["owners"] if r["kind"] == "claude")
+        return path, payload, session
+
+    def test_generated_payload_decodes_renders_and_reads(self):
+        path, payload, session = self.generated({})
+        self.assertEqual(session["jobs"][0]["kind"], "conversation")
+        png = Path(self.out.name) / "generated.png"
+        line = run_bin("--render", str(png), "--fixture", str(path), "--dark")
+        self.assertIn("rendered", line)
+        rows = a11y_path(path)
+        found = labels(rows)
+        row = next(l for l in found if l.startswith(session["title"] + ","))
+        self.assertIn("Building · typecheck", row)
+        self.assertIn("ownership confidence: exact", row)
+        self.assertTrue(any(l.startswith("Unattributed,") for l in found))
+        self.assertIn("Memory pressure normal", " ".join(r["value"] for r in rows))
+        # No project for a scripted session, and no gate object in this payload:
+        # both must read as unknown rather than as a claim.
+        self.assertIn("No project detected", row)
+        self.assertIn("Status unavailable", " ".join(r["value"] for r in rows))
+
+    def test_generated_session_detail_and_stop_confirm(self):
+        _, _, session = self.generated({})
+        path, _, _ = self.generated({"select": session["owner_id"]})
+        found = labels(a11y_path(path))
+        self.assertIn("kept running", found)
+        self.assertTrue(any(l.startswith("Conversation, ") for l in found))
+        self.assertTrue(any(l.startswith("Stop build: Typecheck") for l in found), found)
+        self.assertTrue(any(l.startswith("Stop server:") for l in found), found)
+        path, _, _ = self.generated({"select": session["owner_id"], "confirm": "stop-job"})
+        self.assertIn("Stop typecheck?", labels(a11y_path(path)))
 
 
 if __name__ == "__main__":

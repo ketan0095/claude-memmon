@@ -63,7 +63,7 @@
    "shared_with": null
   },
   {
-   "owner_id": "service:vm:fixture",
+   "owner_id": "service:vm:colima",
    "kind": "service",
    "agent": "service",
    "title": "Container VM",
@@ -218,7 +218,7 @@
   }
  ],
  "_view": {
-  "select": "service:vm:fixture",
+  "select": "service:vm:colima",
   "confirm": "stop-command"
  }
 }

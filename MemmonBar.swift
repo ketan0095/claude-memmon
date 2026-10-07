@@ -350,6 +350,7 @@ struct Owner: Identifiable {
         case "service": return "Not assigned to a session"
         case "codex-app": return "Shared process — memory not split by thread"
         case "codex-ui": return "Frontend only — no stop action"
+        case "claude", "codex": return "No project detected"
         default: return agentLabel
         }
     }
@@ -423,6 +424,8 @@ struct OwnersSnap {
     var system = SystemInfo()
     var protection: Protection?
     var gate = GateStats()
+    /// No gate object at all: its state is unknown, which is not "not installed".
+    var gateMissing = false
     var owners: [Owner] = []
 
     var degraded: Bool { inventory == "degraded" }
@@ -453,7 +456,7 @@ struct OwnersSnap {
                                       route: str(p["route"]),
                                       unmanagedHeavy: int(p["unmanaged_heavy"]))
         }
-        if let g = j["gate"] as? [String: Any] { s.gate = GateStats.decode(g) }
+        if let g = j["gate"] as? [String: Any] { s.gate = GateStats.decode(g) } else { s.gateMissing = true }
         s.owners = list.compactMap { ($0 as? [String: Any]).flatMap(Owner.decode) }
         return s
     }
@@ -2276,7 +2279,7 @@ struct ContentView: View {
             .accessibilityHidden(true)
             ownerList(s).padding(.horizontal, 8)
             Text("System and other users: not itemised"
-                 + (s.hiddenProcesses.map { " (\(plural($0, "process", "processes")))" } ?? ""))
+                 + (s.hiddenProcesses.flatMap { $0 > 0 ? " (\(plural($0, "process", "processes")))" : nil } ?? ""))
                 .font(ft(11)).foregroundColor(P.muted)
                 .padding(.horizontal, 18).padding(.top, 2).padding(.bottom, 8)
             gateSection(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 10)
@@ -2541,7 +2544,9 @@ struct ContentView: View {
                 Image(systemName: "shield").font(.system(size: 13, weight: .medium)).foregroundColor(P.muted)
                     .accessibilityHidden(true)
                 Text("Command protection").font(ft(13, .medium))
-                if !g.installed {
+                if s.gateMissing {
+                    Chip(text: "Status unavailable")
+                } else if !g.installed {
                     Chip(text: "Not installed")
                 } else if g.paused {
                     Chip(text: "Paused", tint: P.amber)
@@ -2603,7 +2608,11 @@ struct ContentView: View {
 
     @ViewBuilder private func gateDetail(_ s: OwnersSnap) -> some View {
         let g = s.gate
-        if !g.installed {
+        if s.gateMissing {
+            Text("memmon did not report the command gate's state this time.")
+                .font(ft(11)).foregroundColor(P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if !g.installed {
             Text("Command protection is not installed. Memory monitoring is active; commands are never warned or stopped.")
                 .font(ft(11)).foregroundColor(P.muted)
                 .fixedSize(horizontal: false, vertical: true)

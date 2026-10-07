@@ -63,7 +63,7 @@
    "shared_with": null
   },
   {
-   "owner_id": "service:vm:fixture",
+   "owner_id": "service:vm:docker-desktop",
    "kind": "service",
    "agent": "service",
    "title": "Container VM",
@@ -83,7 +83,7 @@
      0
     ]
    },
-   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoic2VydmljZTp2bTpmaXh0dXJlIiwiYnVuZGxlX2lkIjoiY29tLmV4YW1wbGUuY29udGFpbmVycyIsImluc3RhbmNlcyI6W3sicGlkIjo1MTAxLCJzdGFydCI6WzE3OTE0NDI4MDAsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDQyODAwLjB9LHsicGlkIjo1MTg4LCJzdGFydCI6WzE3OTE0NDY0MDAsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDQ2NDAwLjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoic2VydmljZTp2bTpkb2NrZXItZGVza3RvcCIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLmNvbnRhaW5lcnMiLCJpbnN0YW5jZXMiOlt7InBpZCI6NTEwMSwic3RhcnQiOlsxNzkxNDQyODAwLDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQ0MjgwMC4wfSx7InBpZCI6NTE4OCwic3RhcnQiOlsxNzkxNDQ2NDAwLDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQ0NjQwMC4wfV0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
    "jobs": [],
    "actions": [
     "quit-app"
@@ -111,7 +111,8 @@
    "used_by": [
     "Checkout refactor",
     "Billing API tests"
-   ]
+   ],
+   "stop_command": null
   },
   {
    "owner_id": "app:com.example.browser",
