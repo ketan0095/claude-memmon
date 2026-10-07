@@ -4,6 +4,7 @@
   "result": "stopped",
   "reason": null,
   "exited": 5,
+  "captured": 5,
   "remaining": [],
   "kept": [],
   "used_bytes_before": 42090679500,

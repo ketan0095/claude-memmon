@@ -247,6 +247,7 @@ struct SystemInfo {
     var ramBytes: Double?, usedBytes: Double?
     var pressureLevel: String?, scoreLevel: String?
     var ncpu: Double?, cpuCores: Double?
+    var reason: String?
 }
 
 struct Protection {
@@ -396,6 +397,11 @@ struct Owner: Identifiable {
         o.instances = (d["instances"] as? [[String: Any]])?.compactMap { i in
             int(i["pid"]).map { AppInstanceInfo(pid: $0, launchDate: launchDate(i["launch_date"])) }
         }
+        if let conv = d["conversation"] as? [String: Any] {
+            o.jobs.append(OwnerJob(id: "\(id)#conversation", kind: "conversation", label: "conversation",
+                                   footprint: num(conv["footprint_bytes"]),
+                                   memberCount: int(conv["member_count"]), token: nil, action: nil))
+        }
         o.sharedWith = strs(d["shared_with"])
         o.stopCommand = str(d["stop_command"])
         o.usedBy = strs(d["used_by"])
@@ -416,6 +422,7 @@ func launchDate(_ v: Any?) -> Double? {
 
 struct OwnersSnap {
     var ts: Double?, source: String?, inventory: String?, cpuWindow: Double?
+    var inventoryReason: String?, hiddenProcesses: Int?
     var system = SystemInfo()
     var protection: Protection?
     var gate = GateStats()
@@ -435,11 +442,13 @@ struct OwnersSnap {
         var s = OwnersSnap()
         s.ts = num(j["ts"]); s.source = str(j["source"])
         s.inventory = str(j["inventory"]); s.cpuWindow = num(j["cpu_window_s"])
+        s.inventoryReason = str(j["inventory_reason"]); s.hiddenProcesses = int(j["hidden_process_count"])
         if let y = j["system"] as? [String: Any] {
             s.system = SystemInfo(ramBytes: num(y["ram_bytes"]), usedBytes: num(y["used_bytes"]),
                                   pressureLevel: str(y["pressure_level"]),
                                   scoreLevel: str(y["score_level"]),
-                                  ncpu: num(y["ncpu"]), cpuCores: num(y["cpu_cores"]))
+                                  ncpu: num(y["ncpu"]), cpuCores: num(y["cpu_cores"]),
+                                  reason: str(y["reason"]))
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -642,6 +651,7 @@ struct ActOutcome {
     var result: String
     var reason: String?
     var exited: Int?
+    var captured: Int?
     var remaining: Int = 0
     var kept: [String] = []
     var forceToken: String?
@@ -651,6 +661,7 @@ struct ActOutcome {
         guard let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let result = str(j["result"]) else { return nil }
         return ActOutcome(result: result, reason: str(j["reason"]), exited: int(j["exited"]),
+                          captured: int(j["captured"]),
                           remaining: (j["remaining"] as? [Any])?.count ?? 0,
                           kept: strs(j["kept"]) ?? [], forceToken: str(j["force_token"]),
                           usedBefore: num(j["used_bytes_before"]),
@@ -867,7 +878,7 @@ enum Copy {
 
     static func refusal(_ reason: String?, noun: String) -> (String, Bool) {
         switch reason {
-        case "target_changed", "ownership_changed", "stale_token":
+        case "target_changed", "ownership_changed", "stale_token", "instance_changed", "lease_mismatch":
             return ("this \(noun) changed since the list was sampled. Refresh and try again.", true)
         case "busy":
             return ("another stop is still in progress. Try again in a moment.", false)
@@ -875,7 +886,7 @@ enum Copy {
             return ("this \(noun) is protected: it is the session itself or belongs to another owner.", false)
         case "degraded_identity":
             return ("process identity is unavailable (limited inventory), so nothing can be stopped safely.", false)
-        case "shared":
+        case "shared", "not_stoppable":
             return ("this process is shared; quit the app that owns it to free it.", false)
         case let r?:
             return ("memmon declined (\(r.replacingOccurrences(of: "_", with: " "))).", false)
@@ -890,32 +901,33 @@ enum Copy {
             let (m, note) = measured(o)
             var parts: [String] = []
             let title: String
-            var tone = Banner.Tone.success
             switch o.result {
             case "already_exited":
                 title = "\(subject) had already exited"
                 parts.append("nothing was signalled")
             case "respawned":
-                title = "\(subject) was restarted"
-                parts.append("Claude started a new worker after the stop")
-                tone = .warning
+                // The worker came back under the same job, so nothing is
+                // left to force; the honest outcome is that it runs again.
+                return Banner(tone: .warning, title: "Session restarted by Claude",
+                              body: "— it is running again.", offersRefresh: true)
             case "force_stopped":
                 title = "\(subject) force-stopped"
             default:
                 title = "\(subject) stopped"
             }
             if let n = o.exited, o.result != "already_exited" {
-                parts.append("\(n) of \(n + o.remaining) processes exited")
+                parts.append("\(n) of \(o.captured ?? n + o.remaining) processes exited")
             }
             if !o.kept.isEmpty { parts.append("\(plural(o.kept.count, "nested session")) kept running") }
             if let m { parts.append(m) }
-            return Banner(tone: tone, title: title, body: "· " + parts.joined(separator: " · "), note: note)
+            return Banner(tone: .success, title: title, body: "· " + parts.joined(separator: " · "), note: note)
         case .refused(let o):
             let (text, refresh) = refusal(o.reason, noun: noun)
             return Banner(tone: .warning, title: "Not stopped", body: "— " + text, offersRefresh: refresh)
         case .partial(let o):
             return Banner(tone: .warning, title: "\(subject) partly stopped",
-                          body: "· \(plural(o.remaining, "process", "processes")) left running")
+                          body: "· \(plural(o.remaining, "process", "processes")) still running outside what was stopped",
+                          offersRefresh: true)
         case .error(let message):
             return Banner(tone: .error, title: "Result unknown",
                           body: "— \(message) Refresh to see what is still running.", offersRefresh: true)
@@ -984,8 +996,12 @@ final class Model: ObservableObject {
     func refresh() {
         guard live, !refreshing else { return }
         refreshing = true
+        // Listening-port lookups cost CPU, so memmon only runs them for the
+        // owner that is open here; that is what tells a server from a build.
+        var args = ["owners", "--json", "--cpu-window", "1.0"]
+        if let open = expanded, open != "unknown:*" { args += ["--expand", open] }
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = CLI.run(["owners", "--json", "--cpu-window", "1.0"],
+            let r = CLI.run(args,
                             timeout: CLI.ownersTimeout, terminateOnTimeout: true)
             var parsed: OwnersSnap?
             var failure: String?
@@ -1121,6 +1137,8 @@ final class Model: ObservableObject {
             switch verifyView(r) {
             case .refused(let o): return .refused(o)
             case .error(let e): return .error(e)
+            case .success(let o) where o.result == "already_exited":
+                return .done(parsed.instances.map { InstanceOutcome(pid: $0.pid, state: .alreadyExited) })
             default: break
             }
             return .done(QuitApp(control: control, watch: watch).quit(parsed))
@@ -1134,7 +1152,7 @@ final class Model: ObservableObject {
             return .error("memmon's answer could not be read.")
         }
         switch (exit, o.result) {
-        case (0, "verified"): return .success(o)
+        case (0, "verified"), (0, "already_exited"): return .success(o)
         case (4, "refused"): return .refused(o)
         default: return .error("memmon could not verify the app.")
         }
@@ -2198,7 +2216,7 @@ struct ContentView: View {
             healthCard(s).padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 8)
             protectionLine(s).padding(.horizontal, 16).padding(.bottom, 12)
             if s.degraded {
-                degradedBanner.padding(.horizontal, 12).padding(.bottom, 10)
+                degradedBanner(s.inventoryReason).padding(.horizontal, 12).padding(.bottom, 10)
             }
             if let e = model.loadError {
                 OutcomeBanner(banner: Banner(tone: .warning, title: "Could not refresh",
@@ -2222,7 +2240,8 @@ struct ContentView: View {
             .padding(.horizontal, 18).padding(.bottom, 3)
             .accessibilityHidden(true)
             ownerList(s).padding(.horizontal, 8)
-            Text("System and other users: not itemised")
+            Text("System and other users: not itemised"
+                 + (s.hiddenProcesses.map { " (\(plural($0, "process", "processes")))" } ?? ""))
                 .font(ft(11)).foregroundColor(P.muted)
                 .padding(.horizontal, 18).padding(.top, 2).padding(.bottom, 8)
             gateSection(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 10)
@@ -2284,8 +2303,10 @@ struct ContentView: View {
                             String(format: "%.1f of %.0f GB", u, r) + (u > r ? ", over the limit" : "") } }
                             ?? "not available")
                 }
-            Text("Score \(level ?? "unavailable") · kernel pressure \(sys.pressureLevel ?? "unavailable")")
+            Text("Score \(level ?? "unavailable") · kernel pressure \(sys.pressureLevel ?? "unavailable")"
+                 + (sys.reason.map { " · \($0)" } ?? ""))
                 .font(ft(11)).foregroundColor(P.muted).padding(.top, 7)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
         .panel(13)
@@ -2338,11 +2359,13 @@ struct ContentView: View {
         .accessibilityLabel(text)
     }
 
-    private var degradedBanner: some View {
-        HStack(alignment: .top, spacing: 8) {
+    private func degradedBanner(_ reason: String?) -> some View {
+        let detail = "libproc is unavailable" + (reason.map { " (\($0))" } ?? "")
+            + ", so memory comes from top and stop actions are off."
+        return HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle").foregroundColor(P.amber).padding(.top, 1)
                 .accessibilityHidden(true)
-            Text("\(Text("Limited process details").fontWeight(.medium)) — libproc is unavailable, so memory comes from top and stop actions are off.")
+            Text("\(Text("Limited process details").fontWeight(.medium)) — \(detail)")
                 .font(ft(12)).foregroundColor(P.text)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -2350,7 +2373,7 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10).fill(P.amber.opacity(0.16)))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Limited process details: libproc is unavailable, so memory comes from top and stop actions are off.")
+        .accessibilityLabel("Limited process details: " + detail)
     }
 
     // MARK: owners

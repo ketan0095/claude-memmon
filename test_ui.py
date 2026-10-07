@@ -120,6 +120,11 @@ class ActOutcomeDecodingTests(StubCase):
         r = self.probe(self.emit(0, {"result": "already_exited", "exited": 0}))
         self.assertEqual(r["view"], "success")
 
+    def test_exit_3_respawned_is_its_own_outcome_without_force(self):
+        r = self.probe(self.emit(3, {"result": "respawned", "exited": 9, "captured": 9, "remaining": []}))
+        self.assertEqual((r["view"], r["result"]), ("success", "respawned"))
+        self.assertIsNone(r["force_token"])
+
     def test_exit_1_is_error(self):
         r = self.probe("sys.stdout.write('Traceback: boom')\nsys.exit(1)\n")
         self.assertEqual(r["view"], "error")
@@ -260,6 +265,11 @@ sys.exit(CODE)
         self.assertEqual((r["view"], r["reason"]), ("refused", "target_changed"))
         self.assertEqual(r["calls"], [])
 
+    def test_verification_finding_every_instance_gone_terminates_nothing(self):
+        r = self.quit_probe(self.verify_stub("already_exited"))
+        self.assertEqual(r["states"], ["already_exited", "already_exited"])
+        self.assertEqual(r["calls"], [])
+
     def test_unreadable_verification_terminates_nothing(self):
         r = self.quit_probe(self.stub("print('ok')\nsys.exit(0)\n"))
         self.assertEqual(r["view"], "error")
@@ -378,8 +388,20 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Refresh the process list", labels(a11y("outcome-refused.json")))
         degraded = a11y("degraded.json")
         spoken = [r["label"] or r["value"] for r in degraded]
-        self.assertIn("Limited process details: libproc is unavailable, so memory comes from top "
-                      "and stop actions are off.", spoken)
+        self.assertIn("Limited process details: libproc is unavailable (libproc self-check failed), "
+                      "so memory comes from top and stop actions are off.", spoken)
+
+    def test_respawned_session_says_so_and_offers_no_force(self):
+        rows = a11y("outcome-respawned.json")
+        spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
+        self.assertIn("Session restarted by Claude — it is running again.", spoken)
+        self.assertIn("Refresh the process list", labels(rows))
+        self.assertFalse(any("Force" in l for l in labels(rows)))
+        self.assertNotIn("still running after 10 s", spoken)
+
+    def test_counts_use_the_captured_total(self):
+        spoken = " ".join(r["value"] for r in a11y("outcome-stopped.json"))
+        self.assertIn("5 of 5 processes exited", spoken)
 
     def test_degraded_inventory_offers_no_stop_buttons(self):
         found = labels(a11y("degraded.json"))

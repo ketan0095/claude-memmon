@@ -4,6 +4,7 @@
   "result": "partial",
   "reason": "survivors",
   "exited": 3,
+  "captured": 5,
   "remaining": [
    {
     "pid": 48311,
