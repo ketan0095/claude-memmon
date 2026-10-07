@@ -79,7 +79,8 @@ if len(kept) != len(pre):
 PY
   fi
   rm -rf "$PLIST" "$BAR_PLIST" "$BIN" "$DEST" "$APP" \
-         "$DEST_DIR/memmon_runner.py" \
+         "$DEST_DIR/memmon_runner.py" "$DEST_DIR/memmon_procs.py" \
+         "$DEST_DIR/memmon_owners.py" "$DEST_DIR/memmon_act.py" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
   exit 0
@@ -106,8 +107,10 @@ mkdir -p "$DEST_DIR" "$BIN_DIR"
 # deleted, and the monitor has to keep working after that.
 # Publish the dependency before the entrypoint, without exposing partial files
 # to an already-running sampler or another CLI invocation during an upgrade.
-cp "$SRC_DIR/memmon_runner.py" "$DEST_DIR/.memmon_runner.py.$$"
-mv -f "$DEST_DIR/.memmon_runner.py.$$" "$DEST_DIR/memmon_runner.py"
+for mod in memmon_runner memmon_procs memmon_owners memmon_act; do
+  cp "$SRC_DIR/$mod.py" "$DEST_DIR/.$mod.py.$$"
+  mv -f "$DEST_DIR/.$mod.py.$$" "$DEST_DIR/$mod.py"
+done
 cp "$SRC_DIR/memmon.py" "$DEST_DIR/.memmon.py.$$"
 mv -f "$DEST_DIR/.memmon.py.$$" "$DEST"
 chmod +x "$DEST"
