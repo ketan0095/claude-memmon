@@ -449,6 +449,17 @@ class HostedPopoverTests(unittest.TestCase):
         self.assertEqual(r["after_esc_phase"], "closed")
         self.assertEqual(r["actions"], [])
 
+    def test_inside_the_transient_popover_esc_closes_only_the_overlay(self):
+        for fixture, phase in (("confirm-stop.json", "ask"), ("outcome-partial.json", "partial")):
+            with self.subTest(fixture=fixture):
+                r = self.host("popover-keys", fixture)
+                self.assertFalse(r["popover_on_a_display"])
+                self.assertEqual(r["focus"], "safe")
+                self.assertEqual(r["after_return_phase"], phase)
+                self.assertEqual(r["after_esc_phase"], "closed")
+                self.assertTrue(r["popover_open_after_esc"])
+                self.assertEqual(r["actions"], [])
+
     def test_freshness_ticker_marks_a_live_sample_stale_after_95_s(self):
         r = self.host("ticker", "overview.json")
         self.assertEqual(r["before"], "Sampled 2s ago by the live reader")

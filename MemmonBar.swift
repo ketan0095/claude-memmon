@@ -3107,6 +3107,24 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 spin(0.4)
                 report["after_esc_phase"] = phase(model)
                 report["actions"] = model.actionLog
+            case "popover-keys":
+                // The same keys inside a shown, transient NSPopover: Esc must
+                // close the overlay, not the popover.
+                pop.behavior = .transient
+                pop.show(relativeTo: .zero, of: probeAnchor(), preferredEdge: .minY)
+                spin(0.5)
+                guard let pw = host.view.window else { fail("popover has no window") }
+                report["popover_on_a_display"] = NSScreen.screens.contains { $0.frame.intersects(pw.frame) }
+                report["focus"] = model.overlayFocus ?? NSNull()
+                key("\r", 36, in: pw)
+                spin(0.3)
+                report["after_return_phase"] = phase(model)
+                key("\u{1b}", 53, in: pw)
+                spin(0.4)
+                report["after_esc_phase"] = phase(model)
+                report["popover_open_after_esc"] = pop.isShown
+                report["actions"] = model.actionLog
+                pop.close()
             case "ticker":
                 func freshness() -> String {
                     axRows(host.view).first { $0.label.hasPrefix("Sampled") || $0.label.hasPrefix("Sample time") }?.label ?? ""
