@@ -45,6 +45,7 @@ CPU_BASELINE = os.path.join(STATE_DIR, "cpu-baseline.json")
 ACTIONS_LOCK = os.path.join(STATE_DIR, "runner", "coord", "actions.lock")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
+CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
 CODEX_HOME = os.path.join(HOME, ".codex")
 
 # A process is a reap candidate only if it matches one of these shapes. Being an
@@ -2514,7 +2515,8 @@ def _owners_ctx(titles: bool = True, listening: set | None = None):
     from memmon_runner import jobs
     ctx = memmon_owners.Context(
         sessions_dir=CLAUDE_SESSIONS_DIR, socks_dir=CC_SOCKS_DIR,
-        codex_home=CODEX_HOME, leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
+        codex_home=CODEX_HOME, jobs_dir=JOBS_DIR, roster_path=CLAUDE_ROSTER,
+        leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
         lsof=lambda args: _sh(["lsof", *args], timeout=5), listening=listening)
     if titles:
         prof = load_profile()
@@ -2534,6 +2536,7 @@ def _engine(**kw):
     kw.setdefault("source", memmon_procs.default_source())
     kw.setdefault("partition_fn", lambda inv: memmon_owners.partition(
         inv, _owners_ctx(titles=False)))
+    kw.setdefault("respawn", memmon_owners.RespawnWatch(_owners_ctx(titles=False)))
     kw.setdefault("lock_path", ACTIONS_LOCK)
     kw.setdefault("system_reader", memmon_procs.read_system_strict)
     kw.setdefault("leases_fn", lambda: jobs(STATE_DIR))
@@ -2606,24 +2609,62 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     import memmon_owners
     ctx = ctx or _owners_ctx()
     sample, window = owners_sample(cpu_window, source, ctx)
+    used_by = None
     if expand:
-        wanted = [p for oid in expand
-                  for p in (sample.part.owners.get(oid).members
-                            if sample.part.owners.get(oid) else [])]
+        owners = sample.part.owners
+        wanted = [p for oid in expand for p in (owners[oid].members if oid in owners else [])]
         ctx.listening = _listening(wanted)
+        used_by = {oid: _service_users(sample, oid) for oid in expand
+                   if oid in owners and owners[oid].kind == "service"}
     hist = memmon_owners.read_json(OWNERS_HISTORY, {})
-    return memmon_owners.owners_payload(
+    payload = memmon_owners.owners_payload(
         sample, ctx, history=hist, cpu_window_s=window,
         system=system_block(system_reader),
         protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
-        gate=gate_stats())
+        gate=gate_stats(), used_by=used_by)
+    measured = [o["cpu_cores"] for o in payload["owners"] if o["cpu_cores"] is not None]
+    payload["system"]["ncpu"] = os.cpu_count()
+    payload["system"]["cpu_cores"] = round(sum(measured), 3) if measured else None
+    return payload
+
+
+def _service_users(sample, oid: str):
+    """Sessions that appear to use a VM: agent processes with a TCP connection
+    to a port the VM side listens on (Lima forwards, or a GUI app's backend).
+    Inferred, computed only on demand; None when it cannot be computed."""
+    part, inv = sample.part, sample.inv
+    host = list(part.owners[oid].members)
+    for o in part.owners.values():
+        if o.kind == "app" and inv.path(o.root) and any(
+                n in inv.path(o.root) for n in ("/Docker.app/", "/OrbStack.app/")):
+            host += o.members
+    agents = {p: o.owner_id for o in part.owners.values()
+              if o.kind in ("claude", "codex") for p in o.members}
+    if not host or not agents:
+        return [] if host else None
+    listen = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fn",
+                  "-p", ",".join(map(str, sorted(set(host))))], timeout=5)
+    ports = {line.rsplit(":", 1)[-1] for line in listen.splitlines()
+             if line.startswith("n") and ":" in line}
+    if not ports:
+        return []
+    est = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:ESTABLISHED", "-Fpn",
+               "-p", ",".join(map(str, sorted(agents)))], timeout=5)
+    users, pid = set(), None
+    for line in est.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and "->" in line and pid in agents:
+            if line.rsplit(":", 1)[-1] in ports:
+                users.add(agents[pid])
+    return sorted(users)
 
 
 def _listening(pids: list) -> set:
     """PIDs among `pids` holding a TCP LISTEN socket (one lsof, on demand)."""
     if not pids:
         return set()
-    out = _sh(["lsof", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fp",
+    out = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fp",
                "-p", ",".join(str(p) for p in sorted(set(pids)))], timeout=5)
     return {int(line[1:]) for line in out.splitlines()
             if line.startswith("p") and line[1:].isdigit()}

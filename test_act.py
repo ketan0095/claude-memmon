@@ -20,8 +20,9 @@ import memmon_act as ma
 import memmon_owners as mo
 import memmon_procs as mp
 import memmon_runner
-from testkit import (MB, NOTE, PY, SLEEP, FakeSource, P, Registry, TempState,
-                     fake_engine, session_file)
+from testkit import (MB, NOTE, PY, SLEEP, FakeClock, FakeSource, P, Registry,
+                     TempState, fake_engine, session_file)
+from test_owners import fake_lsof
 
 T0 = 1_791_400_000
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -173,19 +174,6 @@ class FakeActTests(unittest.TestCase):
         self.assertIn(30, self.src.table)
         self.assertIn(31, self.src.table)
 
-    def test_end_session_reports_respawn(self):
-        # R1: the daemon restarts the worker under the same job id.
-        def respawn(pid, sig):
-            if pid == 10:
-                self.src.table[50] = P(50, start=(T0 + 50, 0))
-                os.remove(os.path.join(self.sessions, "10.json"))
-                session_file(self.sessions, 50, T0 + 50, job_id="0000aaaa")
-        self.src.on_kill = respawn
-        out = self.run_act("end-session", tok("end-session", self.root, self.root))
-        self.assertEqual(out["result"], "respawned")
-        self.assertEqual(out["respawned_as"], {"pid": 50})
-        self.assertEqual(ma.exit_code(out), 0)
-
     def test_act_force_only_after_partial(self):
         # I-4
         self.src.ignore_term = {21}
@@ -269,6 +257,159 @@ class FakeActTests(unittest.TestCase):
         self.addCleanup(stray.close)
         out = self.eng.run("stop-job", job, lock_fd=stray.fileno())
         self.assertEqual(out["reason"], "bad_lock_fd")
+
+
+class RespawnTests(unittest.TestCase):
+    """R1: the daemon revives a worker ended mid-turn. Fixture from the probe;
+    no real Claude process is involved."""
+
+    JOB = "a1b2c3d4"
+
+    def setUp(self):
+        self.state = TempState()
+        self.addCleanup(self.state.close)
+        self.sessions = memmon.CLAUDE_SESSIONS_DIR
+        self.jobs = memmon.JOBS_DIR
+        self.roster = memmon.CLAUDE_ROSTER
+        os.makedirs(os.path.join(self.jobs, self.JOB))
+        os.makedirs(os.path.dirname(self.roster))
+        self.ctx = mo.Context(sessions_dir=self.sessions, jobs_dir=self.jobs,
+                              roster_path=self.roster)
+        self.clock = FakeClock()
+
+    def set_state(self, state):
+        with open(os.path.join(self.jobs, self.JOB, "state.json"), "w") as fh:
+            json.dump({"state": state}, fh)
+
+    def set_roster(self, entry):
+        with open(self.roster, "w") as fh:
+            json.dump({"workers": {self.JOB: entry} if entry else {}}, fh)
+
+    def fixture(self, busy=True):
+        procs = [P(os.getpid(), ppid=0),
+                 P(40000, start=(1000, 0)), P(41000, ppid=40000, start=(2000, 0)),
+                 P(41001, ppid=41000, start=(2000, 100000)),
+                 P(41002, ppid=41001, pgid=41001, start=(2001, 0))]
+        if busy:
+            procs += [P(41010, ppid=41001, start=(2100, 0)),
+                      P(41011, ppid=41010, pgid=41010, start=(2100, 200000))]
+        session_file(self.sessions, 41001, 2000, job_id=self.JOB,
+                     status="busy" if busy else "idle")
+        self.set_roster({"pid": 41000, "attempt": 1})
+        self.set_state("working" if busy else "done")
+        self.src = FakeSource(procs)
+        self.eng = fake_engine(self.src, self.ctx, memmon.ACTIONS_LOCK, clock=lambda: T0 + 5,
+                               mono=self.clock.mono, sleep=self.clock.sleep, poll_s=0.5,
+                               respawn=mo.RespawnWatch(self.ctx))
+        self.token = tok("end-session", self.src.table[41001], self.src.table[41001])
+
+    def crash_on_term(self):
+        def on_kill(pid, sig):
+            if pid == 41001:
+                os.remove(os.path.join(self.sessions, "41001.json"))
+                self.set_state("crashed")
+                self.t_term = self.clock.t
+        self.src.on_kill = on_kill
+
+    def test_r1_busy_worker_respawn_is_reported(self):
+        self.fixture(busy=True)
+        self.crash_on_term()
+
+        def revive():
+            self.src.table[42000] = P(42000, ppid=40000, start=(2212, 0))
+            self.src.table[42001] = P(42001, ppid=42000, start=(2212, 400000))
+            session_file(self.sessions, 42001, 2212, job_id=self.JOB, status="busy")
+            self.set_roster({"pid": 42000, "attempt": 2})
+            self.set_state("running")
+        self.clock.at(self.clock.t + 12.5, revive)
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual((out["result"], ma.exit_code(out)), ("respawned", 3))
+        self.assertEqual(out["reason"], "daemon_restarted_worker")
+        self.assertEqual(out["exited"], 4)
+        self.assertEqual(out["respawned_as"], {"pid": 42001, "start": [2212, 400000]})
+        self.assertNotIn("force_token", out)
+        self.assertEqual({p for p, _ in self.src.signals}, {41001, 41002, 41010, 41011})
+        self.assertLessEqual(self.clock.t - 1000, 22)
+        # The old token now names a process that is gone: nothing is signalled.
+        again = self.eng.run("end-session", self.token)
+        self.assertEqual(again["result"], "already_exited")
+        self.assertEqual({p for p, _ in self.src.signals}, {41001, 41002, 41010, 41011})
+
+    def test_r1_idle_worker_settles_early(self):
+        self.fixture(busy=False)
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual((out["result"], ma.exit_code(out)), ("stopped", 0))
+        self.assertLess(self.clock.t - 1000, 5)        # did not sit out the window
+
+    def test_r1_roster_removal_settles(self):
+        self.fixture(busy=True)
+        self.crash_on_term()
+        self.clock.at(self.clock.t + 12, lambda: self.set_roster(None))
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual(out["result"], "stopped")
+        self.assertLess(self.clock.t - 1000, 14)
+
+    def test_r1_spare_for_another_job_is_not_a_respawn(self):
+        self.fixture(busy=True)
+        self.crash_on_term()
+
+        def spare():
+            self.src.table[43001] = P(43001, ppid=40000, start=(2205, 0))
+            session_file(self.sessions, 43001, 2205, job_id="ffff0000", spare=True)
+        self.clock.at(self.clock.t + 5, spare)
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual(out["result"], "stopped")
+        self.assertGreaterEqual(self.clock.t - 1000, 20)   # watched the whole window
+        self.assertLessEqual(self.clock.t - 1000, 22)
+        self.assertNotIn(43001, {p for p, _ in self.src.signals})
+
+
+class CodexEndSessionTests(unittest.TestCase):
+    """R3: an in-process TUI is ended (usually ignoring TERM); a daemon
+    frontend is refused."""
+
+    def setUp(self):
+        self.state = TempState()
+        self.addCleanup(self.state.close)
+        u2 = "22222222-2222-4222-8222-222222222222"
+        self.ctx = mo.Context(sessions_dir=memmon.CLAUDE_SESSIONS_DIR, lsof=fake_lsof({
+            50001: [("unix", "0xd0d0", "/private/tmp/codex-daemon-501/aaaa")],
+            51000: [("unix", "0xc1c1", "->0xd0d0")],
+            52000: [("REG", "0x1", f"/h/.codex/thread-writer-locks/{u2}.lock")]}))
+        procs = [P(os.getpid(), ppid=0), P(50000, comm="codex"),
+                 P(50001, ppid=50000, comm="codex"),
+                 P(51000, comm="codex"), P(52000, comm="codex", start=(3000, 0)),
+                 P(52001, ppid=52000), P(52002, ppid=52000)]
+        argv = {50000: ["codex", "app-server", "daemon", "pid-update-loop"],
+                50001: ["codex", "app-server", "--listen", "unix://"],
+                51000: ["codex", "--model", "gpt-fixture"],
+                52000: ["codex", "--disable", "daemon_auto_start"]}
+        self.src = FakeSource(procs, argv=argv, ignore_term={52000})
+
+        def children_die_with_parent(pid, sig):
+            if pid == 52000 and sig == signal.SIGKILL:
+                for c in (52001, 52002):
+                    self.src.table.pop(c, None)
+        self.src.on_kill = children_die_with_parent
+        self.eng = fake_engine(self.src, self.ctx, memmon.ACTIONS_LOCK, clock=lambda: T0 + 5)
+
+    def test_r3_in_process_tui_ends_partial_then_force(self):
+        t = self.src.table[52000]
+        out = self.eng.run("end-session", tok("end-session", t, t))
+        self.assertEqual((out["result"], ma.exit_code(out)), ("partial", 3))
+        self.assertEqual([r["pid"] for r in out["remaining"]], [52000])
+        body = mo.decode_token(out["force_token"])
+        self.assertEqual(body["survivors"], [{"pid": 52000, "start": [3000, 0]}])
+        forced = self.eng.run("force", out["force_token"])
+        self.assertEqual(forced["result"], "force_stopped")
+        self.assertEqual([s for s in self.src.signals if s[1] == signal.SIGKILL],
+                         [(52000, signal.SIGKILL)])
+
+    def test_r3_daemon_frontend_is_refused(self):
+        t = self.src.table[51000]
+        out = self.eng.run("end-session", tok("end-session", t, t))
+        self.assertEqual((out["result"], out["reason"]), ("refused", "not_stoppable"))
+        self.assertEqual(self.src.signals, [])
 
 
 class VerifyAppTests(unittest.TestCase):

@@ -43,6 +43,19 @@ def make_repo(root, project, worktree=None):
     return wt
 
 
+def fake_lsof(table):
+    """lsof -F output for pid -> [(type, device, name)], honouring -p."""
+    def run(args):
+        pids = [int(x) for x in args[args.index("-p") + 1].split(",")]
+        out = []
+        for pid in pids:
+            out.append(f"p{pid}")
+            for i, (kind, dev, name) in enumerate(table.get(pid, ())):
+                out += [f"f{i + 3}", f"t{kind}", f"d{dev}", f"n{name}"]
+        return "\n".join(out) + "\n"
+    return run
+
+
 def tool_shell(cmd):
     return ["/bin/zsh", "-c", f"source ~/.snapshot.sh && eval '{cmd}' < /dev/null"]
 
@@ -141,8 +154,13 @@ class PartitionTests(OwnerBase):
                 fh.write(json.dumps({"id": t, "thread_name": f"Billing tests {i}"}) + "\n")
                 open(os.path.join(codex, "thread-writer-locks", t + ".lock"), "w").close()
         exec_thread = "0000000e-eeee-eeee-eeee-00000000000e"
-        self.ctx.lsof = lambda args: (f"p220\nn/x/.codex/sessions/2026/10/08/"
-                                      f"rollout-2026-10-08T01-00-00-{exec_thread}.jsonl\n")
+        locks = [("REG", "0x1000010", f"/x/.codex/thread-writer-locks/{t}.lock")
+                 for t in threads]
+        self.ctx.lsof = fake_lsof({
+            201: [("unix", "0xd0d0", "/private/tmp/codex-daemon-501/aaaa")] + locks,
+            210: [("unix", "0xc1c1", "->0xd0d0")],
+            220: [("REG", "0x1000010", "/x/.codex/sessions/2026/10/08/"
+                   f"rollout-2026-10-08T01-00-00-{exec_thread}.jsonl")]})
         brave = make_bundle(self.root, "Brave Browser", "com.example.brave")
         main = f"{brave}/Contents/MacOS/Brave Browser"
         helper = (f"{brave}/Contents/Frameworks/Brave Browser Framework.framework/"
@@ -208,13 +226,95 @@ class PartitionTests(OwnerBase):
         self.assertEqual(body["bundle_id"], "com.example.brave")
         self.assertEqual(len(body["instances"]), 2)
 
-    def test_codex_tui_with_children_is_its_own_owner(self):
-        # R3: a TUI that runs a thread in-process (it has children) owns them.
-        procs = [P(210, comm="codex"), P(212, ppid=210, pgid=212)]
-        _, inv, part = self.build(procs, argv={210: ["codex"]})
+    def test_codex_tui_without_daemon_evidence_is_its_own_owner(self):
+        # R3: no lsof evidence of a daemon connection -> the safe default, rule 2.
+        procs = [P(210, comm="codex"), P(212, ppid=210, pgid=212),
+                 P(213, comm="codex")]                    # childless, no evidence
+        _, inv, part = self.build(procs, argv={210: ["codex"], 213: ["codex"]})
         owner = part.owners[part.owner_of[212]]
         self.assertEqual(owner.kind, "codex")
         self.assertEqual(owner.root, 210)
+        lone = part.owners[part.owner_of[213]]
+        self.assertEqual((lone.kind, lone.owner_id), ("codex", "codex-proc:213.1700000213"))
+
+    def test_codex_tui_ownership_r3(self):
+        # R3 probe fixture: a daemon-connected TUI is a pointer; in-process
+        # TUIs (holding a writer lock, with or without a rollout) are rule 2;
+        # a stale lock file on disk creates nothing.
+        codex = self.ctx.codex_home
+        os.makedirs(os.path.join(codex, "thread-writer-locks"))
+        u1, u2, u3, u4 = (f"{d * 8}-{d * 4}-4{d * 3}-8{d * 3}-{d * 12}" for d in "1234")
+        open(os.path.join(codex, "thread-writer-locks", f"{u4}.lock"), "w").close()
+        with open(os.path.join(codex, "session_index.jsonl"), "w") as fh:
+            fh.write(json.dumps({"id": u2, "thread_name": "Checkout refactor"}) + "\n")
+            fh.write(json.dumps({"id": u1, "thread_name": "Billing cleanup"}) + "\n")
+        lock = lambda u: ("REG", "0x1000010", f"/h/.codex/thread-writer-locks/{u}.lock")
+        roll = lambda u: ("REG", "0x1000010",
+                          f"/h/.codex/sessions/2026/10/08/rollout-2026-10-08T02-00-00-{u}.jsonl")
+        self.ctx.lsof = fake_lsof({
+            50001: [("unix", "0xd0d0", "/private/tmp/codex-daemon-501/aaaa"), lock(u1), roll(u1)],
+            51000: [("unix", "0xc1c1", "->0xd0d0")],
+            52000: [lock(u2), roll(u2), ("REG", "0x1000010", "/h/.codex/state_5.sqlite")],
+            53000: [lock(u3)],
+            54000: [lock(u4.replace("4", "5"))]})
+        procs = [P(50000, comm="codex"), P(50001, ppid=50000, comm="codex"),
+                 P(900, comm="zsh"), P(51000, ppid=900, comm="codex"),
+                 P(901, comm="zsh"), P(52000, ppid=901, comm="codex"),
+                 P(52001, ppid=52000), P(52002, ppid=52000), P(52003, ppid=52002),
+                 P(902, comm="zsh"), P(53000, ppid=902, comm="codex"),
+                 P(53001, ppid=53000),
+                 P(903, comm="zsh"), P(54000, ppid=903, comm="codex")]   # holds a lock, no children
+        argv = {50000: ["codex", "app-server", "daemon", "pid-update-loop"],
+                50001: ["codex", "app-server", "--listen", "unix://"],
+                51000: ["codex", "--model", "gpt-fixture"],
+                52000: ["codex", "--disable", "daemon_auto_start"],
+                53000: ["codex", "--disable", "daemon_auto_start"],
+                54000: ["codex", "--disable", "daemon_auto_start"]}
+        _, inv, part = self.build(procs, argv=argv)
+        self.assert_partition(inv, part)
+        of = lambda pid: part.owners[part.owner_of[pid]]
+        self.assertEqual((of(50001).kind, of(50001).root), ("codex-app", 50000))
+        self.assertEqual(of(51000).kind, "codex-ui")
+        self.assertEqual(of(51000).members, [51000])
+        self.assertEqual(of(52000).owner_id, f"codex:{u2}")
+        self.assertEqual(sorted(of(52000).members), [52000, 52001, 52002, 52003])
+        self.assertEqual(of(53000).owner_id, f"codex:{u3}")
+        self.assertEqual(sorted(of(53000).members), [53000, 53001])
+        self.assertEqual((of(54000).kind, of(54000).members), ("codex", [54000]))
+        self.assertFalse(any(u4 in oid for oid in part.owners))
+        rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
+        self.assertEqual(rows[f"codex:{u2}"]["title"], "Checkout refactor")
+        self.assertEqual(rows[f"codex:{u2}"]["actions"], ["end-session"])
+        self.assertEqual(rows[f"codex:{u3}"]["title"], "Codex · 33333333")
+        ui = next(r for r in rows.values() if r["kind"] == "codex-ui")
+        self.assertEqual((ui["actions"], ui["token"], ui["confidence"]), ([], None, "shared"))
+        app = next(r for r in rows.values() if r["kind"] == "codex-app")
+        self.assertEqual(app["shared_with"], ["Billing cleanup"])
+
+    def test_gui_app_vm_carries_the_apps_quit_action(self):
+        # S1.6/M5a: a VM run by Docker Desktop quits with Docker Desktop; a VM
+        # paired with a Lima instance only gets a copyable command.
+        docker = make_bundle(self.root, "Docker", "com.docker.docker")
+        vm = "/System/Library/Frameworks/Virtualization.framework/x/com.apple.Virtualization.VirtualMachine"
+        procs = [P(700, comm="com.docker.backend"), P(710, start=(T0, 0)),
+                 P(730, start=(T0 + 9000, 0), comm="limactl"),          # usernet helper
+                 P(720, start=(T0 + 5000, 0)), P(721, start=(T0 + 4998, 0), comm="limactl")]
+        _, inv, part = self.build(procs, paths={700: f"{docker}/Contents/MacOS/com.docker.backend",
+                                                710: vm, 720: vm},
+                                  argv={721: ["limactl", "hostagent", "--pidfile",
+                                              "/x/_lima/colima-dev/ha.pid", "colima-dev"]})
+        rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
+        app = rows["app:com.docker.docker"]
+        gui_vm = next(r for r in rows.values()
+                      if r["owner_id"].startswith("service:vm:virtualization-"))
+        self.assertEqual(gui_vm["actions"], ["quit-app"])
+        self.assertEqual(gui_vm["token"], app["token"])
+        self.assertEqual(gui_vm["quit_app_owner_id"], "app:com.docker.docker")
+        helper = rows["service:vm:lima-helper"]
+        self.assertEqual((helper["actions"], helper["token"]), ([], None))
+        lima = rows["service:vm:colima-dev"]
+        self.assertEqual((lima["actions"], lima["token"], lima["stop_command"]),
+                         ([], None, "colima stop -p dev"))
 
     def test_python_app_bundle_outside_applications_is_not_an_app(self):
         path = ("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
@@ -251,7 +351,7 @@ class PartitionTests(OwnerBase):
         self.assertEqual(part.owner_of[813], "claude:0000dddd")
         rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
         self.assertEqual(rows["job:run-standalone"]["actions"], ["stop-managed-job"])
-        job = rows["claude:0000dddd"]["jobs"][0]
+        job = rows["claude:0000dddd"]["jobs"][1]
         self.assertTrue(job["managed"])
         self.assertEqual(job["action"], "stop-managed-job")
         body = mo.decode_token(job["token"])
@@ -306,7 +406,11 @@ class PresentationTests(OwnerBase):
         self.assertEqual(jobs["dev"]["kind"], "server")
         self.assertEqual(jobs["dev"]["action"], "stop-server")
         self.assertEqual(row["activity"], "Building · typecheck")
-        self.assertEqual(row["conversation"]["member_count"], 2)
+        convo = row["jobs"][0]
+        self.assertEqual((convo["kind"], convo["label"], convo["member_count"]),
+                         ("conversation", "Conversation", 2))
+        self.assertIsNone(convo["token"])
+        self.assertIsNone(convo["action"])
         body = mo.decode_token(jobs["typecheck"]["token"])
         self.assertEqual((body["action"], body["target"]["pid"], body["owner_root"]["pid"]),
                          ("stop-job", 20, 10))
@@ -315,7 +419,7 @@ class PresentationTests(OwnerBase):
         procs = [self.claude(10, "0000a001"), P(20, ppid=10), P(21, ppid=20, pgid=20)]
         self.ctx.listening = {21}
         _, inv, part = self.build(procs, argv={20: tool_shell("node script.js")})
-        self.assertEqual(self.payload(inv, part)["owners"][0]["jobs"][0]["kind"], "server")
+        self.assertEqual(self.payload(inv, part)["owners"][0]["jobs"][1]["kind"], "server")
 
     def test_activity_working_idle_and_unknown(self):
         _, inv, part = self.build([self.claude(10, "0000a001")])
@@ -347,7 +451,7 @@ class PresentationTests(OwnerBase):
         row = payload["owners"][0]
         self.assertIsNone(row["token"])
         self.assertEqual(row["actions"], [])
-        self.assertIsNone(row["jobs"][0]["token"])
+        self.assertEqual([j["token"] for j in row["jobs"]], [None, None])
 
     def test_token_round_trip(self):
         body = {"v": 1, "action": "stop-job", "x": "é"}
@@ -525,6 +629,8 @@ class OwnersCliTests(unittest.TestCase):
         self.assertEqual(payload["source"], "live")
         self.assertEqual(payload["system"]["used_bytes"], 4)
         self.assertEqual(payload["system"]["score_level"], "WATCH")
+        self.assertEqual(payload["system"]["ncpu"], os.cpu_count())
+        self.assertIsNone(payload["system"]["cpu_cores"])       # window 0, no baseline
         self.assertEqual(payload["protection"],
                          {"summary": "on", "gate": "on", "route": "off",
                           "unmanaged_heavy": 0})

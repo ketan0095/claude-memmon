@@ -29,7 +29,8 @@ PY = sys.executable
 PATH_CONSTANTS = ("STATE_DIR", "HISTORY", "SNAPSHOT", "GATE_LOG", "PROFILE",
                   "SHELL_STATE", "PAUSE", "PENDING", "OWNERS_HISTORY",
                   "CPU_BASELINE", "ACTIONS_LOCK", "JOBS_DIR", "PROJECTS_DIR",
-                  "CLAUDE_SESSIONS_DIR", "CC_SOCKS_DIR", "CODEX_HOME")
+                  "CLAUDE_SESSIONS_DIR", "CC_SOCKS_DIR", "CODEX_HOME",
+                  "CLAUDE_ROSTER")
 
 
 class TempState:
@@ -50,7 +51,7 @@ class TempState:
             "ACTIONS_LOCK": f"{r}/runner/coord/actions.lock",
             "JOBS_DIR": f"{r}/jobs", "PROJECTS_DIR": f"{r}/projects",
             "CLAUDE_SESSIONS_DIR": f"{r}/sessions", "CC_SOCKS_DIR": f"{r}/socks",
-            "CODEX_HOME": f"{r}/codex",
+            "CODEX_HOME": f"{r}/codex", "CLAUDE_ROSTER": f"{r}/daemon/roster.json",
         }
         for n, v in values.items():
             setattr(memmon, n, v)
@@ -127,13 +128,37 @@ class FakeSource(memmon_procs.ProcSource):
                     p.ppid = 1
 
 
+class FakeClock:
+    """A monotonic clock that only moves when the engine sleeps, firing any
+    events scheduled for the time it passes."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+        self.events = []
+
+    def mono(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += max(s, 0.05)
+        due = [e for e in self.events if e[0] <= self.t]
+        self.events = [e for e in self.events if e[0] > self.t]
+        for _, fn in sorted(due, key=lambda e: e[0]):
+            fn()
+
+    def at(self, t, fn):
+        self.events.append((t, fn))
+
+
 def session_file(ctx_dir, pid, start_sec, job_id=None, session_id=None,
-                 cwd=None, spare=None):
+                 cwd=None, spare=None, status=None):
     """A ~/.claude/sessions/<pid>.json as Claude writes it (procStart in UTC)."""
     d = {"pid": pid, "jobId": job_id, "sessionId": session_id, "cwd": cwd,
          "procStart": time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(start_sec))}
     if spare is not None:
         d["spare"] = spare
+    if status is not None:
+        d["status"] = status
     with open(os.path.join(ctx_dir, f"{pid}.json"), "w") as fh:
         json.dump(d, fh)
 

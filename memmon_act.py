@@ -34,8 +34,12 @@ POLL_S = 0.2
 FORCE_WAIT_S = 3.0
 FUTURE_SLACK_S = 5.0
 
+RESPAWN_WINDOW_S = 20.0
+RESPAWN_POLL_S = 0.5
+
+# respawned is "needs attention": the stop worked but the daemon restarted it.
 EXIT_CODES = {"stopped": 0, "force_stopped": 0, "already_exited": 0,
-              "respawned": 0, "verified": 0, "partial": 3, "refused": 4,
+              "verified": 0, "partial": 3, "respawned": 3, "refused": 4,
               "error": 1}
 PROCESS_ACTIONS = ("stop-job", "stop-server", "stop-managed-job", "end-session")
 TOKEN_ACTION = {"verify-app": "quit-app", "force": "force"}
@@ -114,6 +118,8 @@ class Engine:
     grace_s: float = GRACE_S
     poll_s: float = POLL_S
     force_wait_s: float = FORCE_WAIT_S
+    respawn: object = None                      # memmon_owners.RespawnWatch
+    respawn_window_s: float = RESPAWN_WINDOW_S
     after_capture: object = None                # test hook: (captured pids) -> None
     sent: list = field(default_factory=list)    # (pid, signal) actually sent
 
@@ -232,16 +238,30 @@ class Engine:
                 raise Refused("protected")
 
         owner_id = part.root_owner.get(rp.pid)
+        job_id = (part.owners[owner_id].info.get("job_id")
+                  if owner_id and root_kind == "claude" else None)
+        watch = self.respawn if action == "end-session" and job_id else None
+        base = watch.baseline(job_id) if watch else None
         out = self._graceful(inv, part, [tp.pid], owner_id, action, body, mine)
-        if (out["result"] == "stopped" and action == "end-session"
-                and root_kind == "claude" and owner_id):
-            again = self.partition_fn(memmon_procs.snapshot(self.source, clock=self.clock))
-            new = again.owners.get(owner_id)
-            if new is not None:
-                np = again.owners[owner_id].root
-                out["result"] = "respawned"
-                out["respawned_as"] = {"pid": np}
+        if watch and out["result"] == "stopped":
+            self._watch_respawn(out, watch, job_id, (rp.pid, *rp.start), base)
         return out
+
+    def _watch_respawn(self, out: dict, watch, job_id: str, old: tuple, base: dict):
+        """Keep reading (never signalling) until 20 s after the first SIGTERM,
+        or until the job settles, to report a daemon restart truthfully."""
+        deadline = self._first_term + self.respawn_window_s
+        while True:
+            inv = memmon_procs.snapshot(self.source, clock=self.clock)
+            state, who = watch.status(inv, job_id, old, base)
+            if state == "respawned":
+                out.update(result="respawned", reason="daemon_restarted_worker",
+                           respawned_as=who, measured_at=self.clock())
+                out.pop("force_token", None)
+                return
+            if state == "settled" or self.mono() >= deadline:
+                return
+            self.sleep(RESPAWN_POLL_S)
 
     def _graceful(self, inv, part, targets: list, owner_id, origin: str,
                   body: dict | None, mine: set) -> dict:
@@ -263,6 +283,7 @@ class Engine:
         if self.after_capture:
             self.after_capture(list(captured))
         used_before = self._used()
+        self._first_term = self.mono()
         for pid in sorted(captured, key=lambda q: -depth[q]):
             self._signal(pid, captured[pid], signal.SIGTERM)
 

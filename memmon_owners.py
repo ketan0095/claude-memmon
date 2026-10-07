@@ -35,6 +35,8 @@ import memmon_procs
 HOME = os.path.expanduser("~")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
+CLAUDE_JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
+CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
 CODEX_HOME = os.path.join(HOME, ".codex")
 
 TOKEN_TTL_S = 120
@@ -59,6 +61,7 @@ APP_BUNDLE_RE = re.compile(r"^(.*?/Applications(?:/[^/]+)?/[^/]+\.app)/")
 CLAUDE_RUNTIME = ("bg-pty-host", "bg-spare", "daemon run", "--chrome-native-host")
 VM_PATH = "com.apple.Virtualization.VirtualMachine"
 ROLLOUT_RE = re.compile(r"rollout-[0-9T:-]+-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
+LOCK_RE = re.compile(r"thread-writer-locks/([0-9a-f]{8}-[0-9a-f-]{27})\.lock$")
 EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)'")
 OWN_BUNDLE_IDS = {"dev.memmon.bar"}
 
@@ -94,6 +97,8 @@ class Context:
     sessions_dir: str = CLAUDE_SESSIONS_DIR
     socks_dir: str = CC_SOCKS_DIR
     codex_home: str = CODEX_HOME
+    jobs_dir: str = CLAUDE_JOBS_DIR
+    roster_path: str = CLAUDE_ROSTER
     titles_by_job: dict = field(default_factory=dict)     # short id -> title
     titles_by_sid: dict = field(default_factory=dict)     # session id -> title
     leases: list = field(default_factory=list)            # runner job rows
@@ -167,6 +172,75 @@ def find_claude_roots(inv, ctx: Context) -> dict:
         for pid in pending:
             roots[pid]["job_id"] = mapping.get(pid)
     return roots
+
+
+class RespawnWatch:
+    """Did the Claude daemon restart a worker memmon just ended?
+
+    The daemon revives a worker that dies mid-turn under the same job id, with
+    a new pid and start (observed ~12 s after the exit). The primary signal is
+    a sessions file for the job naming a live process with another identity;
+    the roster's attempt counter or pty-host pid moving is the secondary one.
+    The job settling (state done/stopped, or its roster entry removed) ends
+    the watch early. Read-only: a revived worker is a new owner, never a
+    target."""
+
+    SETTLED = ("done", "stopped", "killed")
+
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+
+    def _roster(self, job_id: str):
+        try:
+            with open(self.ctx.roster_path) as fh:
+                workers = json.load(fh).get("workers") or {}
+        except (OSError, ValueError, AttributeError):
+            return None
+        return workers.get(job_id) or {}
+
+    def baseline(self, job_id: str) -> dict:
+        entry = self._roster(job_id)
+        return {"roster": entry is not None and bool(entry),
+                "attempt": (entry or {}).get("attempt"), "pid": (entry or {}).get("pid")}
+
+    def status(self, inv, job_id: str, old: tuple, base: dict) -> tuple:
+        """("respawned", {pid, start} | None), ("settled", None) or ("pending", None)."""
+        try:
+            names = os.listdir(self.ctx.sessions_dir)
+        except OSError:
+            names = []
+        for fn in names:
+            if not fn.endswith(".json") or not fn[:-5].isdigit():
+                continue
+            try:
+                with open(os.path.join(self.ctx.sessions_dir, fn)) as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            if d.get("jobId") != job_id or d.get("spare") is True:
+                continue
+            p = inv.procs.get(int(fn[:-5]))
+            if p is None or p.zombie or p.start is None:
+                continue
+            recorded = _utc_ctime(d.get("procStart") or "")
+            if recorded is not None and abs(recorded - p.start[0]) > 2:
+                continue
+            if (p.pid, p.start[0], p.start[1]) != tuple(old):
+                return "respawned", {"pid": p.pid, "start": list(p.start)}
+        entry = self._roster(job_id)
+        if entry and base.get("roster") and (
+                entry.get("attempt") != base.get("attempt") or entry.get("pid") != base.get("pid")):
+            return "respawned", None
+        if base.get("roster") and entry is not None and not entry:
+            return "settled", None
+        try:
+            with open(os.path.join(self.ctx.jobs_dir, job_id, "state.json")) as fh:
+                state = json.load(fh).get("state")
+        except (OSError, ValueError, AttributeError):
+            state = None
+        if state in self.SETTLED:
+            return "settled", None
+        return "pending", None
 
 
 def _codex_role(inv, pid: int) -> str | None:
@@ -277,27 +351,48 @@ def partition(inv, ctx: Context) -> Partition:
         key = info["job_id"] or info["session_id"]
         rule[pid] = ("claude", key, info)
 
+    roles = {}
     for pid in procs:
-        if pid in rule:
-            continue
-        role = _codex_role(inv, pid)
+        if pid not in rule:
+            role = _codex_role(inv, pid)
+            if role:
+                roles[pid] = role
+    handles = codex_handles(roles, ctx)
+    servers = [p for p, r in roles.items() if r == "app-server"]
+    daemon_addrs = {a for p in servers for a in handles.get(p, {}).get("addrs", ())}
+    for pid, role in roles.items():
+        h = handles.get(pid, {})
         if role == "exec":
-            rule[pid] = ("codex", None, {})
+            rule[pid] = ("codex", None, {"thread_id": h.get("thread")})
         elif role == "app-server":
             rule[pid] = ("codex-app", None, {})
-        elif role == "tui":
-            has_kids = any(k in procs for k in inv.children().get(pid, ()))
-            rule[pid] = ("codex", None, {"tui": True}) if has_kids else (
-                "codex-ui", None, {})
+        else:
+            # A TUI is only a pointer into the daemon with positive evidence:
+            # connected to it and holding no thread of its own. Otherwise it
+            # hosts its thread in-process and is the thread's owner.
+            connected = (bool(set(h.get("peers", ())) & daemon_addrs)
+                         or "--remote" in (inv.argv(pid) or []))
+            if connected and not h.get("thread"):
+                rule[pid] = ("codex-ui", None, {})
+            else:
+                rule[pid] = ("codex", None, {"thread_id": h.get("thread"), "tui": True})
     # The daemon's pid-update loop is an app-server too; only the topmost
-    # app-server in a chain is a root.
-    for pid in [p for p, r in rule.items() if r[0] == "codex-app"]:
+    # app-server in a chain is a root, and it lists every thread the chain holds.
+    for pid in servers:
         anc = procs[pid].ppid
         while anc in procs:
             if rule.get(anc, ("",))[0] == "codex-app":
                 del rule[pid]
                 break
             anc = procs[anc].ppid
+    for pid in servers:
+        top = pid
+        while top not in rule and procs[top].ppid in procs:
+            top = procs[top].ppid
+        if rule.get(top, ("",))[0] == "codex-app" and pid in handles:
+            threads = rule[top][2].setdefault("threads", [])
+            threads.extend(t for t in handles.get(pid, {}).get("threads", ())
+                           if t not in threads)
 
     leases = {}
     for row in ctx.leases or []:
@@ -351,7 +446,6 @@ def partition(inv, ctx: Context) -> Partition:
 
     _merge_vm_hosts(procs, rule)
 
-    threads = rollout_threads([p for p, r in rule.items() if r[0] == "codex"], ctx)
     owners: dict = {}
     root_owner: dict = {}
     for root, (kind, key, info) in sorted(rule.items(), key=lambda kv: procs[kv[0]].start):
@@ -360,15 +454,13 @@ def partition(inv, ctx: Context) -> Partition:
             oid = f"claude:{key}" if key else f"claude:proc.{p.pid}.{p.start[0]}"
             conf = "exact"
         elif kind == "codex":
-            thread = threads.get(root)
-            if thread:
-                info = {**info, "thread_id": thread}
+            thread = info.get("thread_id")
             oid = f"codex:{thread}" if thread else f"codex-proc:{p.pid}.{p.start[0]}"
             conf = "inferred"
         elif kind == "codex-app":
             oid, conf = f"codex-app:{p.pid}.{p.start[0]}", "shared"
         elif kind == "codex-ui":
-            oid, conf = f"codex-ui:{p.pid}.{p.start[0]}", "inferred"
+            oid, conf = f"codex-ui:{p.pid}.{p.start[0]}", "shared"
         elif kind == "job":
             oid, conf = f"job:{key}", "exact"
         elif kind == "app":
@@ -555,38 +647,58 @@ def _titles(owner: Owner, inv, ctx: Context, codex: dict) -> None:
         owner.title = p.comm or f"process {owner.root}"
 
 
-def rollout_threads(pids: list, ctx: Context) -> dict:
-    """pid -> Codex thread id, from the rollout file each exec holds open."""
+def codex_handles(roles: dict, ctx: Context) -> dict:
+    """What each Codex process holds open, from one lsof over the candidates.
+
+    pid -> {"thread": uuid of a writer lock or rollout it holds, "threads":
+    every such uuid, "addrs": its unix sockets, "peers": the sockets they
+    connect to}. Only an open handle counts: lock files outlive a killed TUI."""
     out: dict = {}
-    if not pids or not ctx.lsof:
+    pids = sorted(p for p, r in roles.items() if r in ("exec", "tui", "app-server"))
+    if not pids or not ctx.lsof or not any(roles[p] != "app-server" for p in pids):
         return out
     try:
-        text = ctx.lsof(["-a", "-p", ",".join(map(str, sorted(pids))), "-Fpn"])
+        # -O -b: no helper fork, no blocking kernel calls (half the cost).
+        text = ctx.lsof(["-O", "-b", "-w", "-nP", "-a", "-p", ",".join(map(str, pids)),
+                         "-Fpftdn"])
     except Exception:
         return out
-    pid = None
+    pid, ftype, dev = None, None, None
     for line in text.splitlines():
-        if line.startswith("p"):
-            pid = int(line[1:]) if line[1:].isdigit() else None
-        elif line.startswith("n") and pid:
-            m = ROLLOUT_RE.search(line)
-            if m:
-                out[pid] = m.group(1)
+        tag, val = line[:1], line[1:]
+        if tag == "p":
+            pid = int(val) if val.isdigit() else None
+            if pid is not None:
+                out.setdefault(pid, {"thread": None, "threads": [], "addrs": [], "peers": []})
+        elif tag == "f":
+            ftype, dev = None, None
+        elif tag == "t":
+            ftype = val
+        elif tag == "d":
+            dev = val
+        elif tag == "n" and pid is not None:
+            row = out[pid]
+            if ftype == "unix":
+                if dev:
+                    row["addrs"].append(dev)
+                if val.startswith("->"):
+                    row["peers"].append(val[2:])
+                continue
+            m = ROLLOUT_RE.search(val) or LOCK_RE.search(val)
+            if m and m.group(1) not in row["threads"]:
+                row["threads"].append(m.group(1))
+                row["thread"] = row["thread"] or m.group(1)
     return out
 
 
 def _codex_names(part: Partition, ctx: Context) -> dict:
     """Display names for exec threads and the daemon's live threads."""
-    out: dict = {"names": {}, "live": None}
+    out: dict = {"names": {}}
     if not any(o.kind in ("codex", "codex-app") for o in part.owners.values()):
         return out
-    locks = os.path.join(ctx.codex_home, "thread-writer-locks")
-    try:
-        out["live"] = sorted(fn[:-5] for fn in os.listdir(locks) if fn.endswith(".lock"))
-    except OSError:
-        out["live"] = None
     wanted = {o.info["thread_id"] for o in part.owners.values()
-              if o.info.get("thread_id")} | set(out["live"] or [])
+              if o.info.get("thread_id")}
+    wanted |= {t for o in part.owners.values() for t in o.info.get("threads") or ()}
     if wanted:
         try:
             with open(os.path.join(ctx.codex_home, "session_index.jsonl")) as fh:
@@ -781,10 +893,28 @@ def _row_extra_title(rows: list) -> None:
             r["title"] = f"{r['title']} · started {started}"
 
 
+GUI_VM_APPS = ("com.docker.docker", "dev.kdrag0n.MacVirt")     # Docker Desktop, OrbStack
+
+
+def _gui_vm_quit(rows: list) -> None:
+    """A VM started by Docker Desktop or OrbStack stops when that app quits,
+    so its service row carries the app's quit action and token. A VM paired
+    with a Lima instance is not theirs and keeps only its copyable command."""
+    apps = [r for r in rows if r["kind"] == "app" and r["token"]
+            and decode_token(r["token"]).get("bundle_id") in GUI_VM_APPS]
+    if not apps:
+        return
+    for r in rows:
+        if r["kind"] == "service" and r["owner_id"].startswith("service:vm:virtualization-"):
+            r.update(actions=["quit-app"], token=apps[0]["token"],
+                     quit_app_owner_id=apps[0]["owner_id"])
+
+
 def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
                    now: float | None = None, cpu_window_s: float | None = None,
                    system: dict | None = None, protection: dict | None = None,
-                   gate: dict | None = None, source: str = "live") -> dict:
+                   gate: dict | None = None, source: str = "live",
+                   used_by: dict | None = None) -> dict:
     inv, part = sample.inv, sample.part
     now = inv.ts if now is None else now
     degraded = inv.kind == "degraded"
@@ -827,6 +957,15 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
         in_jobs = {m for j in jobs for m in j["members"]}
         convo = [m for m in owner.members if m not in in_jobs]
 
+        conversation = None
+        if owner.kind in ("claude", "codex"):
+            conversation = {
+                "job_id": f"conversation.{root.pid}.{root.start[0]}", "kind": "conversation",
+                "label": "Conversation",
+                "footprint_bytes": _sum(inv.procs[m].footprint for m in convo),
+                "member_count": len(convo), "managed": False, "action": None,
+                "root": {**ident(root), "pgid": root.pgid}, "token": None}
+
         if job_rows:
             j0 = job_rows[0]
             activity = f"{VERB[j0['kind']]} · {j0['label']}"
@@ -864,9 +1003,9 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
                                 "bundle_id": bundle_info(bundle)["bundle_id"],
                                 "instances": instances, "snapshot_ts": round(inv.ts, 3)})
         shared_with = None
-        if owner.kind == "codex-app" and codex.get("live") is not None:
+        if owner.kind == "codex-app" and "threads" in owner.info:
             shared_with = [codex["names"].get(t) or f"Codex · {t[:8]}"
-                           for t in codex["live"]][:10]
+                           for t in owner.info["threads"]][:10]
         if degraded:
             token, actions = None, []
             for j in job_rows:
@@ -885,16 +1024,21 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
             "member_count": len(owner.members),
             "root": {**ident(root), "pgid": root.pgid},
             "started_at": root.start[0] + root.start[1] / 1e6,
-            "token": token, "jobs": job_rows,
-            "conversation": ({"member_count": len(convo),
-                              "footprint_bytes": _sum(inv.procs[m].footprint
-                                                      for m in convo)}
-                             if owner.kind in ("claude", "codex") else None),
+            "token": token, "jobs": ([conversation] if conversation else []) + job_rows,
             "actions": actions, "instances": instances, "shared_with": shared_with,
             "stop_command": (stop_command_for(owner.info["vm"])
                              if owner.kind == "service" else None),
+            "used_by": None, "quit_app_owner_id": None,
         }
+        if owner.kind == "service" and used_by and owner.owner_id in used_by:
+            row["used_by"] = used_by[owner.owner_id]
         rows.append(row)
+    _gui_vm_quit(rows)
+    if used_by:
+        titles = {r["owner_id"]: r["title"] for r in rows}
+        for r in rows:
+            if r["used_by"] is not None:
+                r["used_by"] = sorted({titles.get(o, o) for o in r["used_by"]})
     _row_extra_title(rows)
     rows.sort(key=lambda r: (r["footprint_bytes"] is None, -(r["footprint_bytes"] or 0)))
     return {
