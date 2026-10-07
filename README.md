@@ -25,16 +25,28 @@ after one near-freeze where two full-repo typechecks demanded ~34 GB at once.
 
 ### Reading the popover
 
-**Memory now** — one line telling you whether it is safe to start work, and why.
-The track underneath shows where the score sits between the four tiers, so the
-boundaries are visible rather than implied. The sentence names the actual
-offender (`web-checkout is running tsc typecheck, 21.7G across 12 processes`)
-rather than giving generic advice, and `Memory signals now:` lists the signals
-that produced the verdict. `~6 min to low headroom` appears only when something
-is wrong — see the headroom caveat below.
+**Health card and protection line** — memory in use against RAM (the kernel's
+own accounting, not `top`'s), the kernel pressure level and the score verdict.
+Under it, one line says whether heavy commands are protected: `off`,
+`paused`, `partial` (the gate is on but some heavy work was not started through
+`memmon run`) or `on`. Neither line claims to prevent a freeze.
 
-**Command warnings & stops** — the part of the tool that acts on your sessions,
-so it sits directly under the verdict. It answers four questions in order:
+**Owners** — one row per owner (see *Owners and targeted stops* below): a
+Claude session, a Codex thread or daemon, an app, a VM, a managed job, or the
+unattributed rest. Sort by memory, CPU or growth. A row shows its title, what
+it is doing, and where it runs (project · worktree · confidence). A value
+memmon could not measure shows `—` and the reason, and sorts last. Expand a
+session to see its builds, tests and servers, each with its own Stop button;
+the Conversation is listed too and marked kept. Every stop asks first, inside
+the popover, and the result banner reports what was measured.
+
+The old RAM/Swap tiles, the Reclaimable card with its Reap button, and the
+separate session, worktree and app lists are gone: their processes now appear
+under exactly one owner, and orphaned builds show up as Unattributed. Reaping
+stays on the command line (`memmon reap --apply`, then `--force` if needed).
+
+**Command warnings & stops** — the gate's own section, below the owners. It
+answers four questions in order:
 
 - *Is protection on?* `ACTIVE` or `PAUSED`, with the Pause control next to it.
   The section is always present, so pausing is always one click away.
@@ -58,28 +70,6 @@ Stops that have already been retried are history, so only the three most recent
 show, behind a "show all" toggle; warnings work the same way. Events recorded
 before rules were tracked say so plainly rather than being re-explained with
 today's rules.
-
-**RAM and Swap tiles** — RAM is what is in memory; Swap is what has been written
-to disk. Swap is measured against *RAM size* (`1.21x`), not against the swapfile,
-because macOS grows the swapfile to match demand so the usual percentage is
-meaningless. `OVER` means swap now exceeds physical RAM.
-
-**Reclaimable** — orphaned build processes whose parent died. Nothing else will
-ever clean these up; `Reap` kills them and never touches a live session.
-
-**Other apps** — non-Claude memory, because the question is whether the *machine*
-is safe to work on, not whether Claude is behaving. A browser routinely outweighs
-every session combined; when it does, it is called out and the advice says so
-rather than suggesting you scope a build that is not the problem.
-
-**Claude sessions** — every session by name, its total memory split into the part
-in RAM (blue) and the part swapped to disk (pink), its process count, and what it
-is doing right now. A pink outline means over half that session's memory is on
-disk. `✕` ends a session. Expand a row for the processes it spawned, the
-subagents running inside it, and the services it started.
-
-Completed sessions are called out separately: the work is done, so closing them
-is free memory at no cost.
 
 ## What it looks like in practice
 
@@ -501,9 +491,23 @@ seconds, catching any child forked in the meantime, and reports exactly what is
 still alive. Nothing is force-killed automatically. If something survives, the
 result is `partial` with a force token naming only those survivors, and only
 `memmon act force --target <token>` sends SIGKILL to them — after re-reading each
-one again. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial),
-4 (refused) or 1 (error), and it reports memory in use before and after as a
-measurement: other apps change it too, so it is never a promise of what was freed.
+one again. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial,
+or respawned), 4 (refused) or 1 (error), and it reports memory in use before and
+after as a measurement: other apps change it too, so it is never a promise of
+what was freed.
+
+Two cases end on purpose with exit 3:
+
+- **Respawned.** Claude's daemon restarts a worker that dies mid-turn, under the
+  same job, about ten seconds later. After ending a Claude session, memmon keeps
+  watching (reading only) for up to 20 seconds after the first signal and
+  reports `respawned` if that happens. It never signals the new worker; stop the
+  job from Claude itself (`claude stop <job>`) if you want it gone.
+- **Codex in a terminal.** A `codex` terminal session that is connected to the
+  Codex daemon is only a window onto a thread the daemon runs, so it has no stop
+  action. One running its thread itself is an owner you can end, but it usually
+  ignores SIGTERM, so expect `partial` and a force step. A force-killed Codex
+  terminal may need `reset`.
 
 `MEMMON_INVENTORY=top` forces the old `ps`/`top` inventory. memmon also falls
 back to it on its own if libproc ever fails its self-check; in that mode every
@@ -523,7 +527,8 @@ memmon reap --force <token>
 
 That token names only the processes that survived, by identity, and expires
 after 120 seconds. Orphans that appeared after the first run are never touched
-by it. `--reap-spares --apply` goes through the same engine.
+by it. `--reap-spares --apply` goes through the same engine. The menu bar no
+longer has a Reap button; reaping is a command-line action.
 
 ## Crash prediction
 
