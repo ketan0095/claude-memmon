@@ -469,6 +469,19 @@ class UnknownReaderTests(unittest.TestCase):
                 self.assertEqual(p["rates"], "unavailable")
                 self.assertTrue(p["level_reason"])
 
+    def test_in_process_baseline_over_300_s_is_unknown(self):
+        # A live reader whose last refresh was 400 s ago (a sleep, a stall)
+        # re-seeds instead of scoring a rate over the gap.
+        self.reset(None)
+        clock = [5_000.0]
+        with mock.patch.object(memmon, "mono_now", lambda: clock[0]):
+            memmon.pressure(dict(self.vm))
+            clock[0] += 3
+            self.assertEqual(memmon.pressure(dict(self.vm))["level"], "HEALTHY")
+            clock[0] += 400
+            p = memmon.pressure(dict(self.vm))
+        self.assertEqual((p["level"], p["level_reason"]), ("UNKNOWN", "baseline over 300 s old"))
+
     def test_pressure_flag_prints_unknown_and_exits_0(self):
         self.reset(None)
         rc, out = self.run_main("--pressure")

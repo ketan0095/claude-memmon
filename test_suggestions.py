@@ -417,6 +417,16 @@ class EpisodeTests(unittest.TestCase):
         st, _ = self.step(st, 40, gap=True)
         self.assertAlmostEqual(st["calm_s"], 240.0)
 
+    def test_gap_time_never_counts_as_calm(self):
+        st, _ = self.step(None, 0, pressured=True, rows=[{"job_id": "a"}])
+        for m in range(1, 6):
+            st, _ = self.step(st, m)                       # 4 min of calm counted
+        st, _ = self.step(st, 14, gap=True)                # 8 min unsampled
+        for m in range(15, 20):
+            st, _ = self.step(st, m)
+        self.assertTrue(st["active"], st)                  # 9 min counted, not 19
+        self.assertAlmostEqual(st["calm_s"], 540.0)
+
     def test_floor_holds_across_episodes_and_boot_resets(self):
         st, out = self.step(None, 0, pressured=True, rows=[{"job_id": "a"}])
         self.assertEqual(len(out), 1)
