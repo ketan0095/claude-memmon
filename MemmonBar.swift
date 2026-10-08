@@ -95,6 +95,34 @@ enum P {
     static let red = token(rgb(0xab3a4a), rgb(0xffa0ae))
     static let scrim = token(rgb(0x39334d, 0x55 / 255.0), rgb(0x080610, 0xa8 / 255.0))
     static let onTint = token(rgb(0xffffff), rgb(0x221a35))
+    /// The header's gradient: soft lavender in light, deep purple in dark.
+    static let headerTop = token(rgb(0xebe4ff), rgb(0x2f2154))
+    static let headerBottom = token(rgb(0xf7f4ff), rgb(0x1c1830))
+    /// The donut's grey parts: memory outside every section, and free memory.
+    static let system = token(rgb(0xb3aec2), rgb(0x5a5570))
+    static let track = token(rgb(0xe9e6f2), rgb(0x2c2a3b))
+
+    /// One colour per owner section, shared by the ring, legend and headers.
+    static func section(_ s: OwnerSection) -> Color {
+        switch s {
+        case .claude: return sectionClaude
+        case .codex: return sectionCodex
+        case .job: return sectionJob
+        case .browser: return sectionBrowser
+        case .dev: return sectionDev
+        case .app: return sectionApp
+        case .service: return sectionService
+        case .background: return sectionBackground
+        }
+    }
+    static let sectionClaude = token(rgb(0x7a5ad8), rgb(0xb29cff))
+    static let sectionCodex = token(rgb(0x23857f), rgb(0x6dd1c6))
+    static let sectionJob = token(rgb(0xc26a2e), rgb(0xf2a76f))
+    static let sectionBrowser = token(rgb(0x3474cf), rgb(0x86b4ff))
+    static let sectionDev = token(rgb(0x4f8f2f), rgb(0x9fd77c))
+    static let sectionApp = token(rgb(0xbb4a8a), rgb(0xf09bc9))
+    static let sectionService = token(rgb(0xa98316), rgb(0xe6c65a))
+    static let sectionBackground = token(rgb(0x8c86a2), rgb(0x8f89a6))
 
     /// An unknown level is muted, never green: a missing reading is not health.
     static func tint(_ level: String?) -> Color {
@@ -643,6 +671,59 @@ func sectionCount(_ sec: OwnerSection, _ rows: [Owner]) -> (shown: String, spoke
         spoken.append(plural(unattributed, "unattributed process", "unattributed processes"))
     }
     return (shown.joined(separator: " · "), spoken.joined(separator: " and "))
+}
+
+// MARK: - memory ring
+
+/// One arc of the memory ring.
+struct RingSegment: Identifiable {
+    enum Kind: Equatable { case section(OwnerSection), system }
+    var kind: Kind
+    var id: String {
+        if case .section(let s) = kind { return s.rawValue }
+        return "system"
+    }
+    var name: String {
+        if case .section(let s) = kind { return s.title }
+        return "System & other"
+    }
+    /// What the legend says: the section's own memory.
+    var bytes: Double
+    /// What the ring draws; never more in total than memory in use.
+    var arc: Double
+}
+
+/// The ring's arcs: one per section with memory, in section order, then
+/// "System & other" for used memory no section accounts for. Owners
+/// partition processes, so section totals add up without double counting;
+/// if they ever exceed used memory (footprint and physical "used" are
+/// measured differently), the arcs are scaled down so the ring never claims
+/// more than is in use, and System & other is zero, never negative.
+func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
+    var out: [RingSegment] = sectionedOwners(rows, by: .memory).compactMap { sec, owners in
+        guard let total = sectionTotal(owners), total > 0 else { return nil }
+        return RingSegment(kind: .section(sec), bytes: total, arc: total)
+    }
+    guard let used else { return out }
+    let sum = out.reduce(0) { $0 + $1.bytes }
+    if sum > used, sum > 0 {
+        let k = used / sum
+        for i in out.indices { out[i].arc = out[i].bytes * k }
+    }
+    let system = max(used - sum, 0)
+    out.append(RingSegment(kind: .system, bytes: system, arc: system))
+    return out
+}
+
+/// The pressure word in the ring's centre.
+func pressureWord(_ level: String?) -> String {
+    switch level {
+    case "HEALTHY": return "Normal"
+    case "WATCH": return "Watch"
+    case "DANGER": return "Danger"
+    case "CRITICAL": return "Critical"
+    default: return "Unknown"
+    }
 }
 
 /// The section's memory: owners partition processes, so known footprints add up.
@@ -1336,6 +1417,8 @@ final class Model: ObservableObject {
     @Published var sectionOpen: [OwnerSection: Bool] = [:]
     /// Sections showing every row instead of the first six.
     @Published var showAll: Set<OwnerSection> = []
+    /// A section the ring's legend asked to bring into view.
+    @Published var scrollTarget: OwnerSection?
     @Published var techOpen: Set<String> = []
     @Published var confirm: ConfirmRequest?
     @Published var banner: Banner?
@@ -1823,23 +1906,6 @@ struct ConfidenceChip: View {
     }
 }
 
-struct Meter: View {
-    var value: Double?           // 0…1; nil draws the empty track only
-    var tint: Color
-    var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 8).fill(P.soft)
-                if let value {
-                    RoundedRectangle(cornerRadius: 8).fill(tint)
-                        .frame(width: max(2, g.size.width * min(max(value, 0), 1)))
-                }
-            }
-        }
-        .frame(height: 6)
-    }
-}
-
 struct Chevron: View {
     var open: Bool
     var body: some View {
@@ -2084,6 +2150,7 @@ struct SectionHeader: View {
                     .foregroundColor(P.muted)
                     .rotationEffect(.degrees(open ? 90 : 0))
                     .frame(width: 12)
+                Circle().fill(P.section(section)).frame(width: 7, height: 7)
                 Text(section.title).font(ft(12, .semibold)).foregroundColor(P.text).lineLimit(1)
                 Text("· " + count.shown).font(ft(12)).foregroundColor(P.muted)
                     .lineLimit(1).truncationMode(.tail)
@@ -2865,6 +2932,173 @@ struct ChromeHeightKey: PreferenceKey {
 
 // MARK: - main view
 
+// MARK: - header pill and memory ring
+
+/// The ring sweeps in and the live dot pulses only when motion is allowed;
+/// renders and Reduce Motion get the finished, still picture.
+func ringSweeps(reduceMotion: Bool, animate: Bool) -> Bool { animate && !reduceMotion }
+func dotPulses(reduceMotion: Bool) -> Bool { !reduceMotion }
+
+/// What the header's status pill says about the sample on screen.
+struct StatusState: Equatable {
+    enum Kind: String { case live, syncing, sampling, stale }
+    var kind: Kind
+    var text: String
+    var spoken: String
+}
+
+func statusState(_ s: OwnersSnap?, refreshing: Bool, stillSampling: Bool) -> StatusState {
+    var sampled = "No sample yet"
+    if let s {
+        if let age = s.age {
+            sampled = "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader")"
+                + (s.stale ? ", stale" : "")
+        } else {
+            sampled = "Sample time unknown"
+        }
+    }
+    if refreshing { return StatusState(kind: .syncing, text: "Syncing…", spoken: "Syncing; " + sampled) }
+    if stillSampling {
+        return StatusState(kind: .sampling, text: "Still sampling…", spoken: "Still sampling; " + sampled)
+    }
+    guard let s else { return StatusState(kind: .stale, text: "No sample", spoken: sampled) }
+    guard let age = s.age else { return StatusState(kind: .stale, text: "Time unknown", spoken: sampled) }
+    if s.stale { return StatusState(kind: .stale, text: "Stale · \(ageText(age))", spoken: sampled) }
+    return StatusState(kind: .live, text: "Live · \(ageText(age))", spoken: sampled)
+}
+
+struct StatusPill: View {
+    var state: StatusState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulse = false
+    @State private var spin = false
+
+    private var tint: Color {
+        switch state.kind {
+        case .live: return P.green
+        case .stale: return P.amber
+        case .syncing, .sampling: return P.accent
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            switch state.kind {
+            case .live:
+                Circle().fill(tint).frame(width: 7, height: 7)
+                    .overlay(Circle().stroke(tint, lineWidth: 1.5)
+                        .scaleEffect(pulse ? 2.4 : 1).opacity(pulse ? 0 : 0.7))
+                    .onAppear {
+                        guard dotPulses(reduceMotion: reduceMotion) else { return }
+                        withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { pulse = true }
+                    }
+            case .syncing, .sampling:
+                Circle().trim(from: 0, to: 0.72)
+                    .stroke(tint, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                    .frame(width: 9, height: 9)
+                    .rotationEffect(.degrees(spin ? 360 : 0))
+                    .onAppear {
+                        guard dotPulses(reduceMotion: reduceMotion) else { return }
+                        withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+                    }
+            case .stale:
+                Image(systemName: "clock").font(.system(size: 10, weight: .medium)).foregroundColor(tint)
+            }
+            Text(state.text).font(ft(11, .medium)).lineLimit(1)
+                .foregroundColor(state.kind == .stale ? P.amber : P.text)
+        }
+        .padding(.horizontal, 9).frame(height: 22)
+        .background(Capsule().fill(P.panel.opacity(0.7)))
+        .overlay(Capsule().stroke(state.kind == .stale ? P.amber.opacity(0.6) : P.border, lineWidth: 1))
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.spoken)
+    }
+}
+
+/// The memory ring: one arc per section, a grey arc for the rest of used
+/// memory, and free memory as the empty track.
+struct MemoryRing: View {
+    var segments: [RingSegment]
+    var used: Double?
+    var ram: Double?
+    var animate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appeared = false
+
+    static let lineWidth: CGFloat = 13
+
+    private var total: Double {
+        max(ram ?? 0, used ?? 0, segments.reduce(0) { $0 + $1.arc }, 1)
+    }
+
+    private func color(_ seg: RingSegment) -> Color {
+        if case .section(let s) = seg.kind { return P.section(s) }
+        return P.system
+    }
+
+    var body: some View {
+        let sweep: Double = ringSweeps(reduceMotion: reduceMotion, animate: animate) && !appeared ? 0 : 1
+        let gap = segments.count > 1 ? 0.006 : 0
+        ZStack {
+            Circle().stroke(P.track, lineWidth: Self.lineWidth)
+            if used != nil {
+                ForEach(Array(arcs.enumerated()), id: \.element.0.id) { _, item in
+                    let (seg, start, end) = item
+                    Circle()
+                        .trim(from: start * sweep, to: max(start, end - gap) * sweep)
+                        .stroke(color(seg), style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .butt))
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+        }
+        .animation(ringSweeps(reduceMotion: reduceMotion, animate: animate) ? .easeOut(duration: 0.6) : nil,
+                   value: segments.map { $0.arc })
+        .onAppear {
+            guard ringSweeps(reduceMotion: reduceMotion, animate: animate) else { return }
+            withAnimation(.easeOut(duration: 0.8)) { appeared = true }
+        }
+    }
+
+    /// Each segment's start and end as fractions of the whole ring.
+    private var arcs: [(RingSegment, Double, Double)] {
+        var at = 0.0
+        return segments.map { seg in
+            let start = at
+            at += seg.arc / total
+            return (seg, min(start, 1), min(at, 1))
+        }
+    }
+}
+
+/// A symbol and a number with little space between them.
+struct CompactLabel: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 3) {
+            configuration.icon.font(.system(size: 10, weight: .semibold))
+            configuration.title
+        }
+    }
+}
+
+/// A legend line: a colour dot, the name and its memory.
+struct LegendRow: View {
+    var color: Color
+    var outlined = false
+    var name: String
+    var value: String
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle().fill(outlined ? Color.clear : color).frame(width: 8, height: 8)
+                .overlay(Circle().stroke(outlined ? P.muted.opacity(0.6) : Color.clear, lineWidth: 1))
+            Text(name).font(ft(12)).foregroundColor(P.text).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 4)
+            Text(value).font(ft(12)).foregroundColor(P.muted).monospacedDigit().fixedSize()
+        }
+        .contentShape(Rectangle())
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: Model
     var onQuit: () -> Void
@@ -2921,10 +3155,17 @@ struct ContentView: View {
                 if flattened {
                     content(snap)
                 } else {
-                    ScrollView {
-                        content(snap).background(GeometryReader {
-                            Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height)
-                        })
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            content(snap).background(GeometryReader {
+                                Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height)
+                            })
+                        }
+                        .onChange(of: model.scrollTarget) { target in
+                            guard let target else { return }
+                            withAnimation(motion(0.25)) { proxy.scrollTo("section-" + target.rawValue, anchor: .top) }
+                            model.scrollTarget = nil
+                        }
                     }
                     .frame(height: min(bodyHeight, Self.maxHeight - chromeHeight))
                 }
@@ -2959,22 +3200,26 @@ struct ContentView: View {
             Image(systemName: "memorychip")
                 .font(.system(size: 15, weight: .medium)).foregroundColor(P.accent)
                 .frame(width: 34, height: 34)
-                .background(RoundedRectangle(cornerRadius: 11).fill(P.selected))
+                .background(RoundedRectangle(cornerRadius: 10).fill(P.panel.opacity(0.75)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.border, lineWidth: 1))
                 .accessibilityHidden(true)
-            Text("memmon").font(ft(17, .medium)).tracking(-0.3).foregroundColor(P.text)
-            Spacer()
-            if model.refreshing || model.stillSampling {
-                ProgressView().controlSize(.small)
-                Text(model.refreshing ? "Syncing…" : "Still sampling…").font(ft(11)).foregroundColor(P.muted)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("memmon").font(ft(16, .semibold)).tracking(-0.3).foregroundColor(P.text)
+                Text("Memory & sessions").font(ft(11)).foregroundColor(P.muted)
             }
+            Spacer()
+            StatusPill(state: statusState(model.snap, refreshing: model.refreshing,
+                                          stillSampling: model.stillSampling))
+                .id(model.tick)
         }
-        .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 12)
+        .padding(.horizontal, 16).padding(.top, 13).padding(.bottom, 12)
+        .background(LinearGradient(colors: [P.headerTop, P.headerBottom], startPoint: .top, endPoint: .bottom))
     }
 
     private func content(_ s: OwnersSnap) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            healthCard(s).padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 8)
-            protectionLine(s).padding(.horizontal, 16).padding(.bottom, 12)
+            protectionPill(s).padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 8)
+            healthCard(s).padding(.horizontal, 12).padding(.bottom, 12)
             if s.degraded {
                 degradedBanner(s.inventoryReason).padding(.horizontal, 12).padding(.bottom, 10)
             }
@@ -2999,11 +3244,12 @@ struct ContentView: View {
             .font(ft(11)).foregroundColor(P.muted)
             .padding(.horizontal, 18).padding(.bottom, 3)
             .accessibilityHidden(true)
-            ownerList(s).padding(.horizontal, 8)
-            Text("System and other users: not itemised"
-                 + (s.hiddenProcesses.flatMap { $0 > 0 ? " (\(plural($0, "process", "processes")))" : nil } ?? ""))
-                .font(ft(11)).foregroundColor(P.muted)
-                .padding(.horizontal, 18).padding(.top, 2).padding(.bottom, 8)
+            ownerList(s).padding(.horizontal, 8).padding(.bottom, 8)
+            // Without a Background section the line has nowhere else to go.
+            if !sectionedOwners(s.rows, by: model.sort).contains(where: { $0.0 == .background }) {
+                Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
+                    .padding(.horizontal, 18).padding(.bottom, 8)
+            }
             if !s.runnerJobs.isEmpty {
                 managedJobs(s.runnerJobs).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
             }
@@ -3014,61 +3260,72 @@ struct ContentView: View {
 
     // MARK: health
 
+    private func systemLine(_ s: OwnersSnap) -> String {
+        "System and other users: not itemised"
+            + (s.hiddenProcesses.flatMap { $0 > 0 ? " (\(plural($0, "process", "processes")))" : nil } ?? "")
+    }
+
     private func healthCard(_ s: OwnersSnap) -> some View {
         let sys = s.system
         let level = sys.scoreLevel
-        let (headline, icon): (String, String) = {
-            switch level {
-            case "HEALTHY": return ("Memory pressure normal", "checkmark.circle")
-            case "WATCH": return ("Memory pressure elevated", "exclamationmark.circle")
-            case "DANGER": return ("Memory pressure high", "exclamationmark.triangle")
-            case "CRITICAL": return ("Memory pressure critical", "exclamationmark.octagon")
-            default: return ("Memory pressure unknown", "questionmark.circle")
-            }
-        }()
         let tint = P.tint(level)
-        let ramGB = sys.ramBytes.map { $0 / GB }
-        let usedGB = sys.usedBytes.map { $0 / GB }
+        let segments = ringSegments(s.rows, used: sys.usedBytes)
+        let used = sys.usedBytes, ram = sys.ramBytes
         // A partial sum would understate the machine, so memmon sends a CPU
         // total only when every process was measured (coverage exactly 1).
         let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
         let cpuMissing = s.degraded ? "CPU not measured"
             : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU partly measured"
         let ncpu = sys.ncpu ?? Double(ProcessInfo.processInfo.activeProcessorCount)
-        let over = (usedGB ?? 0) > (ramGB ?? .infinity)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 14, weight: .medium)).foregroundColor(tint)
-                    .accessibilityHidden(true)
-                Text(headline).font(ft(14, .medium)).foregroundColor(tint)
-                Spacer(minLength: 6)
-                freshness(s)
-            }
-            HStack(alignment: .lastTextBaseline) {
-                if let usedGB, let ramGB {
-                    Text("\(Text(String(format: "%.1f", usedGB)).font(ft(23)).foregroundColor(P.text))\(Text(String(format: " / %.0f GB in use", ramGB)).font(ft(12)).foregroundColor(P.muted))")
-                } else {
-                    Text("\(Text("—").font(ft(23)).foregroundColor(P.text))\(Text(" memory in use not available").font(ft(12)).foregroundColor(P.muted))")
+        let over = (used ?? 0) > (ram ?? .infinity)
+        let free = used.flatMap { u in ram.map { max($0 - u, 0) } }
+        let legend = Array(segments.filter { if case .section = $0.kind { return true }; return false }
+            .sorted { $0.bytes > $1.bytes }.prefix(4))
+            + segments.filter { $0.kind == .system }
+        let spokenMemory: String = {
+            guard let used else { return "Memory in use not available, pressure \(pressureWord(level).lowercased())" }
+            var head = "Memory " + String(format: "%.1f", used / GB)
+            head += ram.map { String(format: " of %.0f GB in use", $0 / GB) } ?? " GB in use"
+            if over { head += ", over the limit" }
+            head += ", pressure \(pressureWord(level).lowercased())"
+            let parts = segments.map { "\($0.name) \(gb($0.bytes))" } + (free.map { ["free \(gb($0))"] } ?? [])
+            return head + "; " + parts.joined(separator: ", ")
+        }()
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 16) {
+                ZStack {
+                    MemoryRing(segments: segments, used: used, ram: ram, animate: !flattened)
+                    VStack(spacing: 0) {
+                        Text(used.map { String(format: "%.1f", $0 / GB) } ?? "—")
+                            .font(.system(size: 22, weight: .semibold)).foregroundColor(P.text)
+                        Text(used == nil ? "not available" : ram.map { String(format: "/ %.0f GB", $0 / GB) } ?? "GB in use")
+                            .font(ft(11)).foregroundColor(P.muted)
+                        Text(pressureWord(level)).font(ft(11, .semibold)).foregroundColor(tint)
+                            .padding(.top, 1)
+                    }
+                    .monospacedDigit()
                 }
-                Spacer(minLength: 6)
-                Text(cpuNow.map { String(format: "CPU %.1f / %.0f cores", $0, ncpu) } ?? cpuMissing)
-                    .font(ft(12)).foregroundColor(P.muted)
-            }
-            .monospacedDigit()
-            .padding(.top, 11).padding(.bottom, 8)
-            Meter(value: usedGB.flatMap { u in ramGB.map { u / max($0, 0.001) } },
-                  tint: level == "DANGER" || level == "CRITICAL" || over ? P.red : P.accent)
-                .accessibilityRepresentation {
-                    // A progress indicator is how VoiceOver reads a meter's value.
-                    ProgressView(value: min(max((usedGB ?? 0) / max(ramGB ?? 1, 0.001), 0), 1))
-                        .accessibilityLabel("Memory in use")
-                        .accessibilityValue(usedGB.flatMap { u in ramGB.map { r in
-                            String(format: "%.1f of %.0f GB", u, r) + (u > r ? ", over the limit" : "") } }
-                            ?? "not available")
+                .frame(width: 112, height: 112)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(spokenMemory)
+                VStack(alignment: .leading, spacing: 5) {
+                    if used == nil {
+                        Text("Memory in use not available").font(ft(12)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    ForEach(legend) { seg in legendRow(seg, s) }
+                    if let free {
+                        LegendRow(color: P.track, outlined: true, name: "Free", value: gb(free))
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("Free \(gb(free))")
+                    }
                 }
-            Text("Score \(level ?? "unavailable") · kernel pressure \(sys.pressureLevel ?? "unavailable")"
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("\(cpuNow.map { String(format: "CPU %.1f / %.0f cores", $0, ncpu) } ?? cpuMissing)"
+                 + " · Score \(level ?? "unavailable") · kernel \(sys.pressureLevel ?? "unavailable")"
                  + (sys.reason.map { " · \($0)" } ?? ""))
-                .font(ft(11)).foregroundColor(P.muted).padding(.top, 7)
+                .font(ft(11)).foregroundColor(P.muted).monospacedDigit()
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
@@ -3077,49 +3334,55 @@ struct ContentView: View {
         .accessibilityLabel("System memory")
     }
 
-    private func freshness(_ s: OwnersSnap) -> some View {
-        let text: String
-        let spoken: String
-        if let age = s.age {
-            text = "Sampled \(ageText(age)) ago" + (s.stale ? " · stale" : "")
-            spoken = "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader")"
-                + (s.stale ? ", stale" : "")
-        } else {
-            text = "Sample time unknown"
-            spoken = "Sample time unknown"
+    @ViewBuilder private func legendRow(_ seg: RingSegment, _ s: OwnersSnap) -> some View {
+        switch seg.kind {
+        case .section(let sec):
+            Button {
+                withAnimation(motion(0.16)) {
+                    model.sectionOpen[sec] = true
+                    model.scrollTarget = sec
+                }
+            } label: {
+                LegendRow(color: P.section(sec), name: seg.name, value: gb(seg.bytes))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show \(seg.name) in the list, \(gb(seg.bytes))")
+        case .system:
+            LegendRow(color: P.system, name: seg.name, value: gb(seg.bytes))
+                .help(systemLine(s))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("System & other, \(gb(seg.bytes)). " + systemLine(s))
         }
-        return HStack(spacing: 4) {
-            if s.stale { Image(systemName: "clock").font(.system(size: 11)) }
-            Text(text).font(ft(11)).lineLimit(1)
-        }
-        .foregroundColor(s.stale ? P.amber : P.muted)
-        .fixedSize()
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(spoken)
-        .id(model.tick)
     }
 
-    private func protectionLine(_ s: OwnersSnap) -> some View {
+    private func protectionPill(_ s: OwnersSnap) -> some View {
         let p = s.protection
-        let (text, tint): (String, Color) = {
+        let (short, full, tint): (String, String, Color) = {
             switch p?.summary {
-            case "on": return ("Protection on · no heavy processes outside memmon run", P.green)
+            case "on": return ("Protection on", "Protection on · no heavy processes outside memmon run", P.green)
             case "partial":
                 let n = p?.unmanagedHeavy ?? 0
-                return ("Protection partial · \(plural(n, "heavy process", "heavy processes")) not started through memmon run", P.amber)
-            case "paused": return ("Protection paused · commands run without a memory check", P.amber)
-            case "off": return ("Protection off · the command gate is not installed or is disabled", P.muted)
-            default: return ("Protection status unknown", P.muted)
+                return ("Protection partial · \(n) outside memmon run",
+                        "Protection partial · \(plural(n, "heavy process", "heavy processes")) not started through memmon run",
+                        P.amber)
+            case "paused": return ("Protection paused", "Protection paused · commands run without a memory check", P.amber)
+            case "off": return ("Protection off", "Protection off · the command gate is not installed or is disabled", P.muted)
+            default: return ("Protection unknown", "Protection status unknown", P.muted)
             }
         }()
-        return HStack(alignment: .top, spacing: 7) {
-            Image(systemName: "shield").font(.system(size: 13, weight: .medium)).padding(.top, 1)
-                .accessibilityHidden(true)
-            Text(text).font(ft(12)).fixedSize(horizontal: false, vertical: true)
+        return HStack(spacing: 5) {
+            Image(systemName: p?.summary == "on" ? "checkmark.shield" : "shield")
+                .font(.system(size: 11, weight: .semibold))
+            Text(short).font(ft(11, .medium)).lineLimit(1)
         }
         .foregroundColor(tint)
+        .padding(.horizontal, 9).frame(height: 22)
+        .background(Capsule().fill(tint.opacity(0.13)))
+        .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
+        .fixedSize()
+        .help(full)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(text)
+        .accessibilityLabel(full)
     }
 
     private func degradedBanner(_ reason: String?) -> some View {
@@ -3182,6 +3445,7 @@ struct ContentView: View {
                 SectionHeader(section: sec, rows: rows, open: open, sort: model.sort) {
                     withAnimation(motion(0.16)) { model.toggle(sec, rows) }
                 }
+                .id("section-" + sec.rawValue)
                 if open {
                     let (shown, hidden) = model.visible(sec, rows)
                     ownerRows(shown, s)
@@ -3194,6 +3458,10 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Show \(hidden) more in \(sec.title)")
+                    }
+                    if sec == .background {
+                        Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
+                            .padding(.horizontal, 10).padding(.top, 4)
                     }
                 }
             }
@@ -3322,26 +3590,52 @@ struct ContentView: View {
     private func gateSection(_ s: OwnersSnap) -> some View {
         let g = s.gate
         let isOpen = previewOpenGate || openGate
+        let status = s.gateMissing ? "Status unavailable" : !g.installed ? "Not installed"
+            : g.paused ? "Paused" : "Active"
+        let statusTint: Color? = s.gateMissing || !g.installed ? nil : g.paused ? P.amber : P.green
+        let counts = g.installed ? "\(g.warned) warned · \(g.stopped) stopped" : nil
         return VStack(alignment: .leading, spacing: 8) {
+            // One row: what it is, its state and its counts; the row opens
+            // policy and history, the button pauses or resumes.
             HStack(spacing: 8) {
-                Image(systemName: "shield").font(.system(size: 13, weight: .medium)).foregroundColor(P.muted)
-                    .accessibilityHidden(true)
-                Text("Command protection").font(ft(13, .medium))
-                if s.gateMissing {
-                    Chip(text: "Status unavailable")
-                } else if !g.installed {
-                    Chip(text: "Not installed")
-                } else if g.paused {
-                    Chip(text: "Paused", tint: P.amber)
-                } else {
-                    Chip(text: "Active", tint: P.green)
+                Button { withAnimation(motion(0.16)) { openGate.toggle() } } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "shield").font(.system(size: 13, weight: .medium))
+                            .foregroundColor(statusTint ?? P.muted)
+                        Text("Command protection").font(ft(13, .medium)).lineLimit(1).fixedSize()
+                        Chip(text: status, tint: statusTint)
+                        if let counts {
+                            // Words when they fit; otherwise the warned and
+                            // stopped symbols the history uses, each with its count.
+                            ViewThatFits(in: .horizontal) {
+                                Text(counts).font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                                HStack(spacing: 6) {
+                                    Label("\(g.warned)", systemImage: "exclamationmark.triangle")
+                                        .foregroundColor(g.warned > 0 ? P.amber : P.muted)
+                                    Label("\(g.stopped)", systemImage: "nosign")
+                                        .foregroundColor(g.stopped > 0 ? P.red : P.muted)
+                                }
+                                .labelStyle(CompactLabel())
+                                .font(ft(11, .medium)).fixedSize()
+                                Color.clear.frame(width: 0, height: 0)
+                            }
+                        }
+                        Spacer(minLength: 2)
+                        Chevron(open: isOpen)
+                    }
+                    .contentShape(Rectangle())
                 }
-                Spacer(minLength: 4)
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Command protection, \(status)" + (counts.map { ", \($0)" } ?? "")
+                                    + (g.installed ? ", policy and history" : ", what command protection does"))
+                .accessibilityValue(isOpen ? "expanded" : "collapsed")
+                .accessibilityAddTraits(.isButton)
                 if g.installed {
-                    ActionButton(title: g.paused ? "Resume" : "Pause",
-                                 icon: g.paused ? "play.fill" : "pause.fill") {
+                    ActionButton(title: "", icon: g.paused ? "play.fill" : "pause.fill", variant: .icon) {
                         model.toggleGate(!g.paused)
                     }
+                    .help(g.paused ? "Resume command protection" : "Pause command protection")
                     .accessibilityLabel(g.paused ? "Resume command protection" : "Pause command protection")
                 }
             }
@@ -3383,19 +3677,6 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.amber.opacity(0.62), lineWidth: 1))
                 .accessibilityElement(children: .contain)
             }
-            Button { withAnimation(motion(0.16)) { openGate.toggle() } } label: {
-                HStack(spacing: 5) {
-                    Chevron(open: isOpen)
-                    Text(g.installed
-                         ? "Policy and history · \(g.warned) warned · \(g.stopped) stopped"
-                         : "What command protection does")
-                        .font(ft(11)).foregroundColor(P.muted)
-                    Spacer()
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isOpen ? "expanded" : "collapsed")
             if isOpen { gateDetail(s) }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
@@ -3840,26 +4121,34 @@ func renderFixture(to path: String) {
     }
     do { try png.write(to: URL(fileURLWithPath: path)) } catch { fail("cannot write \(path)") }
     let darkOnly = darkTokenPixels(in: rep)
-    let corner = rep.colorAt(x: 4, y: 4)?.usingColorSpace(.sRGB)
-    let hex = corner.map { String(format: "#%02x%02x%02x", Int(round($0.redComponent * 255)),
-                                  Int(round($0.greenComponent * 255)), Int(round($0.blueComponent * 255))) } ?? "?"
-    print("rendered \(path) \(rep.pixelsWide)x\(rep.pixelsHigh) bg=\(hex) dark_tokens=\(darkOnly)")
+    func hexAt(_ x: Int, _ y: Int) -> String {
+        rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB).map {
+            String(format: "#%02x%02x%02x", Int(round($0.redComponent * 255)),
+                   Int(round($0.greenComponent * 255)), Int(round($0.blueComponent * 255)))
+        } ?? "?"
+    }
+    // The page background is read below the header's gradient, at the
+    // bottom corner; the header itself is reported on its own.
+    print("rendered \(path) \(rep.pixelsWide)x\(rep.pixelsHigh) bg=\(hexAt(4, rep.pixelsHigh - 4)) "
+          + "head=\(hexAt(4, 4)) dark_tokens=\(darkOnly)")
 }
 
 /// Counts pixels of `rep` that carry one of the dark-only surface tokens (bg,
-/// panel, soft) exactly as the renderer draws them in dark mode. A light
+/// panel, soft, the header gradient's two ends, the ring's track) exactly as the renderer draws them in dark mode. A light
 /// render must have none.
 @MainActor
 func darkTokenPixels(in rep: NSBitmapImageRep) -> Int {
-    let swatch = ImageRenderer(content: HStack(spacing: 0) { P.bg; P.panel; P.soft }
-        .frame(width: 3, height: 1).environment(\.colorScheme, .dark))
+    let swatch = ImageRenderer(content: HStack(spacing: 0) {
+        P.bg; P.panel; P.soft; P.headerTop; P.headerBottom; P.track
+    }
+        .frame(width: 6, height: 1).environment(\.colorScheme, .dark))
     swatch.scale = 1
     guard let img = swatch.nsImage, let tiff = img.tiffRepresentation,
           let sw = NSBitmapImageRep(data: tiff), let swData = sw.bitmapData,
           let data = rep.bitmapData, sw.bitsPerPixel == rep.bitsPerPixel, rep.bitsPerPixel == 32 else {
         return -1
     }
-    let tokens = (0..<3).map { k in (0..<3).map { Int(swData[k * 4 + $0]) } }
+    let tokens = (0..<6).map { k in (0..<3).map { Int(swData[k * 4 + $0]) } }
     var hits = 0
     for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
         let row = data + y * rep.bytesPerRow
@@ -4436,8 +4725,20 @@ if ARGS.contains("--sections-probe") {
                 "total": sectionTotal(owners) ?? NSNull(), "count": sectionCount(sec, owners).shown]
     }
     let small = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, isSmallOwner($0)) })
-    let data = try! JSONSerialization.data(withJSONObject: ["sections": out, "small": small],
-                                           options: [.sortedKeys])
+    let used = m.snap?.system.usedBytes
+    let ring: [[String: Any]] = ringSegments(rows, used: used).map {
+        ["id": $0.id, "bytes": $0.bytes, "arc": $0.arc]
+    }
+    let st = statusState(m.snap, refreshing: ARGS.contains("--refreshing"),
+                         stillSampling: ARGS.contains("--sampling"))
+    let reduce = ARGS.contains("--reduce-motion")
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "sections": out, "small": small, "ring": ring, "used": used ?? NSNull(),
+        "status": ["kind": st.kind.rawValue, "text": st.text, "spoken": st.spoken],
+        "motion": ["sweep": ringSweeps(reduceMotion: reduce, animate: true),
+                   "sweep_render": ringSweeps(reduceMotion: reduce, animate: false),
+                   "pulse": dotPulses(reduceMotion: reduce)],
+    ], options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
     exit(0)
 }

@@ -462,6 +462,7 @@ class RenderTests(unittest.TestCase):
                         line = run_bin("--render", str(png), "--fixture", str(f), f"--{theme}")
                         self.assertTrue(png.exists() and png.stat().st_size > 10_000)
                         bg = line.split("bg=")[1].split()[0]
+                        head = line.split("head=")[1].split()[0]
                         dark_px = int(line.split("dark_tokens=")[1].split()[0])
                         if theme == "light":
                             self.assertEqual(dark_px, 0, "a dark-only surface colour in the light render")
@@ -469,8 +470,10 @@ class RenderTests(unittest.TestCase):
                             self.assertGreater(dark_px, 1000)
                         if theme == "light":
                             self.assertGreater(luminance(bg), 0.7, bg)
+                            self.assertGreater(luminance(head), 0.7, head)    # soft lavender
                         else:
                             self.assertLess(luminance(bg), 0.2, bg)
+                            self.assertLess(luminance(head), 0.25, head)      # deep purple
 
     def test_render_without_a_fixture_fails(self):
         proc = subprocess.run([BIN, "--render", os.devnull], capture_output=True, text=True, timeout=60)
@@ -491,9 +494,10 @@ class AccessibilityTests(unittest.TestCase):
         found = labels(rows)
         self.assertIn("Sampled 2s ago by the live reader", found)
         self.assertIn("Protection partial · 2 heavy processes not started through memmon run", found)
-        meter = next(r for r in rows if r["label"] == "Memory in use")
-        self.assertEqual(meter["role"], "AXProgressIndicator")
-        self.assertEqual(meter["described"], "39.2 of 48 GB")
+        ring = next(l for l in found if l.startswith("Memory "))
+        self.assertEqual(ring, "Memory 39.2 of 48 GB in use, pressure normal; Claude sessions 9.5 GB, Codex 2.1 GB, "
+                               "Mac apps 5.2 GB, Shared services 9.9 GB, Background 1.8 GB, "
+                               "System & other 10.7 GB, free 8.8 GB")
         owner = next(r for r in rows if r["label"].startswith("Checkout refactor,"))
         self.assertEqual(owner["role"], "AXButton")
         # Line 2 is clipped at two lines on screen; the label carries all of it.
@@ -515,8 +519,9 @@ class AccessibilityTests(unittest.TestCase):
         self.assertNotIn("warming up", row)
         self.assertNotIn("0.0 GB", row)
         self.assertIn("Sample time unknown", found)
-        meter = next(r for r in a11y("unavailable.json") if r["label"] == "Memory in use")
-        self.assertEqual(meter["described"], "not available")
+        ring = next(l for l in found if l.startswith("Memory in use"))
+        self.assertEqual(ring, "Memory in use not available, pressure unknown")
+        self.assertIn("Memory in use not available", " ".join(r["value"] for r in a11y("unavailable.json")))
 
     def test_session_detail_labels_child_jobs_and_kept_marker(self):
         found = labels(a11y("session-detail.json"))
@@ -916,6 +921,116 @@ class SectionTests(unittest.TestCase):
         self.assertIn("ownership confidence: exact", helper)
 
 
+class HeaderAndRingTests(unittest.TestCase):
+    """The gradient header's status pill, the protection pill, the memory
+    ring and the one-row command protection."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def probe(self, fixture, *flags, payload=None):
+        if payload is not None:
+            path = Path(self.tmp.name) / "payload.json"
+            path.write_text(json.dumps(payload))
+            fixture = path
+        else:
+            fixture = FIXTURES / fixture
+        return run_json("--sections-probe", "--fixture", str(fixture), *flags)
+
+    def test_status_pill_says_live_syncing_sampling_stale_or_unknown(self):
+        live = self.probe("overview.json")["status"]
+        self.assertEqual((live["kind"], live["text"]), ("live", "Live · 2s"))
+        self.assertEqual(live["spoken"], "Sampled 2s ago by the live reader")
+        sync = self.probe("overview.json", "--refreshing")["status"]
+        self.assertEqual((sync["kind"], sync["text"]), ("syncing", "Syncing…"))
+        sampling = self.probe("overview.json", "--sampling")["status"]
+        self.assertEqual((sampling["kind"], sampling["text"]), ("sampling", "Still sampling…"))
+        stale = self.probe("stale-paused.json")["status"]
+        self.assertEqual((stale["kind"], stale["text"]), ("stale", "Stale · 3 min"))
+        self.assertTrue(stale["spoken"].endswith(", stale"))
+        unknown = self.probe("unavailable.json")["status"]
+        self.assertEqual((unknown["kind"], unknown["text"], unknown["spoken"]),
+                         ("stale", "Time unknown", "Sample time unknown"))
+
+    def test_status_pill_is_spoken_in_the_header(self):
+        self.assertIn("Sampled 3 min ago by the background sampler, stale", labels(a11y("stale-paused.json")))
+
+    def test_protection_pill_says_the_whole_sentence(self):
+        cases = {"overview.json": "Protection partial · 2 heavy processes not started through memmon run",
+                 "small.json": "Protection on · no heavy processes outside memmon run",
+                 "stale-paused.json": "Protection paused · commands run without a memory check",
+                 "unavailable.json": "Protection off · the command gate is not installed or is disabled"}
+        for fixture, sentence in cases.items():
+            with self.subTest(fixture=fixture):
+                self.assertIn(sentence, labels(a11y(fixture)))
+
+    def test_command_protection_is_one_row_that_opens_its_history(self):
+        rows = a11y("overview.json")
+        row = next(r for r in rows if r["label"].startswith("Command protection,"))
+        self.assertEqual(row["label"], "Command protection, Active, 1 warned · 1 stopped, policy and history")
+        self.assertEqual(row["value"], "collapsed")
+        self.assertIn("Pause command protection", labels(rows))
+        # The actionable blocked card stays visible with the row closed.
+        self.assertIn("1 blocked command waiting to retry", [r["label"] or r["value"] for r in rows])
+        opened = next(r for r in a11y("gate-open.json") if r["label"].startswith("Command protection,"))
+        self.assertEqual(opened["value"], "expanded")
+        off = next(l for l in labels(a11y("unavailable.json")) if l.startswith("Command protection,"))
+        self.assertEqual(off, "Command protection, Not installed, what command protection does")
+
+    def ring(self, r):
+        return {s["id"]: s for s in r["ring"]}
+
+    def test_system_and_other_is_used_minus_sections_never_negative(self):
+        over = self.probe("sections-open.json")       # sections add up to more than used
+        ring = self.ring(over)
+        self.assertEqual(ring["system"]["bytes"], 0)
+        self.assertLessEqual(sum(s["arc"] for s in over["ring"]), over["used"] + 1)
+        under = self.probe("overview.json")
+        sections = sum(s["bytes"] for s in under["ring"] if s["id"] != "system")
+        self.assertAlmostEqual(self.ring(under)["system"]["bytes"], under["used"] - sections, delta=1)
+
+    def test_ring_arcs_never_exceed_used_and_count_each_owner_once(self):
+        for fixture in ("overview.json", "sections.json", "sections-open.json", "small.json", "degraded.json"):
+            with self.subTest(fixture=fixture):
+                r = self.probe(fixture)
+                self.assertLessEqual(sum(s["arc"] for s in r["ring"]), r["used"] + 1)
+                # Each section's arc source is that section's own total.
+                totals = {s["section"]: s["total"] for s in r["sections"]}
+                for seg in r["ring"]:
+                    if seg["id"] != "system":
+                        self.assertAlmostEqual(seg["bytes"], totals[seg["id"]], delta=1)
+        payload = effective(FIXTURES / "overview.json")
+        fp = sum(o.get("footprint_bytes") or 0 for o in payload["owners"])
+        r = self.probe("overview.json")
+        self.assertAlmostEqual(sum(s["bytes"] for s in r["ring"] if s["id"] != "system"), fp, delta=1)
+
+    def test_unavailable_memory_draws_no_arcs(self):
+        r = self.probe("unavailable.json")
+        self.assertIsNone(r["used"])
+        self.assertNotIn("system", self.ring(r))
+
+    def test_reduce_motion_stops_the_sweep_and_the_pulse(self):
+        moving = self.probe("overview.json")["motion"]
+        self.assertEqual(moving, {"sweep": True, "sweep_render": False, "pulse": True})
+        still = self.probe("overview.json", "--reduce-motion")["motion"]
+        self.assertEqual(still, {"sweep": False, "sweep_render": False, "pulse": False})
+
+    def test_legend_rows_open_their_section(self):
+        found = labels(a11y("overview.json"))
+        self.assertIn("Show Claude sessions in the list, 9.5 GB", found)
+        system = next(l for l in found if l.startswith("System & other,"))
+        self.assertIn("System and other users: not itemised (214 processes)", system)
+
+    def test_system_line_moves_into_background(self):
+        closed = [r["label"] or r["value"] for r in a11y("overview.json")]
+        self.assertNotIn("System and other users: not itemised (214 processes)", closed)
+        opened = [r["label"] or r["value"] for r in a11y("sections-background.json")]
+        self.assertIn("System and other users: not itemised (214 processes)", opened)
+        nobackground = [r["label"] or r["value"] for r in a11y("small.json")]
+        self.assertIn("System and other users: not itemised (214 processes)", nobackground)
+
+
 class HostedPopoverTests(unittest.TestCase):
     """The real popover root, hosted offscreen: size, keyboard and ticker."""
 
@@ -1189,7 +1304,7 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertIn("Building · typecheck", row)
         self.assertIn("ownership confidence: exact", row)
         self.assertTrue(any(l.startswith("Unattributed,") for l in found))
-        self.assertIn("Memory pressure normal", " ".join(r["value"] for r in rows))
+        self.assertTrue(any(l.startswith("Memory ") and "pressure normal" in l for l in found), found)
         # No project for a scripted session reads as unknown, not as a claim.
         self.assertIn("No project detected", row)
         # owners_json's own assembly: partial CPU coverage gives no total, and
