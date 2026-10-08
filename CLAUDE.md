@@ -24,7 +24,7 @@ Four independent pieces. All are optional except the CLI.
 | Piece | What it does | Flag |
 |---|---|---|
 | CLI | `memmon` — live dashboard + one-shot queries | *(always)* |
-| Sampler | launchd job, 1 sample/min, history for `--report` | `--sampler` |
+| Sampler | launchd job, 1 sample/min at Standard priority, history for `--report` | `--sampler` |
 | Menu bar | `MemmonBar.app` — status dot + popover, at login | `--menubar` |
 | Gate | `PreToolUse` hook so Claude sessions back off under memory pressure | `--gate` |
 
@@ -100,6 +100,11 @@ Once `--gate` is installed, before any Bash command in any session:
 - Heavy (typecheck / build / test / install / docker / dev server) → reads memory
   pressure in ~70 ms and either stays silent, injects an advisory into the
   session's context, or refuses the command.
+- Pressure UNKNOWN (no valid rate baseline yet) → allowed silently, logged as
+  UNKNOWN, nothing injected. The gate fails open; it never guesses HEALTHY.
+- Under pressure, the advisory also names the largest heavy job `memmon run`
+  did not start, addressed to the human: *"Ask the user before stopping it; do
+  not stop it yourself."* Follow that. The gate's decision is unchanged.
 
 `MEMMON_GATE` controls it: `block-critical` (default — refuses only at CRITICAL),
 `block` (also at DANGER), `warn` (never refuses), `off`.
@@ -117,6 +122,10 @@ Use `memmon run --label "<task>" -- <command> <args>` for foreground builds,
 typechecks and tests that should share one machine-wide slot. Claude, Codex and
 terminal commands use the same runner. `memmon jobs` explains who is running or
 waiting; the menu-bar dashboard shows those jobs too.
+
+Wrap repo-wide test, build and typecheck runs this way (or turn on route mode).
+That is what puts them under admission and monitoring; anything started
+directly is only ever listed under pressure, never stopped by memmon.
 
 Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit 124
 means the command never started. Do not replace this with a `pgrep` waiting loop,
@@ -146,6 +155,13 @@ pass a `force` token without that confirmation.
 
 For an always-visible readout, add `memmon --statusline` to a Claude Code
 statusline command or shell prompt. It reads the cached sample and never blocks.
+It prints `memmon: pressure unknown` when the last reading had no valid rates,
+and `memmon: no sample for N min` when the sampler has not run for over 3 min.
+
+Under DANGER or CRITICAL, `memmon owners` adds an *Under pressure* section: the
+largest heavy jobs that `memmon run` did not start. "Idle" and "growing" there
+are labels, not permission. Stopping one is the same confirmed `act` step as
+above: show the row to the human and act only on their say-so.
 
 ## Configuration (usually unnecessary)
 
@@ -177,6 +193,8 @@ that directory too for a clean slate.
 | `swiftc not found` | Xcode CLT missing — `xcode-select --install` |
 | Two menu-bar icons | Old instance still exiting; it resolves, re-run install if not |
 | `--report` says no history | `--sampler` not installed |
+| `--pressure` says UNKNOWN | no rate baseline: the sampler is not installed or has not run in the last 5 min. A fresh process has nothing to compare against; `memmon` (live) has one after its first refresh |
+| Status line says "no sample for N min" | the sampler did not run; `launchctl list \| grep memmon` |
 | Gate seems inert | Check `memmon --gate-log`; `MEMMON_GATE=off` disables it |
 
 Do not report the install as done until `memmon --once` renders and, if you

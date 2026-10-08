@@ -50,6 +50,33 @@ Two things the review flagged that were **deliberately not changed**:
   That is a policy question about what the button means, not a defect.
 
 
+### 0.1 Revision for S2 (machine-wide memory admission)
+
+S2 supersedes two non-goals **for `memmon run` only**:
+
+- **NG2.** `memmon run` in its default `protect` mode is an admission
+  controller: it queues wrapped jobs (FIFO, at most 32 tickets), admits one only
+  when its estimate fits under RAM × (1 − headroom_frac) minus what is already
+  committed, and holds after a bad reading until memory has stayed at Watch or
+  better for 30 s. Nothing that is not started through `memmon run` (or the
+  opt-in route) is queued, delayed or serialised. `memmon run-mode paused`
+  restores v1 admission exactly.
+- **NG3.** A job started with `--interruptible`, on a machine where
+  `auto_cancel_interruptible` is on, may be cancelled by policy after 10 s at
+  CRITICAL (exit 75). That is the only automatic stop. Unmanaged heavy work is
+  listed under pressure with a confirmed targeted stop, and is never stopped by
+  memmon on its own (I-14).
+
+S2 also changes these legacy values (D10): the pressure level may be the string
+`UNKNOWN` with `level_reason` and `rates`; the sampler scores from rates taken
+inside each run; the low-headroom streak and the runway need a free_pct
+baseline at least 30 s old; one-shot readers seed from `pressure.json`, then
+`latest.json`, each 2–300 s old by CLOCK_MONOTONIC_RAW and from the same boot;
+`--pressure` exits 0 on UNKNOWN; the status line can print `memmon: pressure
+unknown` or `memmon: no sample for N min`; rows gain `mono`, `uptime`, `boot`
+and optional `gap` and `partial`; `latest.json` and `pressure.json` are
+replaced atomically; and the sampler plist runs at ProcessType Standard.
+
 ## 1. Problem
 
 A 16 GB Apple Silicon laptop running several concurrent Claude Code sessions froze. Not slowed — froze, losing work across every session at once. Three facts made the freeze both possible and undiagnosable with existing tools:

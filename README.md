@@ -125,7 +125,7 @@ verify the install, and how to uninstall.
 | Flag | Adds |
 |---|---|
 | *(none)* | the `memmon` CLI at `~/.local/bin/memmon` |
-| `--sampler` | launchd sampler, 1 sample/min, for `--report` and the menu-bar dot |
+| `--sampler` | launchd sampler, 1 sample/min at Standard priority, for `--report` and the menu-bar dot |
 | `--menubar` | `MemmonBar.app` in the menu bar, launched at login |
 | `--gate` | a `PreToolUse` hook so Claude sessions back off under pressure |
 | `--uninstall` | removes everything (collected history is kept) |
@@ -307,7 +307,7 @@ while over-matching costs one process start.
 ```
 memmon                 live dashboard (repaints in place, alternate screen)
 memmon --once          one snapshot
-memmon --pressure      crash-risk verdict only (fast, no top)
+memmon --pressure      crash-risk verdict only (fast, no top); UNKNOWN exits 0
 memmon --report        per-app / per-worktree averages from history
 memmon --blocked       commands the gate refused in the last 2 hours that nobody has re-run
 memmon --dismiss-blocked ID   stop listing one of them (the menu bar's Dismiss)
@@ -323,6 +323,7 @@ memmon --end-session PID   end a session by root pid (--apply to do it)
 memmon --wait-safe     block until memory pressure clears
 memmon --json          machine-readable snapshot
 memmon --statusline    one compact line, for a shell/Claude statusline
+                       ("memmon: pressure unknown", "memmon: no sample for N min")
 memmon --profile       what this machine has learned costs memory
 memmon --off [8h]      pause the gate entirely; resumes on its own
 memmon --on            resume the gate now
@@ -570,6 +571,11 @@ Reap button; reaping is a command-line action.
 
 ### Upgrading with the old menu bar still running
 
+Run `./install.sh --sampler` once after upgrading: it rewrites the sampler's
+plist at Standard priority and reloads it. Reverting and re-running it restores
+the Background plist. A menu bar built before resource owners shows UNKNOWN as a
+green dot until it is reinstalled; later builds show it as neutral.
+
 Until `./install.sh --menubar` replaces it, an already-running menu bar from
 before this version still calls `--end-session` and `--reap`. Those now take the
 graceful path, which can keep the old app busy for up to about 25 seconds per
@@ -601,7 +607,11 @@ free-memory number worth scoring.
 
 The `~N min left` badge projects when that figure reaches **20%**, at the current
 rate of decline. It is a trend estimate of when free memory reaches that floor —
-not a time until the machine freezes, which nothing on macOS can predict. Two samples, 60 seconds apart:
+not a time until the machine freezes, which nothing on macOS can predict. It needs
+two readings of the percentage at least 30 seconds apart: the figure is a whole
+percentage, so over 2 seconds a single tick would read as 30 points a minute.
+With no such pair the estimate is left out, and the streak below stays where it
+was:
 
 ```
 headroom_min = (current % − 20) ÷ (percentage points lost per minute)
@@ -646,6 +656,66 @@ near-freeze:
 
 The first scoring attempt reported HEALTHY *during* the crisis. The replay is what
 caught it, and why swap-vs-RAM was promoted over free-%.
+
+### UNKNOWN: no reading says HEALTHY without its rates
+
+Paging and swap growth are rates, so a verdict needs a baseline: an earlier
+reading from the same boot, 2 to 300 seconds old. The sampler takes its own,
+two reads 2 seconds apart inside each run, so a reading right after a gap
+still sees the paging happening then. A one-shot reader (`--pressure`,
+`--once`, the gate) seeds from the sampler's `pressure.json`, then from
+`latest.json`. With no valid baseline the level is the string `UNKNOWN` with a
+reason, never HEALTHY. If the instantaneous signals alone already reach WATCH
+or worse, that level stands as a lower bound and says rates are unavailable.
+
+Each reader treats UNKNOWN as fail-open, the same as before: the gate allows
+silently and injects nothing, `--pressure` prints UNKNOWN and exits 0,
+`--wait-safe` keeps waiting (its next poll has a baseline), and the status line
+prints `memmon: pressure unknown`. A `memmon run` in `paused` mode treats it as
+WATCH and admits, as before; `protect` reads the strict path only.
+
+### Sampling gaps
+
+On a starved machine the sampler may not get scheduled at all. Each row records
+`mono` (CLOCK_MONOTONIC_RAW, which keeps counting while the Mac sleeps),
+`uptime` (CLOCK_UPTIME_RAW, which does not) and `boot`
+(`kern.bootsessionuuid`). More than 150 s between rows is a gap: the difference
+of the two clocks is the time asleep, and the rest is awake time nobody
+sampled. A gap with at most 150 s awake is `sleep`; anything more is `starved`;
+a changed boot is `reboot`. Rows are never back-filled, and `--report` lists
+the gaps in its window. After a starved gap with at least 5 min awake, the
+sampler posts one notification and the menu bar shows a notice for a day. The
+notice never says why sampling stopped: an unloaded sampler looks the same.
+
+Each run has a 40 s budget. If `top` or `lsof` stalls past it, the run writes
+what it has as a `partial` row and exits, so the next minute's run is not
+hidden behind it. The sampler runs at launchd's Standard priority rather than
+Background, which yields to exactly the contention it is there to observe.
+Standard still has light resource limits, so this lessens throttling; it does
+not remove it.
+
+## Under pressure: heavy work that `memmon run` did not start
+
+The gate checks a command once, when it launches. A test run that starts at
+HEALTHY and grows to 9 GB is invisible to it afterwards, and the runner watches
+only what it started. So at DANGER or CRITICAL (or when the rates are
+unavailable and the kernel's own level is warning or critical), memmon lists
+the largest unmanaged test, build and server jobs: subtrees, never whole
+sessions or apps, of at least 1 GiB (or 2 % of RAM), at most three, with their
+growth and how long they have been idle.
+
+Each row uses the same confirmed stop as the owner list (*Stop tests…*,
+*Stop build…*, *Stop server…*). Two kinds have no button and say why: a job
+that runs in its session's own process group, and an orphan, whose only stop
+is the untargeted `reap`. **Nothing stops on its own.** "Idle" and "growing"
+are labels, not permission. The sampler posts at most one notification per
+job per episode, and never more than one every 5 minutes. The gate's advisory
+names the top job and tells the agent to ask the user first. `memmon owners`
+prints the same list.
+
+The way to keep such work out of this list is to start it through
+`memmon run` (or route mode), which puts it under admission and monitoring.
+`"pressure_suggestions": false` in `config.json` turns all of this off.
 
 ## The gate
 
@@ -771,9 +841,15 @@ Optional, at `~/.claude/memmon/config.json`:
 {
   "project_roots": ["~/Desktop/Work", "~/code"],
   "worktree_pattern": "monorepo(?:-([A-Za-z0-9._-]+))?",
-  "ticket_pattern": "[A-Z]{2,6}-\\d+"
+  "ticket_pattern": "[A-Z]{2,6}-\\d+",
+  "headroom_frac": 0.20,
+  "pressure_suggestions": true
 }
 ```
+
+`headroom_frac` sets `memmon run`'s admission limit, RAM × (1 − headroom_frac).
+`pressure_suggestions: false` turns off the *Under pressure* list, its
+notifications and the gate's naming of the top job.
 
 `project_roots` is the portable option — the child directory of a root becomes the
 worktree name, needing no naming convention. The regexes are the fallback.
@@ -791,6 +867,9 @@ Everything lives in `~/.claude/memmon/`. Nothing is written to `/tmp`.
 | `owners-history.json` | 60 samples × 200 owners, under ~600 KB |
 | `cpu-baseline.json` | one sample of up to 4,096 processes |
 | `runner/coord/actions.lock` | empty; the lock that serialises every stop |
+| `pressure.json` | the sampler's last reading, replaced atomically each run |
+| `job-history.json` | 60 points × 64 heavy job roots |
+| `runner/coord/pressure-episode.json` | the notification dedupe state |
 
 Worst case ~13 MB, self-limiting. Trimming is by row count, not age — an age
 cutoff further out than the size gate removes nothing, so the file gets rewritten
