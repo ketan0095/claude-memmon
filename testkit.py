@@ -333,7 +333,7 @@ class GuardedEngine(memmon_act.Engine):
 
     registry: Registry = None
 
-    def run(self, action, token, lock_fd=None, origin=None):
+    def run(self, action, token, lock_fd=None, origin=None, still_selected=None):
         body = memmon_owners.decode_token(token)
         reg = self.registry
         if action == "force":
@@ -345,7 +345,8 @@ class GuardedEngine(memmon_act.Engine):
                 who = body.get(key) or {}
                 assert reg.ids.get(who.get("pid")) == tuple(who.get("start") or ()), \
                     f"{key} {who} is not a registered identity"
-        return super().run(action, token, lock_fd=lock_fd, origin=origin)
+        return super().run(action, token, lock_fd=lock_fd, origin=origin,
+                           still_selected=still_selected)
 
     def reap(self, targets, still_selected, selector=None, dry_run=False):
         for item in targets:

@@ -129,7 +129,6 @@ class Engine:
     after_capture: object = None                # test hook: (captured pids) -> None
     sent: list = field(default_factory=list)    # (pid, signal) actually sent
     _pending_watch: object = None
-    _still_selected: object = None
     _first_term: float = 0.0
 
     # ------------------------------------------------------------ signals
@@ -168,7 +167,7 @@ class Engine:
     # ------------------------------------------------------------- entry
 
     def run(self, action: str, token: str, lock_fd: int | None = None,
-            origin: str | None = None) -> dict:
+            origin: str | None = None, still_selected=None) -> dict:
         try:
             try:
                 body = memmon_owners.decode_token(token)
@@ -186,7 +185,7 @@ class Engine:
                 if action == "verify-app":
                     return self._verify_app(body)
                 if action == "force":
-                    return self._force(body, origin)
+                    return self._force(body, origin, still_selected)
                 if action not in PROCESS_ACTIONS:
                     raise Refused("unknown_action")
                 out = self._process(action, body)
@@ -269,12 +268,12 @@ class Engine:
         signal them) instead of claiming the job is gone."""
         pgid = body.get("target_pgid")
         root = inv.procs.get((body.get("owner_root") or {}).get("pid"))
-        if action not in ("stop-job", "stop-server") or not pgid or (
+        if action not in ("stop-job", "stop-server", "stop-managed-job") or not pgid or (
                 root is not None and root.pgid == pgid):
             return outcome("already_exited", None, measured_at=self.clock())
         part = self.partition_fn(inv)
         mine = self._self_tree()
-        rows = [{"pid": p.pid, "start": list(p.start), "forceable": False,
+        rows = [{"pid": p.pid, "start": list(p.start), "forceable": False, "signalled": False,
                  "argv0": os.path.basename((inv.argv(p.pid) or [p.comm])[0] or p.comm)}
                 for p in sorted(inv.procs.values(), key=lambda q: q.pid)
                 if p.pgid == pgid and p.visible and not p.zombie and p.uid == os.getuid()
@@ -290,12 +289,12 @@ class Engine:
         or until the job settles, to report a daemon restart truthfully. The
         whole call stays under 22 s from this process's start, inside the
         menu bar's 25 s timeout."""
-        deadline = self._first_term + self.respawn_window_s
-        me = self.source.read(os.getpid())
-        if me is not None and me.start:
-            started = me.start[0] + me.start[1] / 1e6
-            deadline = min(deadline, self.mono() + (ACT_BUDGET_S - (self.clock() - started)))
         try:
+            deadline = self._first_term + self.respawn_window_s
+            me = self.source.read(os.getpid())
+            if me is not None and me.start:
+                started = me.start[0] + me.start[1] / 1e6
+                deadline = min(deadline, self.mono() + (ACT_BUDGET_S - (self.clock() - started)))
             self._watch_loop(out, watch, job_id, old, base, deadline)
         except Exception as exc:
             out["watch_error"] = f"{type(exc).__name__}: {exc}"
@@ -318,38 +317,34 @@ class Engine:
             return {}
         return self.root_rule_fn(inv, list(dict.fromkeys(pids)))
 
-    def _guarding_wrappers(self, inv, part, captured: dict, kept: dict) -> set:
-        """`memmon run` wrappers that must not get SIGTERM: on cancellation a
-        wrapper signals its child's whole process group, and that group holds
-        a kept owner. Their child is still stopped per PID, after which the
-        wrapper exits on its own."""
-        if not self.leases_fn or not kept:
-            return set()
-        kept_ids = set(kept)
-        out = set()
-        for row in self.leases_fn() or []:
+    def _lease_children(self, captured: dict) -> dict:
+        """Captured `memmon run` wrappers -> (child pid, child start, child
+        pgid or None). On SIGTERM a wrapper signals its child's whole process
+        group, which can hold processes nobody captured, so a wrapper is never
+        signalled while its child runs: the child is stopped per PID instead,
+        and the wrapper then exits on its own."""
+        out = {}
+        for row in (self.leases_fn() if self.leases_fn else None) or []:
             w, c = row.get("wrapper_pid"), row.get("child_pid")
-            cp = inv.procs.get(c)
-            if w not in captured or cp is None or list(cp.start) != list(row.get("child_start") or []):
-                continue
-            if any(q.pgid == cp.pgid and (part.root_owner.get(pid) in kept_ids
-                                         or part.owner_of.get(pid) in kept_ids)
-                   for pid, q in inv.procs.items()):
-                out.add(w)
+            if w in captured and c:
+                out[w] = (c, list(row.get("child_start") or []), None)
         return out
 
-    def _graceful(self, inv, part, targets: list, owner_id, origin: str,
-                  body: dict | None, mine: set, owner_root=None, selected=()) -> dict:
-        """TERM every observed member, watch for new descendants, then report
-        exactly what is still alive. Never escalates on its own.
+    def _child_running(self, inv, child: tuple) -> bool:
+        """The lease child still holds its PID. An unreadable start counts as
+        running: a wrapper is released only once its child is provably gone."""
+        cp = inv.procs.get(child[0])
+        if cp is None or cp.zombie:
+            return False
+        return cp.start is None or _same(cp, child[1])
 
-        Protection is re-derived as the tree changes: a parent is walked only
-        while its identity is unchanged, and a process that turns out to be
-        another owner's root (found by the root rules, applied only to newly
-        seen PIDs) is kept with its subtree."""
+    def _plan(self, inv, part, targets: list, mine: set) -> tuple:
+        """What a stop of `targets` captures, from one snapshot: the members
+        to SIGTERM (with their depth), the nested owners it keeps, and the
+        `memmon run` wrappers it holds back while their child runs. A dry run
+        reports exactly this."""
         stop = set(part.root_owner) - set(targets)
         kept: dict = {}                     # owner_id -> (pid, start)
-        excluded: set = set()               # never signalled, never walked
         captured: dict = {}
         depth: dict = {}
         for t in targets:
@@ -362,9 +357,25 @@ class Engine:
             for r in inv.descendants(t):
                 if r in stop and r in part.root_owner:
                     kept.setdefault(part.root_owner[r], (r, inv.procs[r].start))
-        for w in self._guarding_wrappers(inv, part, captured, kept):
-            excluded.add(w)
-            captured.pop(w, None)
+        held: dict = {}                     # wrapper -> (start, child)
+        lease_pgids: set = set()
+        for w, child in self._lease_children(captured).items():
+            if self._child_running(inv, child):
+                held[w] = (captured.pop(w), child)
+                lease_pgids.add(inv.procs[child[0]].pgid)
+        return stop, captured, depth, kept, held, lease_pgids
+
+    def _graceful(self, inv, part, targets: list, owner_id, origin: str,
+                  body: dict | None, mine: set, owner_root=None, selected=()) -> dict:
+        """TERM every observed member, watch for new descendants, then report
+        exactly what is still alive. Never escalates on its own.
+
+        Protection is re-derived as the tree changes: a parent is walked only
+        while its identity is unchanged, and a process that turns out to be
+        another owner's root (found by the root rules, applied only to newly
+        seen PIDs) is kept with its subtree."""
+        stop, captured, depth, kept, held, lease_pgids = self._plan(inv, part, targets, mine)
+        excluded: set = set()               # never signalled, never walked
         pgids = {inv.procs[t].pgid for t in targets}
         if self.after_capture:
             self.after_capture(list(captured))
@@ -382,8 +393,8 @@ class Engine:
                     continue                # gone or reused: not our parent any more
                 for d in snap.descendants(a, stop=stop | excluded):
                     dp = snap.procs[d]
-                    if (_same(dp, captured.get(d, ())) or d in mine or dp.zombie
-                            or not dp.visible or dp.uid != os.getuid()):
+                    if (_same(dp, captured.get(d, ())) or d in mine or d in held
+                            or dp.zombie or not dp.visible or dp.uid != os.getuid()):
                         continue
                     cand.append(d)
             for r, oid in self._fresh_roots(snap, cand).items():
@@ -392,15 +403,24 @@ class Engine:
                 excluded.update(snap.descendants(r))
             return [d for d in dict.fromkeys(cand) if d not in excluded]
 
+        def release(snap) -> list:
+            """Held wrappers whose child is gone: safe to stop now."""
+            out = [w for w, (ws, child) in held.items()
+                   if not self._child_running(snap, child) and _same(snap.procs.get(w), ws)]
+            for w in out:
+                captured[w] = held.pop(w)[0]
+                depth[w] = 0
+            return out
+
         deadline = self.mono() + self.grace_s
         while True:
             alive = [p for p in captured if self._alive(p, captured[p])]
             fresh = []
-            if alive:
+            if alive or held:
                 now_inv = memmon_procs.snapshot(self.source, clock=self.clock)
-                fresh = discover(now_inv, alive)
+                fresh = discover(now_inv, alive) + release(now_inv)
                 for d in fresh:
-                    captured[d] = now_inv.procs[d].start
+                    captured.setdefault(d, now_inv.procs[d].start)
                     self._signal(d, captured[d], signal.SIGTERM)
             if not alive and not fresh:
                 break
@@ -413,6 +433,12 @@ class Engine:
         remaining = {p: final.procs[p] for p in survivors}
         for d in discover(final, survivors):
             remaining.setdefault(d, final.procs[d])
+        # A wrapper still held is reported, never signalled, when it is a
+        # target or its child was part of this stop; one guarding a child
+        # that is another owner stays with that owner.
+        for w, (ws, child) in held.items():
+            if _same(final.procs.get(w), ws) and (w in targets or child[0] in captured):
+                remaining.setdefault(w, final.procs[w])
         # The sweep reports, never signals. It skips only what this action
         # deliberately leaves alone: kept owners, guarding wrappers and the
         # targets' own ancestors. Anything else still in the group is a known
@@ -423,16 +449,22 @@ class Engine:
             while a in inv.procs and a not in ancestors:
                 ancestors.add(a)
                 a = inv.procs[a].ppid
+        mine_owner = {owner_id, None} | ({part.owner_of.get(t) for t in targets})
         for pid, p in final.procs.items():
-            if (p.pgid in pgids and not _same(p, captured.get(pid, ())) and pid not in mine
-                    and pid not in ancestors and pid not in excluded and not p.zombie
-                    and p.visible and part.owner_of.get(pid) not in kept):
-                remaining.setdefault(pid, p)
+            if (not _same(p, captured.get(pid, ())) and pid not in mine
+                    and pid not in ancestors and pid not in excluded and pid not in held
+                    and not p.zombie and p.visible and part.owner_of.get(pid) not in kept):
+                oid = part.owner_of.get(pid)
+                # A lease child's own group is swept only for this stop's own
+                # or unattributed processes; another owner there is not ours.
+                if p.pgid in pgids or (p.pgid in lease_pgids and (
+                        oid in mine_owner or part.owners[oid].kind == "unknown")):
+                    remaining.setdefault(pid, p)
 
         forceable = set(survivors)
         exited = sum(1 for p in captured if p not in forceable)
         rows = [{"pid": p.pid, "start": list(p.start), "forceable": p.pid in forceable,
-                 "argv0": os.path.basename((final.argv(p.pid) or [p.comm])[0] or p.comm)}
+                 "signalled": p.pid in forceable, "argv0": os.path.basename((final.argv(p.pid) or [p.comm])[0] or p.comm)}
                 for p in sorted(remaining.values(), key=lambda q: q.pid)]
         alive_kept = sorted(oid for oid, (pid, start) in kept.items()
                             if _same(final.procs.get(pid), start))
@@ -452,18 +484,24 @@ class Engine:
                                "selected": p in selected} for p in survivors],
                 "observed": [{"pid": r["pid"], "start": r["start"]}
                              for r in rows if not r["forceable"]][:OBSERVED_CAP],
+                "observed_total": len(rows) - len(forceable),
                 "snapshot_ts": round(self.clock(), 3)})
         return out
 
     # ------------------------------------------------------------- force
 
-    def _force(self, body: dict, origin: str | None = None) -> dict:
+    def _force(self, body: dict, origin: str | None = None, still_selected=None) -> dict:
         """SIGKILL the survivors a partial result named, each re-read first.
         A survivor that has since become another owner's root, that is in
         memmon's own tree, or (for reap) is no longer an unattributed selected
         orphan, is left alone and reported. Processes the action observed but
-        never signalled keep the result partial: force never claims them."""
+        never signalled keep the result partial: force never claims them.
+
+        A reap token is forced only through reap, which re-applies its
+        selector; without one a selected survivor is left alone."""
         if origin and body.get("origin") != origin:
+            raise Refused("wrong_action")
+        if not origin and body.get("origin") == "reap":
             raise Refused("wrong_action")
         mine = self._self_tree()
         used_before = self._used()
@@ -483,43 +521,51 @@ class Engine:
             if part is not None:
                 oid = part.owner_of.get(pid)
                 protected = protected or oid is None or part.owners[oid].kind != "unknown"
-                if s.get("selected") and self._still_selected:
-                    protected = protected or not self._still_selected(inv, pid)
+                if s.get("selected"):
+                    protected = (protected or still_selected is None
+                                 or not still_selected(inv, pid))
             if protected or not self._signal(pid, start, signal.SIGKILL):
                 skipped.append((pid, start))
                 continue
             live.append((pid, start))
+        sent = list(live)
         deadline = self.mono() + self.force_wait_s
         while live and self.mono() < deadline:
             live = [(p, s) for p, s in live if self._alive(p, s)]
             if live:
                 self.sleep(self.poll_s)
         final = memmon_procs.snapshot(self.source, clock=self.clock)
-        still = [(p, s) for p, s in live + skipped if _same(final.procs.get(p), s)]
-        observed = [(o.get("pid"), o.get("start") or []) for o in body.get("observed") or []
-                    if _same(final.procs.get(o.get("pid")), o.get("start") or [])]
-        rows = [{"pid": p, "start": list(s), "forceable": False,
-                 "argv0": os.path.basename((final.argv(p) or [""])[0])}
-                for p, s in still + observed]
+        alive = lambda p, s: _same(final.procs.get(p), s)
+        listed = body.get("observed") or []
+        observed = [(o.get("pid"), o.get("start") or []) for o in listed
+                    if alive(o.get("pid"), o.get("start") or [])]
+        # The token lists at most OBSERVED_CAP observed processes; the rest are
+        # unknown to force and assumed still running.
+        unlisted = max(0, int(body.get("observed_total") or len(listed)) - len(listed))
+        rows = ([{"pid": p, "start": list(s), "forceable": False, "role": "survivor",
+                  "signalled": (p, s) in sent,
+                  "argv0": os.path.basename((final.argv(p) or [""])[0])}
+                 for p, s in live + skipped if alive(p, s)]
+                + [{"pid": p, "start": list(s), "forceable": False, "role": "observed",
+                    "signalled": False, "argv0": os.path.basename((final.argv(p) or [""])[0])}
+                   for p, s in observed])
         reason = None
-        if still:
+        if any(r["role"] == "survivor" for r in rows):
             reason = "survivors"
-        elif observed:
+        elif observed or unlisted:
             reason = "outside_force"
-        return outcome("force_stopped" if not rows else "partial", reason,
-                       exited=len(survivors) - len(still), remaining=rows,
-                       named=len(survivors), forceable=0, observed=len(rows),
+        gone = sum(1 for s in survivors if not alive(s.get("pid"), s.get("start") or []))
+        return outcome("force_stopped" if reason is None else "partial", reason,
+                       exited=gone, killed=sum(1 for p, s in sent if not alive(p, s)),
+                       remaining=rows, named=len(survivors), forceable=0,
+                       observed=len(observed), observed_unlisted=unlisted,
                        used_bytes_before=used_before, used_bytes_after=self._used(),
                        measured_at=self.clock())
 
     def force(self, token: str, origin: str | None = None, still_selected=None) -> dict:
         """The explicit second step. Signals only the identities the token
         names, each re-read first, and never anything that appeared later."""
-        self._still_selected = still_selected
-        try:
-            return self.run("force", token, origin=origin)
-        finally:
-            self._still_selected = None
+        return self.run("force", token, origin=origin, still_selected=still_selected)
 
     # -------------------------------------------------------------- reap
 
@@ -534,62 +580,69 @@ class Engine:
         try:
             if self.source.name == "degraded":
                 raise Refused("degraded_identity")
+            if dry_run:                     # reads only, so it takes no lock
+                return self._reap_once(targets, still_selected, selector, True)
             with action_lock(self.lock_path, sleep=self.sleep, mono=self.mono):
-                inv = memmon_procs.snapshot(self.source, clock=self.clock)
-                part = self.partition_fn(inv)
-                mine = self._self_tree()
-                chosen, refused = [], []
-                for item in targets:
-                    pid, start = item if isinstance(item, (tuple, list)) else (item, None)
-                    p = inv.procs.get(pid)
-                    if p is None or p.zombie:
-                        continue
-                    owner = part.owner_of.get(pid)
-                    if start is not None and (p.start is None or list(p.start) != list(start)):
-                        refused.append({"pid": pid, "reason": "target_changed"})
-                    elif (pid == 1 or pid in mine or not p.visible
-                            or p.uid != os.getuid()):
-                        refused.append({"pid": pid, "reason": "protected"})
-                    elif owner is None or part.owners[owner].kind != "unknown":
-                        refused.append({"pid": pid, "reason": "attributed"})
-                    elif not still_selected(inv, pid):
-                        refused.append({"pid": pid, "reason": "target_changed"})
-                    else:
-                        chosen.append(pid)
-                if not chosen:
-                    out = outcome("refused" if refused else "already_exited",
-                                  refused[0]["reason"] if refused else None)
-                    out["refused"] = refused
-                    return out
-                # Targets nested inside another target are covered by it.
-                tset = set(chosen)
-                top = [t for t in chosen if not _has_ancestor_in(inv, t, tset)]
-                if dry_run:
-                    stop = set(part.root_owner) - tset
-                    would = sorted({d for t in top for d in [t] + inv.descendants(t, stop=stop)
-                                    if d not in mine and inv.procs[d].visible
-                                    and not inv.procs[d].zombie})
-                    out = outcome("would_stop", None, refused=refused)
-                    out["would_signal"] = [{"pid": d, "start": list(inv.procs[d].start),
-                                            "argv0": os.path.basename(
-                                                (inv.argv(d) or [inv.procs[d].comm])[0])}
-                                           for d in would]
-                    return out
-                out = self._graceful(inv, part, top, None, "reap", None, mine,
-                                     selected=tset)
-                if out.get("force_token") and selector:
-                    body = memmon_owners.decode_token(out["force_token"])
-                    out["force_token"] = memmon_owners.mint_token({**body, "selector": selector})
-                out["refused"] = refused
-                return out
+                return self._reap_once(targets, still_selected, selector, False)
         except Refused as r:
             return outcome("refused", r.reason)
         except Exception as exc:
             return outcome("error", f"{type(exc).__name__}: {exc}")
 
+    def _reap_once(self, targets, still_selected, selector, dry_run: bool) -> dict:
+        inv = memmon_procs.snapshot(self.source, clock=self.clock)
+        part = self.partition_fn(inv)
+        mine = self._self_tree()
+        chosen, refused = [], []
+        for item in targets:
+            pid, start = item if isinstance(item, (tuple, list)) else (item, None)
+            p = inv.procs.get(pid)
+            if p is None or p.zombie:
+                continue
+            owner = part.owner_of.get(pid)
+            if start is not None and (p.start is None or list(p.start) != list(start)):
+                refused.append({"pid": pid, "reason": "target_changed"})
+            elif (pid == 1 or pid in mine or not p.visible
+                    or p.uid != os.getuid()):
+                refused.append({"pid": pid, "reason": "protected"})
+            elif owner is None or part.owners[owner].kind != "unknown":
+                refused.append({"pid": pid, "reason": "attributed"})
+            elif not still_selected(inv, pid):
+                refused.append({"pid": pid, "reason": "target_changed"})
+            else:
+                chosen.append(pid)
+        if not chosen:
+            out = outcome("refused" if refused else "already_exited",
+                          refused[0]["reason"] if refused else None)
+            out["refused"] = refused
+            return out
+        # Targets nested inside another target are covered by it.
+        tset = set(chosen)
+        top = [t for t in chosen if not _has_ancestor_in(inv, t, tset)]
+        if dry_run:
+            _, captured, _, kept, _, _ = self._plan(inv, part, top, mine)
+            out = outcome("would_stop", None, refused=refused,
+                          kept=sorted(kept), measured_at=self.clock())
+            out["would_signal"] = [{"pid": d, "start": list(inv.procs[d].start),
+                                    "argv0": os.path.basename(
+                                        (inv.argv(d) or [inv.procs[d].comm])[0])}
+                                   for d in sorted(captured)]
+            return out
+        out = self._graceful(inv, part, top, None, "reap", None, mine, selected=tset)
+        if out.get("force_token") and selector:
+            body = memmon_owners.decode_token(out["force_token"])
+            out["force_token"] = memmon_owners.mint_token({**body, "selector": selector})
+        out["refused"] = refused
+        return out
+
     # -------------------------------------------------------- verify-app
 
     def _verify_app(self, body: dict) -> dict:
+        """Check every instance a quit-app token names. The answer carries a
+        fresh token for the next check (after the quit, or before a force
+        quit). On such a re-check an instance whose PID now holds another
+        process is reported exited: the one that was named is gone."""
+        recheck = bool(body.get("checked"))
         inv = memmon_procs.snapshot(self.source, clock=self.clock)
         mine = self._self_tree()
         part = self.partition_fn(inv)
@@ -602,6 +655,9 @@ class Engine:
                 rows.append({**inst, "status": "exited"})
                 continue
             if p.start is None or list(p.start) != list(inst.get("start") or []):
+                if recheck:
+                    rows.append({**inst, "status": "exited"})
+                    continue
                 raise Refused("instance_changed")
             if p.pid in mine or not p.visible or p.uid != os.getuid():
                 raise Refused("protected")
@@ -616,11 +672,16 @@ class Engine:
                 raise Refused("instance_changed")
             running += 1
             rows.append({**inst, "status": "running"})
+        now = self.clock()
+        token = memmon_owners.mint_token({
+            "v": 1, "action": "quit-app", "owner_id": body.get("owner_id"),
+            "bundle_id": body.get("bundle_id"), "instances": body.get("instances") or [],
+            "checked": True, "snapshot_ts": round(now, 3)})
         if not running:
-            return outcome("already_exited", None, instances=rows,
-                           measured_at=self.clock())
-        return outcome("verified", None, instances=rows,
-                       used_bytes_before=self._used(), measured_at=self.clock())
+            return outcome("already_exited", None, instances=rows, token=token,
+                           measured_at=now)
+        return outcome("verified", None, instances=rows, token=token,
+                       used_bytes_before=self._used(), measured_at=now)
 
 
 def _depth(inv, pid: int, top: int) -> int:

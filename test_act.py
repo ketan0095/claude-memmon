@@ -214,13 +214,56 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual((out["forceable"], out["observed"]), (1, 1))
         forced = self.run_act("force", out["force_token"])
         self.assertEqual((forced["result"], forced["reason"]), ("partial", "outside_force"))
-        self.assertEqual((forced["named"], forced["exited"]), (1, 1))
-        self.assertEqual([r["pid"] for r in forced["remaining"]], [30])
+        self.assertEqual((forced["named"], forced["exited"], forced["killed"]), (1, 1, 1))
+        self.assertEqual(forced["observed"], 1)
+        self.assertEqual([(r["pid"], r["role"], r["signalled"]) for r in forced["remaining"]],
+                         [(30, "observed", False)])
         self.assertNotIn((30, signal.SIGKILL), self.src.signals)
         self.assertNotIn("force_token", forced)
         text = memmon._stop_report(forced, "force")
-        self.assertIn("1 of 1 named survivor(s) gone after SIGKILL", text)
+        self.assertIn("1 of 1 named survivor(s) gone: 1 killed by SIGKILL, 0 had already "
+                      "exited", text)
+        self.assertIn("30  proc  (observed, never signalled)", text)
         self.assertNotIn("of 0", text)
+
+    def test_force_tells_killed_from_already_gone_and_kept_alive(self):
+        # Of three survivors: one is killed, one exits before force, one has
+        # since become a session (left alone). Only the left-alone one is
+        # remaining, as an unsignalled survivor.
+        self.src.ignore_term = {21, 22, 23}
+        self.src.table[23] = P(23, ppid=20, pgid=20)
+        out = self.run_act("stop-job", self.job_token())
+        self.assertEqual(out["forceable"], 3)
+        self.src.table.pop(22)
+        start = self.src.table[23].start
+        self.src.table[23] = P(23, ppid=1, pgid=23, start=start)
+        session_file(self.sessions, 23, start[0], job_id="0000dddd")
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual((forced["named"], forced["exited"], forced["killed"],
+                          forced["observed"]), (3, 2, 1, 0))
+        self.assertEqual([(r["pid"], r["role"], r["signalled"]) for r in forced["remaining"]],
+                         [(23, "survivor", False)])
+        text = memmon._stop_report(forced, "force")
+        self.assertIn("1 killed by SIGKILL, 1 had already exited", text)
+        self.assertNotIn("never signalled", text)
+
+    def test_observed_beyond_the_token_cap_keep_force_partial(self):
+        # 70 observed processes; the token lists 64. Even with all 64 gone,
+        # force cannot vouch for the other 6.
+        self.src.ignore_term = {21}
+        for pid in range(100, 170):
+            self.src.table[pid] = P(pid, ppid=1, pgid=20)
+        out = self.run_act("stop-job", self.job_token())
+        self.assertEqual(out["observed"], 70)
+        body = mo.decode_token(out["force_token"])
+        self.assertEqual((len(body["observed"]), body["observed_total"]), (ma.OBSERVED_CAP, 70))
+        for o in body["observed"]:
+            self.src.table.pop(o["pid"])
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual((forced["result"], forced["reason"]), ("partial", "outside_force"))
+        self.assertEqual((forced["observed"], forced["observed_unlisted"]), (0, 6))
+        self.assertIn("6 more still running that memmon could not list",
+                      memmon._stop_report(forced, "force"))
 
     def test_reused_parent_is_not_walked(self):
         # A captured parent whose PID now belongs to another process is not
@@ -275,22 +318,68 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual(self.run_act("stop-job", self.job_token(ts=T0 + 5 + 4))["result"],
                          "stopped")
 
+    def lease(self, wrapper=30, child=31):
+        row = {"id": "run1", "wrapper_pid": wrapper, "child_pid": child,
+               "child_start": list(self.src.table[child].start)}
+        self.eng.leases_fn = lambda: [row]
+        return row
+
     def test_runner_wrapper_guarding_a_kept_owner_is_not_signalled(self):
         # A `memmon run` wrapper killpg()s its child's group on SIGTERM;
-        # that group holds a nested session, so the wrapper is left alone.
+        # that group holds a nested session, so the wrapper is signalled only
+        # once its child is gone (it then exits without touching the group).
         self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
         self.src.table[31] = P(31, ppid=30, pgid=31)
         self.src.table[32] = P(32, ppid=31, pgid=31, start=(T0 + 32, 0))
         session_file(self.sessions, 32, T0 + 32, job_id="0000bbbb")
-        lease = {"id": "run1", "wrapper_pid": 30, "child_pid": 31,
-                 "child_start": list(self.src.table[31].start)}
-        self.eng.leases_fn = lambda: [lease]
+        self.lease()
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        order = [p for p, _ in self.src.signals]
+        self.assertNotIn(32, order)
+        self.assertLess(order.index(31), order.index(30))
+        self.assertEqual(out["kept"], ["claude:0000bbbb"])
+
+    def test_wrapper_is_never_signalled_while_its_child_runs(self):
+        # The child ignores SIGTERM, and a disowned session shares its group:
+        # the wrapper is never signalled, the session is never touched, and
+        # both the child and the wrapper are reported.
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31)
+        self.src.table[40] = P(40, ppid=1, pgid=31, start=(T0 + 40, 0))
+        session_file(self.sessions, 40, T0 + 40, job_id="0000cccc")
+        self.src.ignore_term = {31}
+        self.lease()
         out = self.run_act("end-session", tok("end-session", self.root, self.root))
         signalled = {p for p, _ in self.src.signals}
         self.assertNotIn(30, signalled)
-        self.assertNotIn(32, signalled)
-        self.assertIn(31, signalled)
+        self.assertNotIn(40, signalled)
+        rows = {r["pid"]: r for r in out["remaining"]}
+        self.assertTrue(rows[31]["forceable"])
+        self.assertFalse(rows[30]["forceable"])
+        self.assertNotIn(40, rows)
+
+    def test_kept_lease_child_wrapper_is_never_signalled(self):
+        # `memmon run -- claude` inside a session: the child is a nested
+        # session, kept, so its wrapper is never signalled at all.
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31, start=(T0 + 31, 0))
+        session_file(self.sessions, 31, T0 + 31, job_id="0000bbbb")
+        self.lease()
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        signalled = {p for p, _ in self.src.signals}
+        self.assertFalse(signalled & {30, 31})
         self.assertEqual(out["kept"], ["claude:0000bbbb"])
+
+    def test_unreadable_lease_child_holds_its_wrapper(self):
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31)
+        self.lease()
+        # The child became unreadable (its start can no longer be read).
+        self.src.table[31] = P(31, ppid=30, pgid=31, visible=False, uid=0)
+        self.src.table[31].start = None
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        self.assertNotEqual(out["result"], "error", out)
+        self.assertNotIn(30, {p for p, _ in self.src.signals})
 
     def test_kept_owner_that_exited_is_not_reported_kept(self):
         self.src.table[30] = P(30, ppid=21, pgid=30, start=(T0 + 30, 0))
@@ -311,6 +400,16 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual(self.src.signals, [])
         del self.src.table[21], self.src.table[22]
         self.assertEqual(self.run_act("stop-job", token)["result"], "already_exited")
+
+    def test_managed_job_root_gone_but_its_group_still_runs(self):
+        # The same for a `memmon run` child that exited before the stop.
+        token = tok("stop-managed-job", self.src.table[10], self.src.table[20],
+                    target_pgid=20, run_id="run1")
+        del self.src.table[20]
+        self.src.table[21].ppid = 1
+        out = self.run_act("stop-managed-job", token)
+        self.assertEqual((out["result"], out["reason"]), ("partial", "root_exited"))
+        self.assertEqual(self.src.signals, [])
 
     def test_unreadable_start_is_target_changed(self):
         # A reused PID now owned by another user reads no start time.
@@ -364,6 +463,49 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual(out["result"], "stopped", text)
         self.assertEqual(self.src.signals, [(60, signal.SIGTERM)])
 
+    def test_legacy_flags_exit_with_the_outcome(self):
+        # main() wires --reap/--reap-spares/--end-session with --apply to the
+        # outcome's exit code, and a dry run to 0.
+        partial, refused = ma.outcome("partial", "survivors"), ma.outcome("refused", "x")
+        cases = [(["--reap", "--apply"], "reap_report", partial, 3),
+                 (["--reap"], "reap_report", partial, 0),
+                 (["--reap-spares", "--apply"], "reap_spares_report", refused, 4),
+                 (["--end-session", "10", "--apply"], "end_session_report", refused, 4),
+                 (["--end-session", "10"], "end_session_report", refused, 0)]
+        for argv, fn, out, code in cases:
+            with mock.patch.object(sys, "argv", ["memmon", *argv]), \
+                    mock.patch.object(memmon, "collect", return_value={}), \
+                    mock.patch.object(memmon, fn, return_value=("text", out)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memmon.main(), code, argv)
+
+    def test_claimed_spare_survives_every_force_path(self):
+        # A stale spare survives the reap; before Force it is claimed (its
+        # claim socket is gone) but not yet attributed (its sessions record
+        # still says spare). Only reap's own force, with its selector, may
+        # act on a reap token, and it must leave the spare alone.
+        claim = os.path.join(self.state.root, "x.claim.sock")
+        open(claim, "w").close()
+        self.src.table[60] = P(60, start=(T0 - 5 * 3600, 0))
+        self.src._argv[60] = ["claude", "bg-spare", "--bg-spare", claim]
+        self.src.ignore_term = {60}
+        with open(os.path.join(self.sessions, "60.json"), "w") as fh:
+            json.dump({"pid": 60, "spare": True}, fh)
+        snap = {"overhead": {"items": [{"pid": 60, "mem": MB, "age": 5 * 3600,
+                                        "stale": True}]}}
+        _, out = memmon.reap_spares_report(snap, True, engine=self.eng)
+        self.assertEqual(out["result"], "partial", out)
+        token = out["force_token"]
+        os.remove(claim)                                   # claimed since
+        for argv in (["force", "--target", token], ["--force", token]):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.assertEqual(memmon.act_cli(argv, engine=self.eng), 4)
+            self.assertEqual(json.loads(buf.getvalue())["reason"], "wrong_action")
+        self.assertEqual(self.eng.force(token, origin="reap")["result"], "partial")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(memmon.reap_cli(["--force", token], engine=self.eng), 3)
+        self.assertNotIn(signal.SIGKILL, [s for _, s in self.src.signals])
+
     def test_reap_dry_run_matches_apply(self):
         # The dry run lists what --apply would signal (descendants too)
         # and what it would refuse, and signals nothing.
@@ -374,10 +516,44 @@ class FakeActTests(unittest.TestCase):
                              "tag": "vitest", "worktree": ""},
                             {"pid": 20, "mem": MB, "age": 7200, "orphaned": False,
                              "tag": "vitest", "worktree": ""}], "orphan_total": 2 * MB}
-        text, out = memmon.reap_report(snap, False, engine=self.eng)
+        self.src.table[82] = P(82, ppid=80, start=(T0 + 82, 0))     # a nested session
+        session_file(self.sessions, 82, T0 + 82, job_id="0000ffff")
+        # A dry run only reads: it works while another action holds the lock.
+        with ma.action_lock(memmon.ACTIONS_LOCK):
+            text, out = memmon.reap_report(snap, False, engine=self.eng)
         self.assertEqual(out["result"], "would_stop")
         self.assertEqual([r["pid"] for r in out["would_signal"]], [80, 81])
+        self.assertEqual(out["kept"], ["claude:0000ffff"])
         self.assertEqual(out["refused"], [{"pid": 20, "reason": "attributed"}])
+        self.assertIn("would keep running: claude:0000ffff", text)
+        self.assertIn("left alone: pid 20 (attributed)", text)
+        self.assertIn("dry run — re-run with --apply", text)
+        self.assertEqual(self.src.signals, [])
+        # Nothing it would stop: the refusals are listed, with no footer.
+        text, out = memmon.reap_report({**snap, "orphans": snap["orphans"][1:]}, False,
+                                       engine=self.eng)
+        self.assertEqual(out["result"], "refused")
+        self.assertIn("left alone: pid 20 (attributed)", text)
+        self.assertNotIn("re-run with --apply", text)
+
+    def test_reap_report_binds_the_identity_it_read(self):
+        # The identity read when the report starts is the one the engine
+        # checks: a PID reused after that read is refused, not signalled.
+        self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        real, reads = self.src.read, []
+
+        def read(pid):
+            reads.append(pid)
+            p = real(pid)
+            if pid == 80 and reads.count(80) == 1:      # right after the report's read
+                self.src.table[80] = P(80, start=(T0 - 3700, 9), comm="node")
+            return p
+        self.src.read = read
+        snap = {"orphans": [{"pid": 80, "mem": MB, "age": 7200, "orphaned": True,
+                             "tag": "vitest", "worktree": ""}], "orphan_total": MB}
+        text, out = memmon.reap_report(snap, True, engine=self.eng)
+        self.assertEqual(out["refused"], [{"pid": 80, "reason": "target_changed"}], text)
         self.assertEqual(self.src.signals, [])
 
     def test_reap_refuses_a_listed_pid_reused_since(self):
@@ -584,6 +760,8 @@ class RespawnTests(unittest.TestCase):
         out = self.eng.run("end-session", self.token)
         self.assertEqual(out["result"], "stopped")
         self.assertIn("roster unreadable", out["watch_error"])
+        self.assertIn("the respawn watch stopped early (OSError: roster unreadable)",
+                      memmon._stop_report(out, "end"))
 
     def test_respawn_idle_worker_settles_early(self):
         self.fixture(busy=False)
@@ -698,6 +876,34 @@ class VerifyAppTests(unittest.TestCase):
         self.assertEqual(self.eng.run("verify-app", self.token(bundle_id="com.other"))
                          ["reason"], "instance_changed")
 
+    def test_verify_app_hands_out_a_fresh_token_for_the_recheck(self):
+        # Each answer carries a token minted now; on that re-check a reused
+        # PID means the named instance exited, not that the call is refused.
+        owners_token = self.token()
+        first = self.eng.run("verify-app", owners_token)
+        body = mo.decode_token(first["token"])
+        self.assertEqual((body["action"], body["checked"], body["snapshot_ts"]),
+                         ("quit-app", True, T0 + 1))
+        self.assertEqual(body["instances"], mo.decode_token(owners_token)["instances"])
+        self.src.table[70] = P(70, start=(T0 + 70, 70))           # quit, PID reused
+        again = self.eng.run("verify-app", first["token"])
+        self.assertEqual(again["result"], "verified", again)
+        self.assertEqual([i["status"] for i in again["instances"]], ["running", "exited"])
+        self.assertIn("token", again)
+        self.src.table.pop(60)
+        last = self.eng.run("verify-app", again["token"])
+        self.assertEqual((last["result"], [i["status"] for i in last["instances"]]),
+                         ("already_exited", ["exited", "exited"]))
+        # The first check still refuses a changed instance outright.
+        self.src.table[60] = P(60, start=(T0 + 60, 60))
+        self.assertEqual(self.eng.run("verify-app", owners_token)["reason"], "instance_changed")
+
+    def test_verify_app_unreadable_start_is_instance_changed(self):
+        token = self.token()
+        self.src.table[70] = P(70, visible=False, uid=0)
+        self.src.table[70].start = None
+        self.assertEqual(self.eng.run("verify-app", token)["reason"], "instance_changed")
+
     def test_verify_app_refuses_a_helper_as_an_instance(self):
         helper = os.path.join(self.state.root, "Applications", "Brave Browser.app",
                               "Contents", "Frameworks", "Brave Helper.app", "Contents",
@@ -749,7 +955,11 @@ class PolicyTests(unittest.TestCase):
         boom.assert_not_called()
 
 
-SIGNAL_SITE = re.compile(r"\bos\.kill\s*\(|\bkillpg\s*\(|(^|[;&|\s])kill\s+-")
+SIGNAL_SITE = re.compile(
+    r"\bos\.kill\s*\(|\bkillpg\s*\(|\bself\.kill\s*\(|\.kill\s*\(|\.terminate\s*\("
+    r"|\bsend_signal\s*\(|\bpthread_kill\s*\(|(?<![\"'])\b(?:pkill|killall)\b(?![\"'])"
+    r"|\[\s*[\"']kill[\"']|(^|[;&|\s])kill\s+-")
+BAR = 'pkill {}-f "MemmonBar.app/Contents/MacOS/MemmonBar" 2>/dev/null || true'
 
 
 class SignalSiteTests(unittest.TestCase):
@@ -760,12 +970,12 @@ class SignalSiteTests(unittest.TestCase):
                 self.assertNotRegex(fh.read(), r"killpg\s*\(", name)
 
     def test_only_known_code_sends_signals(self):
-        # Every shipped .py/.sh signal site: the engine signals through its
-        # injected `kill`; the runner's _stop is the one group signal, aimed
-        # at its own child (the runner's own exception). Tests signal only what
-        # they spawned and are excluded here.
+        # Every shipped .py/.sh signal site, exactly: the engine's _signal
+        # (through its injected kill), the runner's _stop (its own child's
+        # group) and install.sh stopping the menu bar app it installs. Tests
+        # signal only what they spawned and are excluded here.
         from test_owners import tracked_files
-        hits = []
+        hits = set()
         for path in tracked_files(self):
             name = os.path.basename(path)
             if not name.endswith((".py", ".sh")) or name.startswith("test") or \
@@ -774,14 +984,32 @@ class SignalSiteTests(unittest.TestCase):
             with open(path) as fh:
                 lines = fh.read().splitlines()
             func = None
-            for n, line in enumerate(lines, 1):
+            for line in lines:
                 m = re.match(r"\s*def (\w+)", line)
                 if m:
                     func = m.group(1)
                 if SIGNAL_SITE.search(line.split("#")[0]):
-                    hits.append((name, func))
-        self.assertTrue(hits)
-        self.assertEqual({h for h in hits if h != ("memmon_runner.py", "_stop")}, set())
+                    hits.add((name, func if name.endswith(".py") else line.strip()))
+        self.assertEqual(hits, {("memmon_act.py", "_signal"), ("memmon_runner.py", "_stop"),
+                                ("install.sh", BAR.format("")), ("install.sh", BAR.format("-9 "))})
+
+    def test_timing_constants_match_the_menu_bar(self):
+        # The menu bar waits actTimeout for an act call that the engine keeps
+        # under ACT_BUDGET_S, and expires a Force offer when the token does.
+        with open(os.path.join(HERE, "MemmonBar.swift")) as fh:
+            swift = fh.read()
+        num = lambda name: float(re.search(rf"static (?:var|let) {name} = ([0-9.]+)",
+                                           swift).group(1))
+        self.assertLess(ma.ACT_BUDGET_S, num("actTimeout"))
+        self.assertEqual(ma.TOKEN_TTL_S, num("forceTTL"))
+
+    def test_signal_site_pattern_catches_every_spelling(self):
+        for line in ("os.kill(p, 9)", "os.killpg(g, 15)", "self.kill(pid, sig)",
+                     "proc.kill()", "proc.terminate()", "p.send_signal(15)",
+                     "signal.pthread_kill(t, 15)", "pkill -f x", "killall Dock",
+                     'subprocess.run(["kill", "-9", pid])', "kill -TERM $pid"):
+            self.assertRegex(line, SIGNAL_SITE)
+        self.assertNotRegex('words = {"kill", "pgrep", "pkill"}', SIGNAL_SITE)
 
 
 # ------------------------------------------------------- real processes
@@ -1037,7 +1265,7 @@ class RealProcessTests(unittest.TestCase):
         self.reg.spawn(ORPHAN).wait(timeout=10)                 # appears in between
         self.reg.wait_notes(2)
         late = [p for t, p, _ in self.reg.read_notes() if t == "orphan" and p != orphan][0]
-        out = self.eng.force(force, origin="reap")
+        out = self.eng.force(force, origin="reap", still_selected=memmon._orphan_still_selected)
         self.assertEqual(out["result"], "force_stopped", out)
         self.assertFalse(self.reg.alive(orphan))
         self.assertTrue(self.reg.alive(late))

@@ -1874,7 +1874,9 @@ def _stop_report(out: dict, what: str) -> str:
     """Plain-text account of an engine outcome for the legacy commands."""
     r = out.get("result")
     if r == "refused":
-        return f"refused: {out.get('reason')}"
+        return "\n".join([f"refused: {out.get('reason')}"]
+                         + [f"left alone: pid {row['pid']} ({row['reason']})"
+                            for row in out.get("refused") or []])
     if r == "error":
         return f"error: {out.get('reason')}"
     if r == "already_exited":
@@ -1882,9 +1884,12 @@ def _stop_report(out: dict, what: str) -> str:
     if r == "would_stop":
         L = [f"{what}: would send SIGTERM to {len(out['would_signal'])} process(es):"]
         L += [f"  {row['pid']:>7}  {row['argv0']}" for row in out["would_signal"]]
+        L += [f"would keep running: {row}" for row in out.get("kept") or []]
+        out = {**out, "kept": []}
     elif "named" in out:                     # a force result
-        L = [f"{what}: {r} — {out.get('exited', 0)} of {out['named']} named "
-             f"survivor(s) gone after SIGKILL"]
+        gone, killed = out.get("exited", 0), out.get("killed", 0)
+        L = [f"{what}: {r} — {gone} of {out['named']} named survivor(s) gone: "
+             f"{killed} killed by SIGKILL, {gone - killed} had already exited"]
     elif out.get("reason") == "root_exited":
         L = [f"{what}: the job had already exited, but processes it started are "
              "still running in its group (nothing was signalled)"]
@@ -1903,8 +1908,16 @@ def _stop_report(out: dict, what: str) -> str:
     if out.get("remaining"):
         L.append(f"{len(out['remaining'])} still running:")
         for row in out["remaining"]:
-            note = "" if row.get("forceable") else "  (observed, never signalled)"
+            note = ""
+            if not row.get("signalled", row.get("forceable")):
+                note = ("  (not force-killed: no longer safe to)" if row.get("role") == "survivor"
+                        else "  (observed, never signalled)")
             L.append(f"  {row['pid']:>7}  {row['argv0']}{note}")
+    if out.get("observed_unlisted"):
+        L.append(f"{out['observed_unlisted']} more still running that memmon could not list")
+    if out.get("watch_error"):
+        L.append(f"the respawn watch stopped early ({out['watch_error']}); a daemon "
+                 "restart after this point would not be reported")
     if out.get("reason") == "outside_force":
         L.append("Force only touches the survivors the stop signalled; the rest "
                  "were observed in the group and are left alone.")
@@ -1924,8 +1937,11 @@ SELECTORS = {"orphan": lambda inv, pid: _orphan_still_selected(inv, pid),
 
 def _reap_run(pids: list, selector: str, what: str, apply: bool, engine=None) -> tuple:
     """Run the reap selection through the engine: a dry run reports what
-    --apply would signal and refuse; --apply stops at partial. Targets carry
-    the identity they had when listed, so a reused PID is refused."""
+    --apply would signal and refuse; --apply stops at partial. The listing
+    comes from ps and has no start time, so each target's identity is read
+    here, once, and the engine refuses a PID that holds another process by
+    the time it looks; a PID reused before this read is caught only by the
+    selector, which the engine re-applies too."""
     eng = engine or _engine()
     ids = []
     for pid in pids:
@@ -1959,7 +1975,7 @@ def reap_spares_report(snap: dict, apply: bool, engine=None) -> tuple:
     L.append(f"{len(stale)} idle prewarm procs · {human(total)} reclaimable")
     text, out = _reap_run([i["pid"] for i in stale], "spare", "prewarm reap", apply, engine)
     L.append(text)
-    if not apply:
+    if not apply and out.get("result") == "would_stop":
         L.append("dry run — re-run with --apply to stop these.")
     return "\n".join(L), out
 
@@ -1980,7 +1996,7 @@ def reap_report(snap: dict, apply: bool, engine=None) -> tuple:
     L.append(f"total reclaimable: {human(snap['orphan_total'])}")
     text, out = _reap_run([o["pid"] for o in targets], "orphan", "reap", apply, engine)
     L.append(text)
-    if not apply:
+    if not apply and out.get("result") == "would_stop":
         L.append("dry run — re-run with --apply to stop these.")
     return "\n".join(L), out
 
