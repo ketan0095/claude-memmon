@@ -185,6 +185,7 @@ def fake_engine(source, ctx, lock_path, **kw):
     kw.setdefault("force_wait_s", 0.2)
     kw.setdefault("sleep", lambda s: None)
     kw.setdefault("system_reader", lambda: {"used_bytes": 10 * MB})
+    kw.setdefault("root_rule_fn", lambda inv, pids: memmon_owners.fresh_roots(inv, pids, ctx))
     return memmon_act.Engine(source=source, kill=source.kill,
                              partition_fn=lambda inv: memmon_owners.partition(inv, ctx),
                              lock_path=lock_path, **kw)
@@ -193,9 +194,17 @@ def fake_engine(source, ctx, lock_path, **kw):
 # ------------------------------------------------------- real processes
 
 SLEEP = "import time; time.sleep(120)"
-NOTE = ("import os,sys\n"
-        "def note(tag):\n"
-        "    with open(sys.argv[1], 'a') as fh: fh.write(f'{tag} {os.getpid()}\\n')\n")
+# Every synthetic process records its own identity, read by itself, so the
+# registry never adopts whatever process happens to hold a PID later. The
+# helper reaches grandchildren through the environment.
+NOTE_SRC = ("import os, sys\n"
+            "sys.path.insert(0, os.environ['MEMMON_TEST_REPO'])\n"
+            "import memmon_procs\n"
+            "def note(tag):\n"
+            "    s = memmon_procs.default_source().read(os.getpid()).start\n"
+            "    with open(sys.argv[1], 'a') as fh:\n"
+            "        fh.write(f'{tag} {os.getpid()} {s[0]} {s[1]}\\n')\n")
+NOTE = "import os\nexec(os.environ['MEMMON_NOTE'])\n"
 
 
 class Registry:
@@ -211,16 +220,24 @@ class Registry:
         self.notes = os.path.join(self.dir, "pids.txt")
 
     def spawn(self, code, *args, **kw):
+        env = dict(os.environ, MEMMON_NOTE=NOTE_SRC,
+                   MEMMON_TEST_REPO=os.path.dirname(os.path.abspath(__file__)))
         proc = subprocess.Popen([PY, "-c", code, self.notes, *args],
-                                stdin=subprocess.DEVNULL, **kw)
+                                stdin=subprocess.DEVNULL, env=env, **kw)
         self.popens.append(proc)
-        self.register(proc.pid)
+        self.register(proc.pid)       # our unreaped child: its PID cannot be reused
         return proc
 
-    def register(self, pid):
-        p = self.src.read(pid)
-        if p is not None and p.start:
-            self.ids[pid] = p.start
+    def register(self, pid, start=None):
+        """Record an identity once. Without `start` the PID must be our own
+        unreaped child; anything else brings the start it recorded itself."""
+        if pid in self.ids:
+            return pid
+        if start is None:
+            p = self.src.read(pid)
+            start = p.start if p is not None else None
+        if start:
+            self.ids[pid] = tuple(start)
         return pid
 
     def wait_notes(self, count, timeout=10):
@@ -229,16 +246,17 @@ class Registry:
         while time.monotonic() < deadline:
             rows = self.read_notes()
             if len(rows) >= count:
-                for _, pid in rows:
-                    self.register(pid)
-                return {tag: pid for tag, pid in rows}
+                for _, pid, start in rows:
+                    self.register(pid, start)
+                return {tag: pid for tag, pid, _ in rows}
             time.sleep(0.02)
         raise AssertionError(f"only {len(self.read_notes())} of {count} processes started")
 
     def read_notes(self):
         try:
             with open(self.notes) as fh:
-                return [(t, int(p)) for t, p in (line.split() for line in fh if line.strip())]
+                return [(t, int(p), (int(sec), int(usec)))
+                        for t, p, sec, usec in (line.split() for line in fh if line.strip())]
         except FileNotFoundError:
             return []
 
@@ -250,8 +268,7 @@ class Registry:
         return self.identity(pid) == tuple(self.ids[pid])
 
     def _covered(self, pid):
-        if pid in self.ids:
-            return True
+        """A registered identity, or a live descendant of one."""
         cur, seen = self.src.read(pid), set()
         while cur is not None and cur.pid not in seen and cur.pid > 1:
             if cur.pid in self.ids and tuple(cur.start) == tuple(self.ids[cur.pid]):
@@ -270,6 +287,7 @@ class Registry:
         kw.setdefault("poll_s", 0.05)
         kw.setdefault("force_wait_s", 2.0)
         kw.setdefault("system_reader", memmon_procs.read_system_strict)
+        kw.setdefault("root_rule_fn", lambda inv, pids: memmon_owners.fresh_roots(inv, pids, ctx))
         eng = GuardedEngine(source=self.src, kill=self.guarded_kill,
                             partition_fn=lambda inv: memmon_owners.partition(inv, ctx),
                             lock_path=lock_path, **kw)
@@ -314,16 +332,20 @@ class GuardedEngine(memmon_act.Engine):
 
     def run(self, action, token, lock_fd=None, origin=None):
         body = memmon_owners.decode_token(token)
+        reg = self.registry
         if action == "force":
             for s in body.get("survivors") or []:
-                assert self.registry._covered(s["pid"]), s
+                assert (reg.ids.get(s["pid"]) == tuple(s["start"])
+                        or reg._covered(s["pid"])), s
         else:
             for key in ("owner_root", "target"):
-                pid = (body.get(key) or {}).get("pid")
-                assert pid in self.registry.ids, f"{key} {pid} is not a registered pid"
+                who = body.get(key) or {}
+                assert reg.ids.get(who.get("pid")) == tuple(who.get("start") or ()), \
+                    f"{key} {who} is not a registered identity"
         return super().run(action, token, lock_fd=lock_fd, origin=origin)
 
-    def reap(self, pids, still_selected):
-        for pid in pids:
+    def reap(self, targets, still_selected, selector=None, dry_run=False):
+        for item in targets:
+            pid = item[0] if isinstance(item, (tuple, list)) else item
             assert pid in self.registry.ids, f"reap target {pid} is not registered"
-        return super().reap(pids, still_selected)
+        return super().reap(targets, still_selected, selector, dry_run)

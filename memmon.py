@@ -1633,8 +1633,8 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
                      + col(human(o["mem"]).rjust(7), "red", on)
                      + f" {dur(o['age']):>7}  {o['pid']:>7}  "
                      + col(clip(why, max(10, w - 62)), "grey", on))
-        L.append(col("  → memmon --reap           preview the kill list", "grey", on))
-        L.append(col("  → memmon --reap --apply   free it now", "grey", on))
+        L.append(col("  → memmon --reap           preview what would be stopped", "grey", on))
+        L.append(col("  → memmon --reap --apply   SIGTERM them; anything left is reported", "grey", on))
         L.append("")
 
     # ---- build work rolled up by worktree
@@ -1883,8 +1883,18 @@ def _stop_report(out: dict, what: str) -> str:
         return f"error: {out.get('reason')}"
     if r == "already_exited":
         return f"{what}: already exited — nothing was signalled"
-    L = [f"{what}: {r} — {out.get('exited', 0)} of {out.get('captured', 0)} "
-         f"process(es) exited after SIGTERM"]
+    if r == "would_stop":
+        L = [f"{what}: would send SIGTERM to {len(out['would_signal'])} process(es):"]
+        L += [f"  {row['pid']:>7}  {row['argv0']}" for row in out["would_signal"]]
+    elif "named" in out:                     # a force result
+        L = [f"{what}: {r} — {out.get('exited', 0)} of {out['named']} named "
+             f"survivor(s) gone after SIGKILL"]
+    elif out.get("reason") == "root_exited":
+        L = [f"{what}: the job had already exited, but processes it started are "
+             "still running in its group (nothing was signalled)"]
+    else:
+        L = [f"{what}: {r} — {out.get('exited', 0)} of {out.get('captured', 0)} "
+             f"process(es) exited after SIGTERM"]
     before, after = out.get("used_bytes_before"), out.get("used_bytes_after")
     if before is not None and after is not None:
         delta = before - after
@@ -1897,22 +1907,42 @@ def _stop_report(out: dict, what: str) -> str:
     if out.get("remaining"):
         L.append(f"{len(out['remaining'])} still running:")
         for row in out["remaining"]:
-            L.append(f"  {row['pid']:>7}  {row['argv0']}")
+            note = "" if row.get("forceable") else "  (observed, never signalled)"
+            L.append(f"  {row['pid']:>7}  {row['argv0']}{note}")
+    if out.get("reason") == "outside_force":
+        L.append("Force only touches the survivors the stop signalled; the rest "
+                 "were observed in the group and are left alone.")
     return "\n".join(L)
 
 
-def _reap_apply(pids: list, selector, what: str, engine=None) -> tuple:
+def _force_hint(out: dict, command: str) -> str:
+    import memmon_act
+    return (f"\nNothing was force-killed. To force the {out.get('forceable', 0)} captured "
+            f"survivor(s) (the token expires in {memmon_act.TOKEN_TTL_S} s):\n"
+            f"  {command} {out['force_token']}")
+
+
+SELECTORS = {"orphan": lambda inv, pid: _orphan_still_selected(inv, pid),
+             "spare": lambda inv, pid: _spare_still_selected(inv, pid)}
+
+
+def _reap_run(pids: list, selector: str, what: str, apply: bool, engine=None) -> tuple:
+    """Run the reap selection through the engine: a dry run reports what
+    --apply would signal and refuse; --apply stops at partial. Targets carry
+    the identity they had when listed, so a reused PID is refused."""
     eng = engine or _engine()
-    out = eng.reap(pids, selector)
+    ids = []
+    for pid in pids:
+        p = eng.source.read(pid)
+        ids.append((pid, list(p.start)) if p is not None and p.start else (pid, None))
+    out = eng.reap(ids, SELECTORS[selector], selector, dry_run=not apply)
     text = _stop_report(out, what)
     if out.get("force_token"):
-        text += ("\nNothing was force-killed. To force exactly these (the token "
-                 "expires in 120 s):\n"
-                 f"  memmon reap --force {out['force_token']}")
+        text += _force_hint(out, "memmon reap --force")
     return text, out
 
 
-def reap_spares(snap: dict, apply: bool, engine=None) -> str:
+def reap_spares_report(snap: dict, apply: bool, engine=None) -> tuple:
     """Idle prewarm processes older than 4h. The daemon keeps a warm pool and is
     meant to recycle it; when it doesn't, these just hold memory. Stopping one is
     safe — the pool respawns on demand — so only the stale ones are targeted."""
@@ -1924,29 +1954,27 @@ def reap_spares(snap: dict, apply: bool, engine=None) -> str:
         return (f"No stale prewarms. Idle pool: {ov.get('spares', 0)} spares, "
                 f"{human(ov.get('spare_mem', 0))}, oldest {dur(oldest)}.\n"
                 f"{ov.get('claimed', 0)} claimed session(s) holding "
-                f"{human(ov.get('claimed_mem', 0))} are working and excluded.")
+                f"{human(ov.get('claimed_mem', 0))} are working and excluded."), None
     L = [f"{'PID':>7}  {'MEM':>7} {'IDLE':>7}"]
     for i in sorted(stale, key=lambda x: -x["mem"]):
         L.append(f"{i['pid']:>7}  {human(i['mem']):>7} {dur(i['age']):>7}")
     total = sum(i["mem"] for i in stale)
     L.append("")
     L.append(f"{len(stale)} idle prewarm procs · {human(total)} reclaimable")
+    text, out = _reap_run([i["pid"] for i in stale], "spare", "prewarm reap", apply, engine)
+    L.append(text)
     if not apply:
         L.append("dry run — re-run with --apply to stop these.")
-        return "\n".join(L)
-    text, _ = _reap_apply([i["pid"] for i in stale], _spare_still_selected,
-                          "prewarm reap", engine)
-    L.append(text)
-    return "\n".join(L)
+    return "\n".join(L), out
 
 
-def reap(snap: dict, apply: bool, engine=None) -> str:
+def reap_report(snap: dict, apply: bool, engine=None) -> tuple:
     """Orphaned or stale build processes. --apply sends SIGTERM, identity-checked
     per PID, and stops at a partial result: anything still running is listed
     with a `memmon reap --force` token that names exactly those processes."""
     targets = snap["orphans"]
     if not targets:
-        return "Nothing to reap — no orphaned or stale build processes."
+        return "Nothing to reap — no orphaned or stale build processes.", None
     L = [f"{'PID':>7}  {'MEM':>7} {'AGE':>7}  WHAT"]
     for o in targets:
         L.append(f"{o['pid']:>7}  {human(o['mem']):>7} {dur(o['age']):>7}  "
@@ -1954,13 +1982,24 @@ def reap(snap: dict, apply: bool, engine=None) -> str:
                  + ("  [orphan]" if o["orphaned"] else "  [stale]"))
     L.append("")
     L.append(f"total reclaimable: {human(snap['orphan_total'])}")
+    text, out = _reap_run([o["pid"] for o in targets], "orphan", "reap", apply, engine)
+    L.append(text)
     if not apply:
         L.append("dry run — re-run with --apply to stop these.")
-        return "\n".join(L)
-    text, _ = _reap_apply([o["pid"] for o in targets], _orphan_still_selected,
-                          "reap", engine)
-    L.append(text)
-    return "\n".join(L)
+    return "\n".join(L), out
+
+
+def reap(snap: dict, apply: bool, engine=None) -> str:
+    return reap_report(snap, apply, engine)[0]
+
+
+def reap_spares(snap: dict, apply: bool, engine=None) -> str:
+    return reap_spares_report(snap, apply, engine)[0]
+
+
+def _apply_exit(out, apply: bool) -> int:
+    import memmon_act
+    return memmon_act.exit_code(out) if apply and out is not None else 0
 
 
 # -------------------------------------------------------------------- the gate
@@ -2458,11 +2497,16 @@ def gate() -> int:
 
 
 def end_session(pid: int, apply: bool, engine=None) -> str:
+    return end_session_report(pid, apply, engine)[0]
+
+
+def end_session_report(pid: int, apply: bool, engine=None) -> tuple:
     """End a Claude session (or a codex exec) by hand, tree and all.
 
     Refuses any pid that is not currently such an owner's ROOT — the caller
     passes a number, and a stale or mistyped one must never reach a process.
     SIGTERM only, identity-checked per PID; nested owners are kept."""
+    import memmon_act
     import memmon_owners
     import memmon_procs
     eng = engine or _engine()
@@ -2470,16 +2514,16 @@ def end_session(pid: int, apply: bool, engine=None) -> str:
     part = eng.partition_fn(inv)
     oid = part.root_owner.get(pid)
     owner = part.owners.get(oid) if oid else None
-    if owner is None or owner.kind not in ("claude", "codex"):
+    if owner is None or owner.kind not in memmon_owners.ENDABLE_KINDS:
         live = ", ".join(f"{o.owner_id}={o.root}" for o in part.owners.values()
-                         if o.kind in ("claude", "codex"))
+                         if o.kind in memmon_owners.ENDABLE_KINDS)
         return (f"refused: pid {pid} is not a live session root.\n"
-                f"live sessions: {live or 'none'}")
+                f"live sessions: {live or 'none'}"), memmon_act.outcome("refused", "not_stoppable")
     fp = sum(inv.procs[p].footprint or 0 for p in owner.members)
     if not apply:
         return (f"would end {owner.owner_id} — {human(fp)} across "
                 f"{len(owner.members)} process(es), root pid {pid}\n"
-                f"re-run with --apply to do it.")
+                f"re-run with --apply to do it."), None
     root = inv.procs[pid]
     token = memmon_owners.mint_token({
         "v": 1, "action": "end-session", "owner_id": oid,
@@ -2488,17 +2532,8 @@ def end_session(pid: int, apply: bool, engine=None) -> str:
     out = eng.run("end-session", token)
     text = _stop_report(out, f"end {oid}")
     if out.get("force_token"):
-        text += ("\nNothing was force-killed. To force exactly these:\n"
-                 f"  memmon act force --target {out['force_token']}")
-    return text
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
+        text += _force_hint(out, "memmon act force --target")
+    return text, out
 
 
 def wait_safe(timeout: int) -> int:
@@ -2547,7 +2582,9 @@ def _engine(**kw):
     kw.setdefault("source", memmon_procs.default_source())
     kw.setdefault("partition_fn", lambda inv: memmon_owners.partition(
         inv, _owners_ctx(titles=False)))
-    kw.setdefault("respawn", memmon_owners.RespawnWatch(_owners_ctx(titles=False)))
+    ctx = _owners_ctx(titles=False)
+    kw.setdefault("respawn", memmon_owners.RespawnWatch(ctx))
+    kw.setdefault("root_rule_fn", lambda inv, pids: memmon_owners.fresh_roots(inv, pids, ctx))
     kw.setdefault("lock_path", ACTIONS_LOCK)
     kw.setdefault("system_reader", memmon_procs.read_system_strict)
     kw.setdefault("leases_fn", lambda: jobs(STATE_DIR))
@@ -2763,21 +2800,30 @@ def act_cli(argv: list, engine=None) -> int:
     the exit code is 0 done, 3 partial, 4 refused, 1 error."""
     import argparse
     import memmon_act
-    ap = argparse.ArgumentParser(prog="memmon act")
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):
+            raise ValueError(message)
+    ap = Parser(prog="memmon act")
     ap.add_argument("action", nargs="?", choices=(
-        "stop-job", "stop-server", "stop-managed-job", "end-session",
-        "verify-app", "force"))
+        *memmon_act.PROCESS_ACTIONS, *memmon_act.TOKEN_ACTION))
     ap.add_argument("--target", help="token from `memmon owners --json`")
     ap.add_argument("--force", metavar="FORCE_TOKEN",
                     help="SIGKILL the survivors a partial result named")
     ap.add_argument("--lock-fd", type=int, help="inherited actions.lock descriptor")
-    args = ap.parse_args(argv)
-    if args.force:
-        action, token = "force", args.force
-    else:
-        action, token = args.action, args.target
-    if not action or not token:
-        ap.error("give an action and --target TOKEN, or --force FORCE_TOKEN")
+    try:
+        args = ap.parse_args(argv)
+        action, token = (("force", args.force) if args.force
+                         else (args.action, args.target))
+        if not action or not token:
+            raise ValueError("give an action and --target TOKEN, or --force FORCE_TOKEN")
+    except (ValueError, SystemExit) as exc:
+        if isinstance(exc, SystemExit) and not exc.code:
+            raise                                   # --help
+        out = memmon_act.outcome("refused", "bad_args")
+        out["detail"] = str(exc)
+        print(json.dumps(out))
+        return memmon_act.exit_code(out)
     try:
         out = (engine or _engine()).run(action, token, lock_fd=args.lock_fd)
     except Exception as exc:
@@ -2798,12 +2844,19 @@ def reap_cli(argv: list, engine=None) -> int:
                     help="idle claude prewarms older than 4h instead of orphans")
     args = ap.parse_args(argv)
     if args.force:
-        out = (engine or _engine()).force(args.force, origin="reap")
+        import memmon_owners
+        try:
+            selector = memmon_owners.decode_token(args.force).get("selector")
+        except ValueError:
+            selector = None
+        out = (engine or _engine()).force(args.force, origin="reap",
+                                          still_selected=SELECTORS.get(selector))
         print(_stop_report(out, "force"))
         return memmon_act.exit_code(out)
     snap = collect()
-    print((reap_spares if args.spares else reap)(snap, args.apply, engine))
-    return 0
+    text, out = (reap_spares_report if args.spares else reap_report)(snap, args.apply, engine)
+    print(text)
+    return _apply_exit(out, args.apply)
 
 
 # ---------------------------------------------------------------------- main
@@ -2864,8 +2917,9 @@ def main() -> int:
     if args.gate:
         return gate()
     if args.end_session:
-        print(end_session(args.end_session, args.apply))
-        return 0
+        text, out = end_session_report(args.end_session, args.apply)
+        print(text)
+        return _apply_exit(out, args.apply)
     if args.off is not None:
         until = "forever"
         if args.off != "forever":
@@ -3042,12 +3096,10 @@ def main() -> int:
             print(f"owners sample failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
         return 0
-    if args.reap:
-        print(reap(snap, args.apply))
-        return 0
-    if args.reap_spares:
-        print(reap_spares(snap, args.apply))
-        return 0
+    if args.reap or args.reap_spares:
+        text, out = (reap_report if args.reap else reap_spares_report)(snap, args.apply)
+        print(text)
+        return _apply_exit(out, args.apply)
     if args.once:
         print(render(snap, color))
         return 0

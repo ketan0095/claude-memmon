@@ -1,10 +1,13 @@
-"""Action engine tests (I-1 to I-4, I-6). Rows marked real spawn bounded
+"""Action engine tests: identity, protection, graceful-first and force. Rows marked real spawn bounded
 synthetic sleepers and signal nothing else: every engine here is either fed
 an injected process table, or is a GuardedEngine whose kill function refuses
 any PID the test did not spawn."""
 
+import contextlib
 import fcntl
+import io
 import json
+import re
 import os
 import plistlib
 import signal
@@ -107,7 +110,7 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual(self.src.signals, [])
 
     def test_act_identity_reread_before_every_signal(self):
-        # I-1: a member replaced between capture and its signal is not signalled.
+        # A member replaced between capture and its signal is not signalled.
         def swap(captured):
             self.src.table[21] = P(21, ppid=20, pgid=20, start=(T0 + 777, 7))
         self.eng.after_capture = swap
@@ -175,7 +178,6 @@ class FakeActTests(unittest.TestCase):
         self.assertIn(31, self.src.table)
 
     def test_act_force_only_after_partial(self):
-        # I-4
         self.src.ignore_term = {21}
         job = self.job_token()
         out = self.run_act("stop-job", job)
@@ -200,6 +202,216 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual(forced["result"], "force_stopped")
         late = fake_engine(self.src, self.ctx, memmon.ACTIONS_LOCK, clock=lambda: T0 + 500)
         self.assertEqual(late.run("force", out["force_token"])["reason"], "stale_token")
+
+    def test_force_counts_only_what_it_signalled(self):
+        # An observed group member is reported, never forced, and keeps
+        # force from claiming success.
+        self.src.ignore_term = {21}
+        self.src.table[30] = P(30, ppid=1, pgid=20)          # outside the lineage
+        out = self.run_act("stop-job", self.job_token())
+        rows = {r["pid"]: r["forceable"] for r in out["remaining"]}
+        self.assertEqual(rows, {21: True, 30: False})
+        self.assertEqual((out["forceable"], out["observed"]), (1, 1))
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual((forced["result"], forced["reason"]), ("partial", "outside_force"))
+        self.assertEqual((forced["named"], forced["exited"]), (1, 1))
+        self.assertEqual([r["pid"] for r in forced["remaining"]], [30])
+        self.assertNotIn((30, signal.SIGKILL), self.src.signals)
+        self.assertNotIn("force_token", forced)
+        text = memmon._stop_report(forced, "force")
+        self.assertIn("1 of 1 named survivor(s) gone after SIGKILL", text)
+        self.assertNotIn("of 0", text)
+
+    def test_reused_parent_is_not_walked(self):
+        # A captured parent whose PID now belongs to another process is not
+        # a parent any more; its children are not ours.
+        original = self.eng._alive
+        self.eng._alive = lambda pid, start: pid == 21 or original(pid, start)
+
+        def swap(captured):
+            self.src.table[21] = P(21, ppid=1, pgid=21, start=(T0 + 777, 7))
+            self.src.table[77] = P(77, ppid=21, pgid=21)
+        self.eng.after_capture = swap
+        self.run_act("stop-job", self.job_token())
+        self.assertNotIn(77, [p for p, _ in self.src.signals])
+
+    def test_owner_appearing_during_grace_is_kept(self):
+        # A session root started under the job mid-stop is another owner.
+        self.src.ignore_term = {21}
+
+        def spawn(pid, sig):
+            if pid == 22:
+                self.src.table[25] = P(25, ppid=21, pgid=25, start=(T0 + 25, 0))
+                session_file(self.sessions, 25, T0 + 25, job_id="0000cccc")
+        self.src.on_kill = spawn
+        out = self.run_act("stop-job", self.job_token())
+        self.assertNotIn(25, [p for p, _ in self.src.signals])
+        self.assertIn("claude:0000cccc", out["kept"])
+        self.assertNotIn(25, [r["pid"] for r in out["remaining"]])
+
+    def test_force_skips_survivor_that_became_an_owner(self):
+        # Still alive and same identity, but now another owner's root.
+        self.src.ignore_term = {21}
+        out = self.run_act("stop-job", self.job_token())
+        session_file(self.sessions, 21, self.src.table[21].start[0], job_id="0000dddd")
+        forced = self.run_act("force", out["force_token"])
+        self.assertNotIn((21, signal.SIGKILL), self.src.signals)
+        self.assertEqual((forced["result"], forced["reason"], forced["exited"]),
+                         ("partial", "survivors", 0))
+        self.assertEqual([r["pid"] for r in forced["remaining"]], [21])
+
+    def test_force_never_touches_memmon_itself(self):
+        me = self.src.table[os.getpid()]
+        token = mo.mint_token({"v": 1, "action": "force", "origin": "stop-job",
+                               "survivors": [{"pid": me.pid, "start": list(me.start)}],
+                               "snapshot_ts": T0 + 5})
+        forced = self.run_act("force", token)
+        self.assertEqual(self.src.signals, [])
+        self.assertEqual((forced["result"], forced["exited"]), ("partial", 0))
+
+    def test_force_token_from_the_future_is_stale(self):
+        self.assertEqual(self.run_act("stop-job", self.job_token(ts=T0 + 5 + 6))["reason"],
+                         "stale_token")
+        self.assertEqual(self.run_act("stop-job", self.job_token(ts=T0 + 5 + 4))["result"],
+                         "stopped")
+
+    def test_runner_wrapper_guarding_a_kept_owner_is_not_signalled(self):
+        # A `memmon run` wrapper killpg()s its child's group on SIGTERM;
+        # that group holds a nested session, so the wrapper is left alone.
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31)
+        self.src.table[32] = P(32, ppid=31, pgid=31, start=(T0 + 32, 0))
+        session_file(self.sessions, 32, T0 + 32, job_id="0000bbbb")
+        lease = {"id": "run1", "wrapper_pid": 30, "child_pid": 31,
+                 "child_start": list(self.src.table[31].start)}
+        self.eng.leases_fn = lambda: [lease]
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        signalled = {p for p, _ in self.src.signals}
+        self.assertNotIn(30, signalled)
+        self.assertNotIn(32, signalled)
+        self.assertIn(31, signalled)
+        self.assertEqual(out["kept"], ["claude:0000bbbb"])
+
+    def test_kept_owner_that_exited_is_not_reported_kept(self):
+        self.src.table[30] = P(30, ppid=21, pgid=30, start=(T0 + 30, 0))
+        session_file(self.sessions, 30, T0 + 30, job_id="0000bbbb")
+        self.eng.after_capture = lambda captured: self.src.table.pop(30)
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        self.assertEqual(out["kept"], [])
+
+    def test_job_root_gone_but_its_group_still_runs(self):
+        token = self.job_token(target_pgid=20)
+        del self.src.table[20]
+        self.src.table[21].ppid = 1
+        out = self.run_act("stop-job", token)
+        self.assertEqual((out["result"], out["reason"], ma.exit_code(out)),
+                         ("partial", "root_exited", 3))
+        self.assertEqual(sorted(r["pid"] for r in out["remaining"]), [21, 22])
+        self.assertNotIn("force_token", out)
+        self.assertEqual(self.src.signals, [])
+        del self.src.table[21], self.src.table[22]
+        self.assertEqual(self.run_act("stop-job", token)["result"], "already_exited")
+
+    def test_unreadable_start_is_target_changed(self):
+        # A reused PID now owned by another user reads no start time.
+        token = self.job_token()
+        self.src.table[20] = P(20, ppid=10, uid=0, visible=False)
+        self.src.table[20].start = None
+        self.assertEqual(self.run_act("stop-job", token)["reason"], "target_changed")
+
+    def test_permission_error_keeps_the_survivor(self):
+        def deny(pid, sig):
+            if pid == 22:
+                raise PermissionError(pid)
+        self.src.on_kill = deny
+        out = self.run_act("stop-job", self.job_token())
+        self.assertEqual(out["result"], "partial")
+        self.assertIn(22, [r["pid"] for r in out["remaining"]])
+
+    def test_stop_managed_job_refuses_a_lease_with_another_child_start(self):
+        child = self.src.table[21]
+        self.eng.leases_fn = lambda: [{"id": "run1", "child_pid": 21, "child_start": [9, 9]}]
+        out = self.run_act("stop-managed-job",
+                           tok("stop-managed-job", self.root, child, run_id="run1"))
+        self.assertEqual(out["reason"], "lease_mismatch")
+        self.eng.leases_fn = lambda: [{"id": "run1", "child_pid": 21,
+                                       "child_start": list(child.start)}]
+        self.assertNotEqual(self.run_act("stop-managed-job", tok(
+            "stop-managed-job", self.root, child, run_id="run1"))["reason"], "lease_mismatch")
+
+    def test_reap_force_refuses_an_act_token(self):
+        # `memmon reap --force` only takes tokens a reap minted.
+        self.src.ignore_term = {21}
+        out = self.run_act("stop-job", self.job_token())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = memmon.reap_cli(["--force", out["force_token"]], engine=self.eng)
+        self.assertEqual(code, 4)
+        self.assertIn("wrong_action", buf.getvalue())
+        self.assertNotIn(signal.SIGKILL, [s for _, s in self.src.signals])
+
+    def test_reap_spares_goes_through_the_engine(self):
+        claim = os.path.join(self.state.root, "x.claim.sock")
+        open(claim, "w").close()
+        self.src.table[60] = P(60, start=(T0 - 5 * 3600, 0))
+        self.src._argv[60] = ["claude", "bg-spare", "--bg-spare", claim]
+        snap = {"overhead": {"items": [{"pid": 60, "mem": MB, "age": 5 * 3600,
+                                        "stale": True}]}}
+        dry = memmon.reap_spares(snap, False, engine=self.eng)
+        self.assertIn("would send SIGTERM to 1", dry)
+        self.assertEqual(self.src.signals, [])
+        text, out = memmon.reap_spares_report(snap, True, engine=self.eng)
+        self.assertEqual(out["result"], "stopped", text)
+        self.assertEqual(self.src.signals, [(60, signal.SIGTERM)])
+
+    def test_reap_dry_run_matches_apply(self):
+        # The dry run lists what --apply would signal (descendants too)
+        # and what it would refuse, and signals nothing.
+        self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
+        self.src.table[81] = P(81, ppid=80)
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        snap = {"orphans": [{"pid": 80, "mem": MB, "age": 7200, "orphaned": True,
+                             "tag": "vitest", "worktree": ""},
+                            {"pid": 20, "mem": MB, "age": 7200, "orphaned": False,
+                             "tag": "vitest", "worktree": ""}], "orphan_total": 2 * MB}
+        text, out = memmon.reap_report(snap, False, engine=self.eng)
+        self.assertEqual(out["result"], "would_stop")
+        self.assertEqual([r["pid"] for r in out["would_signal"]], [80, 81])
+        self.assertEqual(out["refused"], [{"pid": 20, "reason": "attributed"}])
+        self.assertEqual(self.src.signals, [])
+
+    def test_reap_refuses_a_listed_pid_reused_since(self):
+        self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        listed = list(self.src.table[80].start)
+        self.src.table[80] = P(80, start=(T0 - 3700, 5), comm="node")
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        out = self.eng.reap([(80, listed)], memmon._orphan_still_selected)
+        self.assertEqual(out["refused"], [{"pid": 80, "reason": "target_changed"}])
+        self.assertEqual(self.src.signals, [])
+
+    def test_reap_and_end_session_exit_with_the_outcome(self):
+        # Applying exits 0 done / 3 partial / 4 refused; a dry run exits 0.
+        self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        self.src.ignore_term = {80}
+        orphan = {"pid": 80, "mem": MB, "age": 7200, "orphaned": True,
+                  "tag": "vitest", "worktree": ""}
+        attributed = {**orphan, "pid": 20, "orphaned": False}
+
+        def reap(args, *rows):
+            snap = {"orphans": list(rows), "orphan_total": MB}
+            with mock.patch.object(memmon, "collect", return_value=snap), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                return memmon.reap_cli(args, engine=self.eng)
+        self.assertEqual(reap([], orphan), 0)
+        self.assertEqual(self.src.signals, [])
+        self.assertEqual(reap(["--apply"], attributed), 4)
+        self.assertEqual(reap(["--apply"], orphan), 3)
+        self.assertEqual(memmon._apply_exit(memmon.end_session_report(20, True, self.eng)[1],
+                                            True), 4)
+        self.assertEqual(memmon._apply_exit(memmon.end_session_report(10, False, self.eng)[1],
+                                            False), 0)
 
     def test_legacy_end_session_routes_through_engine(self):
         dry = memmon.end_session(10, False, engine=self.eng)
@@ -260,7 +472,7 @@ class FakeActTests(unittest.TestCase):
 
 
 class RespawnTests(unittest.TestCase):
-    """R1: the daemon revives a worker ended mid-turn. Fixture from the probe;
+    """The daemon revives a worker ended mid-turn. Fixture from the probe;
     no real Claude process is involved."""
 
     JOB = "a1b2c3d4"
@@ -286,7 +498,7 @@ class RespawnTests(unittest.TestCase):
             json.dump({"workers": {self.JOB: entry} if entry else {}}, fh)
 
     def fixture(self, busy=True):
-        procs = [P(os.getpid(), ppid=0),
+        procs = [P(os.getpid(), ppid=0, start=(T0 + 4, 0)),       # act began 1 s ago
                  P(40000, start=(1000, 0)), P(41000, ppid=40000, start=(2000, 0)),
                  P(41001, ppid=41000, start=(2000, 100000)),
                  P(41002, ppid=41001, pgid=41001, start=(2001, 0))]
@@ -311,7 +523,7 @@ class RespawnTests(unittest.TestCase):
                 self.t_term = self.clock.t
         self.src.on_kill = on_kill
 
-    def test_r1_busy_worker_respawn_is_reported(self):
+    def test_busy_worker_respawn_is_reported(self):
         self.fixture(busy=True)
         self.crash_on_term()
 
@@ -335,8 +547,8 @@ class RespawnTests(unittest.TestCase):
         self.assertEqual(again["result"], "already_exited")
         self.assertEqual({p for p, _ in self.src.signals}, {41001, 41002, 41010, 41011})
 
-    def test_r1_watch_runs_without_the_actions_lock(self):
-        # AD-S1-11: another action during the 20 s watch is served, not busy.
+    def test_respawn_watch_runs_without_the_actions_lock(self):
+        # Another action during the 20 s watch is served, not busy.
         self.fixture(busy=True)
         self.crash_on_term()
         other_clock = FakeClock()
@@ -351,13 +563,35 @@ class RespawnTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual((seen[0]["result"], seen[0]["reason"]), ("refused", "not_stoppable"))
 
-    def test_r1_idle_worker_settles_early(self):
+    def test_respawn_watch_respects_the_act_budget(self):
+        # The whole act stays inside 22 s from its own process start.
+        self.fixture(busy=True)
+        self.src.table[os.getpid()].start = (T0 + 5 - 10, 0)    # started 10 s ago
+        self.crash_on_term()
+        self.eng.run("end-session", self.token)
+        self.assertLessEqual(self.clock.t - 1000, 12.6)
+
+    def test_respawn_watch_error_keeps_the_result(self):
+        self.fixture(busy=True)
+
+        class Broken:
+            def baseline(self, job):
+                return {}
+
+            def status(self, *a):
+                raise OSError("roster unreadable")
+        self.eng.respawn = Broken()
+        out = self.eng.run("end-session", self.token)
+        self.assertEqual(out["result"], "stopped")
+        self.assertIn("roster unreadable", out["watch_error"])
+
+    def test_respawn_idle_worker_settles_early(self):
         self.fixture(busy=False)
         out = self.eng.run("end-session", self.token)
         self.assertEqual((out["result"], ma.exit_code(out)), ("stopped", 0))
         self.assertLess(self.clock.t - 1000, 5)        # did not sit out the window
 
-    def test_r1_roster_removal_settles(self):
+    def test_respawn_roster_removal_settles(self):
         self.fixture(busy=True)
         self.crash_on_term()
         self.clock.at(self.clock.t + 12, lambda: self.set_roster(None))
@@ -365,7 +599,7 @@ class RespawnTests(unittest.TestCase):
         self.assertEqual(out["result"], "stopped")
         self.assertLess(self.clock.t - 1000, 14)
 
-    def test_r1_spare_for_another_job_is_not_a_respawn(self):
+    def test_respawn_spare_for_another_job_is_not_a_respawn(self):
         self.fixture(busy=True)
         self.crash_on_term()
 
@@ -381,7 +615,7 @@ class RespawnTests(unittest.TestCase):
 
 
 class CodexEndSessionTests(unittest.TestCase):
-    """R3: an in-process TUI is ended (usually ignoring TERM); a daemon
+    """An in-process TUI is ended (usually ignoring TERM); a daemon
     frontend is refused."""
 
     def setUp(self):
@@ -415,7 +649,7 @@ class CodexEndSessionTests(unittest.TestCase):
         self.assertEqual((out["result"], ma.exit_code(out)), ("partial", 3))
         self.assertEqual([r["pid"] for r in out["remaining"]], [52000])
         body = mo.decode_token(out["force_token"])
-        self.assertEqual(body["survivors"], [{"pid": 52000, "start": [3000, 0]}])
+        self.assertEqual([(v["pid"], v["start"]) for v in body["survivors"]], [(52000, [3000, 0])])
         forced = self.eng.run("force", out["force_token"])
         self.assertEqual(forced["result"], "force_stopped")
         self.assertEqual([s for s in self.src.signals if s[1] == signal.SIGKILL],
@@ -464,18 +698,90 @@ class VerifyAppTests(unittest.TestCase):
         self.assertEqual(self.eng.run("verify-app", self.token(bundle_id="com.other"))
                          ["reason"], "instance_changed")
 
+    def test_verify_app_refuses_a_helper_as_an_instance(self):
+        helper = os.path.join(self.state.root, "Applications", "Brave Browser.app",
+                              "Contents", "Frameworks", "Brave Helper.app", "Contents",
+                              "MacOS", "Brave Helper")
+        self.src._paths[70] = helper
+        self.assertEqual(self.eng.run("verify-app", self.token())["reason"], "instance_changed")
+
+    def test_verify_app_on_a_code_sign_clone_main(self):
+        clone = os.path.join(self.state.root, "X", "com.example.brave.code_sign_clone",
+                             "code_sign_clone.r", "Brave Browser.app.bundle")
+        os.makedirs(os.path.join(clone, "Contents"))
+        with open(os.path.join(clone, "Contents", "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.example.brave",
+                           "CFBundleExecutable": "Brave Browser"}, fh)
+        self.src._paths[70] = f"{clone}/Contents/MacOS/Brave Browser"
+        out = self.eng.run("verify-app", self.token())
+        self.assertEqual(out["result"], "verified", out)
+
+    def test_verify_app_refuses_an_app_hosting_a_session(self):
+        self.src.table[71] = P(71, ppid=70, comm="zsh")
+        self.src.table[72] = P(72, ppid=71, start=(T0 + 72, 0))
+        session_file(memmon.CLAUDE_SESSIONS_DIR, 72, T0 + 72, job_id="0000ee02")
+        self.assertEqual(self.eng.run("verify-app", self.token())["reason"], "hosts_sessions")
+
     def test_verify_app_all_gone(self):
         token = self.token()
         del self.src.table[60], self.src.table[70]
         self.assertEqual(self.eng.run("verify-app", token)["result"], "already_exited")
 
 
-class NoKillpgTests(unittest.TestCase):
+class PolicyTests(unittest.TestCase):
+    def test_policy_never_autostops_unmanaged(self):
+        # Viewing, sampling and gating never stop anything, however idle,
+        # heavy or orphaned a process looks.
+        state = TempState()
+        self.addCleanup(state.close)
+        ctx = mo.Context(sessions_dir=memmon.CLAUDE_SESSIONS_DIR)
+        src = FakeSource([P(os.getpid(), ppid=0), P(10, comm="node"), P(11, ppid=10)],
+                         argv={10: ["node", "/r/node_modules/.bin/vitest"]})
+        boom = mock.Mock(side_effect=AssertionError("signal sent"))
+        with mock.patch.object(os, "kill", boom), mock.patch.object(os, "killpg", boom), \
+                mock.patch.object(ma.Engine, "_signal", boom), \
+                mock.patch.object(memmon, "gate_stats", return_value={}), \
+                mock.patch.object(memmon, "system_block", return_value={}):
+            memmon.owners_json(0, source=src, ctx=ctx)
+            memmon.owners_sampler_tick(src, ctx)
+            memmon.gate_decision("Bash", "pnpm typecheck",
+                                 {"level": "CRITICAL", "reasons": ["x"]}, {}, "block")
+        boom.assert_not_called()
+
+
+SIGNAL_SITE = re.compile(r"\bos\.kill\s*\(|\bkillpg\s*\(|(^|[;&|\s])kill\s+-")
+
+
+class SignalSiteTests(unittest.TestCase):
     def test_act_no_killpg(self):
-        # I-1 / D28: the engine and everything it calls signal per PID only.
+        # The engine and everything it calls signal per PID only.
         for name in ("memmon_act.py", "memmon_owners.py", "memmon_procs.py"):
             with open(os.path.join(HERE, name)) as fh:
                 self.assertNotRegex(fh.read(), r"killpg\s*\(", name)
+
+    def test_only_known_code_sends_signals(self):
+        # Every shipped .py/.sh signal site: the engine signals through its
+        # injected `kill`; the runner's _stop is the one group signal, aimed
+        # at its own child (the runner's own exception). Tests signal only what
+        # they spawned and are excluded here.
+        from test_owners import tracked_files
+        hits = []
+        for path in tracked_files(self):
+            name = os.path.basename(path)
+            if not name.endswith((".py", ".sh")) or name.startswith("test") or \
+                    name == "testkit.py":
+                continue
+            with open(path) as fh:
+                lines = fh.read().splitlines()
+            func = None
+            for n, line in enumerate(lines, 1):
+                m = re.match(r"\s*def (\w+)", line)
+                if m:
+                    func = m.group(1)
+                if SIGNAL_SITE.search(line.split("#")[0]):
+                    hits.append((name, func))
+        self.assertTrue(hits)
+        self.assertEqual({h for h in hits if h != ("memmon_runner.py", "_stop")}, set())
 
 
 # ------------------------------------------------------- real processes
@@ -494,7 +800,7 @@ import os, subprocess, sys, time
 note("build")
 for i in range(3):
     subprocess.Popen([sys.executable, "-c",
-        "import os,sys,time; open(sys.argv[1],'a').write(f'sleeper {os.getpid()}\\\\n'); time.sleep(120)",
+        "import os; exec(os.environ['MEMMON_NOTE']); note('sleeper'); import time; time.sleep(120)",
         sys.argv[1]], preexec_fn=os.setsid if i == 2 else None)
 time.sleep(120)
 """
@@ -510,7 +816,7 @@ BUILD_FORKS_ON_TERM = NOTE + """
 import os, signal, subprocess, sys, time
 def on_term(*_):
     subprocess.Popen([sys.executable, "-c",
-        "import os,sys,time; open(sys.argv[1],'a').write(f'gc {os.getpid()}\\\\n'); time.sleep(120)",
+        "import os; exec(os.environ['MEMMON_NOTE']); note('gc'); import time; time.sleep(120)",
         sys.argv[1]])
     time.sleep(0.8)
     os._exit(0)
@@ -522,10 +828,10 @@ time.sleep(120)
 BUILD_DOUBLE_FORK = NOTE + """
 import subprocess, sys, time
 note("build")
+GC = "import os; exec(os.environ['MEMMON_NOTE']); note('gc'); import time; time.sleep(120)"
 subprocess.Popen([sys.executable, "-c",
-    "import subprocess,sys; subprocess.Popen([sys.executable, '-c', "
-    "\\"import os,sys,time; open(sys.argv[1],'a').write(f'gc {os.getpid()}\\\\\\\\n'); time.sleep(120)\\", "
-    "sys.argv[1]])", sys.argv[1]]).wait()
+    "import subprocess, sys; subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]])",
+    sys.argv[1], GC]).wait()
 time.sleep(120)
 """
 
@@ -542,8 +848,8 @@ time.sleep(120)
 ORPHAN = NOTE + """
 import os, signal, subprocess, sys
 # vitest  (marks this process reapable to the orphan selector)
-code = ("import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "open(sys.argv[1],'a').write(f'orphan {os.getpid()}\\\\n'); time.sleep(120) # vitest")
+code = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "exec(os.environ['MEMMON_NOTE']); note('orphan'); time.sleep(120) # vitest")
 subprocess.Popen([sys.executable, "-c", code, sys.argv[1]], start_new_session=True)
 """
 
@@ -574,7 +880,7 @@ class RealProcessTests(unittest.TestCase):
         b = self.reg.spawn(NOTE + "note('B')\n" + SLEEP).pid
         session_file(self.sessions, b, self.reg.ids[b][0], job_id=f"{b:08x}")
         notes = self.reg.wait_notes(6)
-        sleepers = [pid for tag, pid in self.reg.read_notes() if tag == "sleeper"]
+        sleepers = [pid for tag, pid, _ in self.reg.read_notes() if tag == "sleeper"]
         build = notes["build"]
         before = {p: self.reg.identity(p) for p in (a, b)}
         out = self.eng.run("stop-job", self.reg.token("stop-job", a, build))
@@ -670,6 +976,22 @@ class RealProcessTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.reg.guarded_kill(os.getppid(), 0)
 
+    def test_registry_binds_pid_and_start(self):
+        # The harness records an identity once and covers a PID only while
+        # that same identity holds it, so a reused PID is never signalled.
+        pid = self.reg.spawn(SLEEP).pid
+        real = self.reg.ids[pid]
+        self.reg.register(pid, (1, 1))
+        self.assertEqual(self.reg.ids[pid], real)
+        self.assertTrue(self.reg._covered(pid))
+        self.reg.ids[pid] = (1, 1)                 # as if the PID now held another process
+        try:
+            self.assertFalse(self.reg._covered(pid))
+            with self.assertRaises(AssertionError):
+                self.reg.guarded_kill(pid, 0)
+        finally:
+            self.reg.ids[pid] = real
+
     def test_real_stop_managed_job(self):
         # A14
         runner_dir = os.path.join(self.state.root, "runstate")
@@ -686,7 +1008,7 @@ class RealProcessTests(unittest.TestCase):
             time.sleep(0.02)
             rows = memmon_runner.jobs(runner_dir)
         row = rows[0]
-        child = self.reg.register(row["child_pid"])
+        child = self.reg.register(row["child_pid"], row["child_start"])
         self.ctx.leases = rows
         self.eng.leases_fn = lambda: memmon_runner.jobs(runner_dir)
         wrong = self.eng.run("stop-managed-job", self.reg.token(
@@ -714,7 +1036,7 @@ class RealProcessTests(unittest.TestCase):
 
         self.reg.spawn(ORPHAN).wait(timeout=10)                 # appears in between
         self.reg.wait_notes(2)
-        late = [p for t, p in self.reg.read_notes() if t == "orphan" and p != orphan][0]
+        late = [p for t, p, _ in self.reg.read_notes() if t == "orphan" and p != orphan][0]
         out = self.eng.force(force, origin="reap")
         self.assertEqual(out["result"], "force_stopped", out)
         self.assertFalse(self.reg.alive(orphan))
@@ -747,6 +1069,19 @@ class CliTests(unittest.TestCase):
         proc = subprocess.run([PY, os.path.join(HERE, "memmon.py"), "act", *args],
                               capture_output=True, text=True, timeout=60, env=env)
         return proc.returncode, json.loads(proc.stdout)
+
+    def test_cli_bad_args_and_reap_force_dispatch(self):
+        env = dict(os.environ, HOME=self.home.name)
+        run = lambda *a: subprocess.run([PY, os.path.join(HERE, "memmon.py"), *a],
+                                        capture_output=True, text=True, timeout=60, env=env)
+        proc = run("act", "stop-job")
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(json.loads(proc.stdout)["reason"], "bad_args")
+        proc = run("act", "teleport", "--target", "x")
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["reason"]), (4, "bad_args"))
+        proc = run("reap", "--force", "not-a-token")
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn("refused: bad_token", proc.stdout)
 
     def test_cli_exit_codes_and_json(self):
         a = self.reg.spawn(A_CODE, "session", BUILD_3).pid
