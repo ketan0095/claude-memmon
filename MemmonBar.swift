@@ -480,6 +480,9 @@ struct SystemInfo {
     var pressureLevel: String?, scoreLevel: String?
     /// Why the level is UNKNOWN or only a lower bound, and whether rates were read.
     var levelReason: String? = nil, rates: String? = nil
+    /// The kernel's own level when the strict read failed (pressure_level null).
+    var kernelLevel: String? = nil
+    var kernel: String? { pressureLevel ?? kernelLevel }
     var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
     /// Why nothing was measured; set only when cpu_coverage is null.
     var cpuReason: String?
@@ -742,6 +745,7 @@ struct OwnersSnap {
                                   reason: str(y["reason"]))
             s.system.idleBytes = num(y["idle_bytes"]); s.system.cacheBytes = num(y["cache_bytes"])
             s.system.levelReason = str(y["level_reason"]); s.system.rates = str(y["rates"])
+            s.system.kernelLevel = str(y["kernel_level"])
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -788,6 +792,21 @@ struct OwnersSnap {
 }
 
 extension OwnersSnap {
+    /// The runner's hold, but only while some work is actually waiting: the
+    /// runner reports "holding for recovery" on an idle machine too (a fresh
+    /// boot, or a job that ended on a bad reading), and that is not news.
+    var heldWork: String? {
+        guard let h = runner?.hold else { return nil }
+        let waiting = (runner?.queueLength ?? 0) > 0 || runnerJobs.contains { $0.waiting }
+        return waiting ? h : nil
+    }
+
+    /// The managed-jobs card: with jobs to list, while waiting work is held,
+    /// or when the mode is not protect, so a paused runner is never invisible.
+    var showsManagedJobs: Bool {
+        !runnerJobs.isEmpty || heldWork != nil || (runner?.mode.map { $0 != "protect" } ?? false)
+    }
+
     /// The under_pressure predicate memmon evaluated; an older payload without
     /// it falls back to the score level the card was first drawn for.
     var pressured: Bool {
@@ -1016,6 +1035,16 @@ func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
     return out
 }
 
+/// The ring's headline and its spoken form. A level from instantaneous
+/// signals alone (failed rates) is a lower bound and says so: "≥ Watch".
+func pressureHeadline(_ level: String?, reason: String?) -> (shown: String, spoken: String) {
+    let word = pressureWord(level)
+    guard levelTone(level) != .muted, reason?.hasPrefix("lower bound") == true else {
+        return (word, word.lowercased())
+    }
+    return ("≥ " + word, "at least " + word.lowercased())
+}
+
 /// The pressure word in the ring's centre.
 func pressureWord(_ level: String?) -> String {
     switch level {
@@ -1220,29 +1249,26 @@ enum PrefKey {
     static let notifiedJobs = "memmon.notifiedJobStates"
 }
 
+/// `done` reports whether the notification was handed over; only then is it
+/// remembered as sent. It may be called on any thread.
 protocol Notifier {
-    func post(id: String, title: String, body: String)
-}
-
-/// Posts nothing: renders, probes and a binary run outside its app bundle.
-struct SilentNotifier: Notifier {
-    func post(id: String, title: String, body: String) {}
+    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void)
 }
 
 /// UNUserNotificationCenter, which exists only inside an app bundle.
+/// Authorization is asked once, at launch, not in front of the first alert.
 final class SystemNotifier: Notifier {
-    private var asked = false
-    func post(id: String, title: String, body: String) {
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        let center = UNUserNotificationCenter.current()
-        if !asked {
-            asked = true
-            center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        }
+    private let center: UNUserNotificationCenter?
+    init() {
+        center = Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) {
+        guard let center else { done(false); return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { done($0 == nil) }
     }
 }
 
@@ -1283,33 +1309,76 @@ final class InterventionAlerts {
         return ("\(j.label) needs attention", why + " New heavy work is on hold. Open memmon to stop it.")
     }
 
+    /// Posted but not yet confirmed: not posted again meanwhile.
+    private var inFlight: Set<String> = []
+
     /// Posts for every new notifiable state in `jobs`; returns what it posted.
+    /// A state is remembered only once its notification was handed over, so
+    /// a failed one is tried again on the next tick. Main thread only.
     @discardableResult
     func observe(_ jobs: [ManagedJob]) -> [String] {
-        var seen = store.strings(PrefKey.notifiedJobs)
+        let seen = Set(store.strings(PrefKey.notifiedJobs))
         var posted: [String] = []
         for j in jobs where InterventionAlerts.states.contains(j.state) {
             let k = InterventionAlerts.key(j)
-            guard !seen.contains(k) else { continue }
-            seen.append(k)
-            let (title, body) = InterventionAlerts.copy(j)
-            notifier.post(id: k, title: title, body: body)
+            guard !seen.contains(k), !inFlight.contains(k) else { continue }
+            inFlight.insert(k)
             posted.append(k)
+            let (title, body) = InterventionAlerts.copy(j)
+            notifier.post(id: k, title: title, body: body) { ok in
+                let finish = { self.inFlight.remove(k); if ok { self.remember(k) } }
+                if Thread.isMainThread { finish() } else { DispatchQueue.main.async(execute: finish) }
+            }
         }
-        if !posted.isEmpty { store.set(Array(seen.suffix(InterventionAlerts.keep)), PrefKey.notifiedJobs) }
         return posted
+    }
+
+    private func remember(_ k: String) {
+        var seen = store.strings(PrefKey.notifiedJobs)
+        guard !seen.contains(k) else { return }
+        seen.append(k)
+        store.set(Array(seen.suffix(InterventionAlerts.keep)), PrefKey.notifiedJobs)
     }
 }
 
 /// The runner's own job records, read straight from disk: a directory
-/// listing and a few small files, never a spawn. Only `<32 hex>.json`.
+/// listing and a few small files, never a spawn. Only `<32 hex>.json`, at
+/// most 64 of them and 256 KB each, and only while the record's lease is
+/// still locked, which is memmon_runner.jobs()'s own liveness test: a record
+/// left by a dead runner never notifies. Call it off the main thread.
+enum RunnerFiles {
+    static let maxFiles = 64
+    static let maxBytes = 256 * 1024
+}
+
+/// Someone holds the lease: a shared, non-blocking probe fails with
+/// EWOULDBLOCK. The probe is released and closed at once.
+func leaseHeld(_ path: String) -> Bool {
+    let fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    if flock(fd, LOCK_SH | LOCK_NB) == 0 {
+        flock(fd, LOCK_UN)
+        return false
+    }
+    return errno == EWOULDBLOCK
+}
+
 func runnerRows(_ dir: String) -> [ManagedJob] {
-    let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
-    return names.compactMap { name -> ManagedJob? in
+    let fm = FileManager.default
+    let names = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { name in
         let stem = (name as NSString).deletingPathExtension
-        guard name.hasSuffix(".json"), stem.count == 32,
-              stem.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
-              let d = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent(name)),
+        return name.hasSuffix(".json") && stem.count == 32
+            && stem.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }.sorted().prefix(RunnerFiles.maxFiles)
+    return names.compactMap { name -> ManagedJob? in
+        let path = (dir as NSString).appendingPathComponent(name)
+        let lease = (dir as NSString).appendingPathComponent((name as NSString).deletingPathExtension + ".lease")
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              let size = (attrs[.size] as? NSNumber)?.intValue, size <= RunnerFiles.maxBytes,
+              leaseHeld(lease),
+              let d = fm.contents(atPath: path), d.count <= RunnerFiles.maxBytes,
               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return nil }
         return ManagedJob.decode(j)
     }
@@ -4311,11 +4380,11 @@ struct ContentView: View {
                 Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
                     .padding(.horizontal, 18).padding(.bottom, 8)
             }
-            if let r = s.runner, let hold = r.hold {
+            if let r = s.runner, let hold = s.heldWork {
                 HoldBanner(kind: hold, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining)
                     .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
             }
-            if showsManagedJobs(s) {
+            if s.showsManagedJobs {
                 managedJobs(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
             }
             gateSection(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 10)
@@ -4334,6 +4403,7 @@ struct ContentView: View {
         let sys = s.system
         let level = sys.scoreLevel
         let tint = P.tint(level)
+        let headline = pressureHeadline(level, reason: sys.levelReason)
         let segments = ringSegments(s.rows, used: sys.usedBytes)
         let used = sys.usedBytes, ram = sys.ramBytes
         // A partial sum would understate the machine, so memmon sends a CPU
@@ -4348,11 +4418,11 @@ struct ContentView: View {
             .sorted { $0.bytes > $1.bytes }.prefix(4))
             + segments.filter { $0.kind == .system }
         let spokenMemory: String = {
-            guard let used else { return "Memory in use not available, pressure \(pressureWord(level).lowercased())" }
+            guard let used else { return "Memory in use not available, pressure \(headline.spoken)" }
             var head = "Memory " + String(format: "%.1f", used / GB)
             head += ram.map { String(format: " of %.0f GB in use", $0 / GB) } ?? " GB in use"
             if over { head += ", over the limit" }
-            head += ", pressure \(pressureWord(level).lowercased())"
+            head += ", pressure \(headline.spoken)"
             let parts = segments.map { "\($0.name) \($0.spoken)" } + (free.map { ["free \(gb($0))"] } ?? [])
             return head + "; " + parts.joined(separator: ", ")
         }()
@@ -4375,7 +4445,7 @@ struct ContentView: View {
                             if levelTone(level) == .muted {
                                 Image(systemName: "questionmark.circle").font(.system(size: 9, weight: .semibold))
                             }
-                            Text(pressureWord(level)).font(ft(10, .semibold))
+                            Text(headline.shown).font(ft(10, .semibold))
                         }
                         .foregroundColor(tint)
                         .padding(.horizontal, 7).padding(.vertical, 1)
@@ -4428,7 +4498,7 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .help("Pressure score \(level ?? "unavailable")"
                       + (sys.levelReason.map { " (\($0))" } ?? "")
-                      + " · macOS memory pressure \(sys.pressureLevel ?? "unavailable")")
+                      + " · macOS memory pressure \(sys.kernel ?? "unavailable")")
             if let notice = gapNotice(s, dismissed: model.dismissedGap, now: nowTs()) {
                 gapNoticeRow(notice)
             }
@@ -4638,17 +4708,10 @@ struct ContentView: View {
 
     // MARK: managed jobs (memmon run)
 
-    /// Shown with jobs to list, while new work is held, or when the mode is
-    /// not protect, so a paused runner is never invisible.
-    private func showsManagedJobs(_ s: OwnersSnap) -> Bool {
-        !s.runnerJobs.isEmpty || s.runner?.hold != nil
-            || (s.runner?.mode.map { $0 != "protect" } ?? false)
-    }
-
     private func managedJobs(_ s: OwnersSnap) -> some View {
         let r = s.runner
         let jobs = s.runnerJobs.sorted { $0.rank < $1.rank }
-        let holding = r?.hold != nil || (r?.committed?.over == true && (r?.mode ?? "protect") == "protect")
+        let holding = s.heldWork != nil || (r?.committed?.over == true && (r?.mode ?? "protect") == "protect")
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "list.bullet.rectangle").font(.system(size: 13, weight: .medium))
@@ -4700,7 +4763,8 @@ struct ContentView: View {
 
     private func underPressure(_ s: OwnersSnap) -> some View {
         let level = s.system.scoreLevel
-        let word = level == "DANGER" || level == "CRITICAL" ? level! : "kernel \(s.system.pressureLevel ?? "warning")"
+        let word = level == "DANGER" || level == "CRITICAL" ? level!
+            : s.system.kernel.map { "kernel \($0)" } ?? "readings unavailable"
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
                 Image(systemName: "exclamationmark.triangle").font(.system(size: 13, weight: .semibold))
@@ -5071,6 +5135,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let cache = NSString(string: "~/.claude/memmon/latest.json").expandingTildeInPath
     let runnerDir = NSString(string: "~/.claude/memmon/runner").expandingTildeInPath
     let pressureWatch = PressureWatch()
+    /// One runner read at a time; a slow disk skips a tick instead of piling up.
+    var readingRunner = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -5093,7 +5159,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // A job that needs intervention is noticed with the popover closed:
         // the runner's own small records, read every 10 s, never a spawn.
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
-            self.model.alerts?.observe(runnerRows(self.runnerDir))
+            guard !self.readingRunner, self.model.alerts != nil else { return }
+            self.readingRunner = true
+            let dir = self.runnerDir
+            DispatchQueue.global(qos: .utility).async {
+                let rows = runnerRows(dir)
+                DispatchQueue.main.async {
+                    self.readingRunner = false
+                    self.model.alerts?.observe(rows)
+                }
+            }
         }
     }
 
@@ -6052,7 +6127,7 @@ if ARGS.contains("--sections-probe") {
                 "can_stop": row.canStop, "button": row.canStop ? sg.asJob.stopLabel + "…" : NSNull(),
                 "note": row.canStop ? NSNull() : row.note]
     }
-    let holding = snapS2.runner?.hold != nil
+    let holding = snapS2.heldWork != nil
     let managed: [[String: Any]] = snapS2.runnerJobs.sorted { $0.rank < $1.rank }.map { j in
         ["id": j.id, "state": j.stateWord,
          "detail": managedJobDetail(j, level: level, holding: holding || snapS2.runner?.committed?.over == true, now: nowTs()),
@@ -6062,15 +6137,16 @@ if ARGS.contains("--sections-probe") {
         let (h, sub) = budgetLines(c); return [h, sub ?? NSNull()]
     } ?? NSNull()
     let hold: Any = snapS2.runner.flatMap { r in
-        r.hold.map { HoldBanner(kind: $0, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining).text }
+        snapS2.heldWork.map { HoldBanner(kind: $0, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining).text }
     } ?? NSNull()
     let s2: [String: Any] = [
         "pressure": ["word": pressureWord(level), "tone": levelTone(level).rawValue,
+                     "headline": pressureHeadline(level, reason: snapS2.system.levelReason).shown,
                      "glyph": levelTone(level) == .muted],
         "gap_notice": notice.map { $0.text + " " + $0.sub } ?? NSNull(),
         "under_pressure_card": !snapS2.shownSuggestions.isEmpty,
         "suggestions": suggestions, "managed": managed, "budget": budget, "hold": hold,
-        "mode": snapS2.runner?.mode ?? NSNull(),
+        "mode": snapS2.runner?.mode ?? NSNull(), "card": snapS2.showsManagedJobs,
     ]
     let data = try! JSONSerialization.data(withJSONObject: [
         "s2": s2,
@@ -6092,16 +6168,23 @@ if ARGS.contains("--notify-probe") {
           let seq = (try? JSONSerialization.jsonObject(with: d)) as? [[[String: Any]]] else {
         fail("usage: --notify-probe --sequence <json list of job lists> [--store <file>]")
     }
+    // `--fail-adds N`: the first N hand-overs fail, as a refused add would.
     final class Recorder: Notifier {
         var posted: [[String: String]] = []
-        func post(id: String, title: String, body: String) { posted.append(["id": id, "title": title, "body": body]) }
+        var failures = 0
+        func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) {
+            posted.append(["id": id, "title": title, "body": body])
+            if failures > 0 { failures -= 1; done(false) } else { done(true) }
+        }
     }
     let rec = Recorder()
+    rec.failures = argValue("--fail-adds").flatMap(Int.init) ?? 0
     let store: PrefStore = argValue("--store").map { FileStore(path: $0) } ?? MemoryStore()
     let alerts = InterventionAlerts(notifier: rec, store: store)
     let rounds = seq.map { alerts.observe($0.map(ManagedJob.decode)) }
     if let dir = argValue("--runner-dir") { _ = alerts.observe(runnerRows(dir)) }
-    let data = try! JSONSerialization.data(withJSONObject: ["rounds": rounds, "posted": rec.posted],
+    let data = try! JSONSerialization.data(withJSONObject: ["rounds": rounds, "posted": rec.posted,
+                                                            "remembered": store.strings(PrefKey.notifiedJobs)],
                                            options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
     exit(0)

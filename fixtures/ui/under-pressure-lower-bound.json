@@ -1,0 +1,15 @@
+{
+ "_base": "under-pressure.json",
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 49499498086,
+  "pressure_level": null,
+  "score_level": "WATCH",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.817,
+  "kernel_level": "critical",
+  "level_reason": "lower bound: vm_stat failed",
+  "rates": "unavailable"
+ }
+}

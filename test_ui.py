@@ -1618,6 +1618,29 @@ class ManagedJobsCardTests(StubCase):
         self.assertIsNone(r["budget"])
         self.assertEqual(r["managed"][0]["detail"], "command running · 42s")
 
+    def idle_hold(self, **runner):
+        p = payload("managed-jobs-intervention.json", runner_jobs=[])
+        p["runner"] = dict(p["runner"], queue={"length": 0, "max": 32}, **runner)
+        return p
+
+    def test_a_hold_on_an_idle_machine_shows_no_banner_and_no_card(self):
+        r = s2(payload=self.idle_hold())["s2"]
+        self.assertEqual((r["hold"], r["card"]), (None, False))
+        self.assertFalse(any(l.startswith("Holding new heavy work") for l in labels(a11y_path_payload(self.idle_hold()))))
+        # A runner that is not protecting still shows its card, never a hold.
+        r = s2(payload=self.idle_hold(mode="paused"))["s2"]
+        self.assertEqual((r["hold"], r["card"]), (None, True))
+
+    def test_a_hold_shows_once_work_is_waiting(self):
+        p = self.idle_hold()
+        p["runner"]["queue"]["length"] = 1
+        r = s2(payload=p)["s2"]
+        self.assertEqual((bool(r["hold"]), r["card"]), (True, True))
+        # The queue count can lag the rows: a waiting row is enough.
+        p = self.idle_hold()
+        p["runner_jobs"] = [effective(FIXTURES / "managed-jobs-intervention.json")["runner_jobs"][2]]
+        self.assertTrue(s2(payload=p)["s2"]["hold"])
+
     def test_mode_control_runs_run_mode_and_nothing_else(self):
         fixture = FIXTURES / "managed-jobs-v2.json"
         self.assertEqual(host("run-mode", fixture, "--mode", "paused")["actions"], ["run-mode paused"])
@@ -1638,7 +1661,8 @@ class UnknownPressureTests(StubCase):
 
     def test_unknown_is_muted_with_a_question_mark(self):
         r = s2("pressure-unknown.json")
-        self.assertEqual(r["s2"]["pressure"], {"word": "Unknown", "tone": "muted", "glyph": True})
+        self.assertEqual(r["s2"]["pressure"], {"word": "Unknown", "headline": "Unknown", "tone": "muted",
+                                               "glyph": True})
         self.assertEqual((r["status"]["kind"], r["status"]["text"]), ("plain", "Sampled 6 min ago"))
         self.assertNotIn("stale", r["status"]["text"])
         # Busy states never hide staleness, and the spoken label keeps it.
@@ -1671,6 +1695,24 @@ class UnknownPressureTests(StubCase):
                                     "level_reason": "no rate baseline", "rates": "unavailable"}))
         self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 2.0G")
 
+    def test_a_lower_bound_level_is_shown_as_at_least(self):
+        p = payload("overview.json")
+        p["system"] = dict(p["system"], score_level="WATCH", level_reason="lower bound: vm_stat failed",
+                           rates="unavailable")
+        self.assertEqual(s2(payload=p)["s2"]["pressure"]["headline"], "≥ Watch")
+        ring = next(l for l in labels(a11y_path_payload(p)) if l.startswith("Memory "))
+        self.assertIn("pressure at least watch", ring)
+        p["system"]["level_reason"] = None
+        self.assertEqual(s2(payload=p)["s2"]["pressure"]["headline"], "Watch")
+
+    def test_kernel_level_stands_in_when_the_strict_read_failed(self):
+        p = payload("under-pressure.json")
+        p["system"] = dict(p["system"], score_level="UNKNOWN", pressure_level=None, kernel_level="critical",
+                           level_reason="vm_stat failed", rates="unavailable")
+        found = said_payload(p)
+        self.assertIn("Under pressure, kernel critical", found)
+        self.assertTrue(any("kernel critical" in l and l.startswith("CPU") for l in found), found)
+
     def test_retry_copy_under_unknown_says_the_gate_lets_it_run(self):
         found = said("pressure-unknown.json")
         self.assertTrue(any("a retry runs without a memory check" in l for l in found), found)
@@ -1694,6 +1736,10 @@ class CoverageTests(unittest.TestCase):
     def test_without_coverage_the_route_state_is_named(self):
         row = self.pill(payload("overview.json"))
         self.assertEqual(row["described"] or row["value"], "Route off")
+
+
+def said_payload(p):
+    return [r["label"] or r["value"] for r in a11y_path_payload(p)]
 
 
 def a11y_path_payload(p):
@@ -1901,11 +1947,53 @@ class InterventionNotificationTests(unittest.TestCase):
         r = self.probe([[job(state="cancelled_by_policy", changed=300.0)]])
         self.assertEqual(r["posted"][0]["title"], "memmon cancelled Search index rebuild")
 
-    def test_runner_records_are_read_from_disk_by_run_id_only(self):
+    def test_a_failed_hand_over_is_retried_and_not_remembered(self):
+        r = self.probe([[job()], [job()], [job()]], True, "--fail-adds", "1")
+        self.assertEqual([len(x) for x in r["rounds"]], [1, 1, 0])
+        self.assertEqual(len(r["remembered"]), 1)
+        r = self.probe([[job(changed=500.0)]], True, "--fail-adds", "5")
+        self.assertEqual(len(r["remembered"]), 1)          # the failed one is not added
+        self.assertEqual(len(self.probe([[job(changed=500.0)]])["posted"]), 1)
+
+    def runner_dir(self):
         runner = self.dir / "runner"
-        (runner / "coord").mkdir(parents=True)
-        (runner / ("b" * 32 + ".json")).write_text(json.dumps(job(id_="b" * 32)))
+        (runner / "coord").mkdir(parents=True, exist_ok=True)
+        return runner
+
+    def record(self, runner, rid, body=None, lease="held"):
+        (runner / f"{rid}.json").write_text(body if body is not None else json.dumps(job(id_=rid)))
+        if lease is None:
+            return
+        fh = open(runner / f"{rid}.lease", "w")
+        self.addCleanup(fh.close)
+        if lease == "held":
+            fcntl.flock(fh, fcntl.LOCK_EX)
+
+    def test_runner_records_are_read_from_disk_by_run_id_only(self):
+        runner = self.runner_dir()
+        self.record(runner, "b" * 32)
         (runner / "coord" / "admission-state.json").write_text(json.dumps(job(id_="c" * 32)))
         (runner / "not-a-run.json").write_text(json.dumps(job(id_="d" * 32)))
         r = self.probe([], True, "--runner-dir", str(runner))
         self.assertEqual([p["id"].split("|")[0] for p in r["posted"]], ["b" * 32])
+
+    def test_a_record_without_a_live_lease_never_notifies(self):
+        runner = self.runner_dir()
+        self.record(runner, "1" * 32, lease="free")       # the runner died: lease unlocked
+        self.record(runner, "2" * 32, lease=None)         # no lease at all
+        self.record(runner, "3" * 32)
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertEqual([p["id"].split("|")[0] for p in r["posted"]], ["3" * 32])
+
+    def test_oversized_garbage_and_excess_records_are_skipped(self):
+        runner = self.runner_dir()
+        big = json.dumps(dict(job(id_="4" * 32), pad="x" * (300 * 1024)))
+        self.record(runner, "4" * 32, body=big)
+        self.record(runner, "5" * 32, body="{not json")
+        self.record(runner, "6" * 32, body="[1, 2]")
+        self.assertEqual(self.probe([], True, "--runner-dir", str(runner))["posted"], [])
+        for k in range(70):
+            self.record(runner, f"{k + 0x100:032x}")
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertLessEqual(len(r["posted"]), 64)
+        self.assertGreater(len(r["posted"]), 0)
