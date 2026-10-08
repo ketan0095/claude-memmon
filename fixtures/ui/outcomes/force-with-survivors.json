@@ -1,4 +1,5 @@
 {
+ "_comment": "Defence only: py never emits force_stopped with remaining rows. It pins that Swift still shows a listed survivor as partial.",
  "exit": 0,
  "after_force": true,
  "stdout": {

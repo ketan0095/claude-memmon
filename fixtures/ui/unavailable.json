@@ -7,7 +7,9 @@
   "used_bytes": null,
   "pressure_level": null,
   "score_level": null,
-  "reason": "vm_stat did not answer"
+  "reason": "vm_stat did not answer",
+  "cpu_coverage": 0.091,
+  "cpu_cores": null
  },
  "protection": {
   "summary": "off",
@@ -78,11 +80,11 @@
    "title": "Checkout refactor",
    "project": "acme-web",
    "worktree": "checkout",
-   "activity": "Building \u00b7 typecheck",
+   "activity": "Building · typecheck",
    "confidence": "exact",
    "footprint_bytes": null,
    "cpu_cores": null,
-   "cpu_coverage": 1.0,
+   "cpu_coverage": null,
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
    "member_count": 9,
@@ -118,7 +120,7 @@
     {
      "job_id": "48260.1791449050.500100",
      "kind": "server",
-     "label": "dev server \u00b7 port 3000",
+     "label": "dev server · port 3000",
      "action": "stop-server",
      "managed": false,
      "footprint_bytes": 966367641,
@@ -141,11 +143,11 @@
    "title": "Billing API tests",
    "project": "acme-api",
    "worktree": "main",
-   "activity": "Testing \u00b7 vitest run",
+   "activity": "Testing · vitest run",
    "confidence": "inferred",
    "footprint_bytes": 2254857830,
    "cpu_cores": null,
-   "cpu_coverage": 0.0,
+   "cpu_coverage": null,
    "cpu_reason": "warming up",
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
@@ -232,7 +234,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   },
   {
    "owner_id": "unknown:9188.1791400000",
@@ -255,7 +258,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   },
   {
    "owner_id": "unknown:9240.1791400000",
@@ -278,7 +282,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   }
  ],
  "_view": {

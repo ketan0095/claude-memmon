@@ -1,16 +1,5 @@
 {
- "_base": "overview.json",
- "inventory": "degraded",
- "inventory_reason": "libproc self-check failed",
- "system": {
-  "ram_bytes": 51539607552,
-  "used_bytes": 42090679500,
-  "pressure_level": "normal",
-  "score_level": "HEALTHY",
-  "ncpu": 18,
-  "cpu_coverage": 0.0,
-  "cpu_cores": null
- },
+ "_base": "../overview.json",
  "owners": [
   {
    "owner_id": "claude:fixture-a",
@@ -20,12 +9,12 @@
    "project": "acme-web",
    "worktree": "checkout",
    "activity": "Building · typecheck",
-   "confidence": "inferred",
+   "confidence": "exact",
    "footprint_bytes": 9556302233,
-   "cpu_cores": null,
-   "cpu_coverage": null,
-   "growth_bytes_per_10min": null,
-   "growth_reason": "not enough history",
+   "cpu_cores": 3.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
    "member_count": 9,
    "root": {
     "pid": 48211,
@@ -34,7 +23,7 @@
      318442
     ]
    },
-   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "token": "fresh-session-token",
    "jobs": [
     {
      "job_id": "48211.1791449000.318442",
@@ -54,7 +43,7 @@
      "managed": false,
      "footprint_bytes": 7301444403,
      "member_count": 5,
-     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODMwMiwic3RhcnQiOlsxNzkxNDQ5MTAwLDEyMDA0NF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+     "token": "fresh-build-token"
     },
     {
      "job_id": "48260.1791449050.500100",
@@ -71,8 +60,7 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null,
-   "cpu_reason": "not measured"
+   "shared_with": null
   },
   {
    "owner_id": "service:vm:docker-desktop",
@@ -84,9 +72,9 @@
    "activity": "Working",
    "confidence": "shared",
    "footprint_bytes": 6979321856,
-   "cpu_cores": null,
-   "cpu_coverage": null,
-   "growth_bytes_per_10min": null,
+   "cpu_cores": 0.8,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 41943040,
    "member_count": 6,
    "root": {
     "pid": 5101,
@@ -124,9 +112,7 @@
     "Checkout refactor",
     "Billing API tests"
    ],
-   "stop_command": null,
-   "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   "stop_command": null
   },
   {
    "owner_id": "app:com.example.browser",
@@ -136,9 +122,9 @@
    "activity": "Working",
    "confidence": "exact",
    "footprint_bytes": 5583457484,
-   "cpu_cores": null,
-   "cpu_coverage": null,
-   "growth_bytes_per_10min": null,
+   "cpu_cores": 0.6,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 78643200,
    "member_count": 28,
    "root": {
     "pid": 6200,
@@ -161,9 +147,36 @@
      "pid": 6390,
      "launch_date": 1791446000.0
     }
-   ],
-   "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   ]
+  },
+  {
+   "owner_id": "codex-app:7001.1791440000",
+   "kind": "codex-app",
+   "agent": "codex",
+   "title": "Codex app",
+   "activity": "Idle",
+   "confidence": "shared",
+   "footprint_bytes": 3650722201,
+   "cpu_cores": 0.4,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": null,
+   "growth_reason": "not enough history",
+   "member_count": 4,
+   "root": {
+    "pid": 7001,
+    "start": [
+     1791440000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "shared_with": [
+    "Billing API tests",
+    "Search tuning",
+    "Docs pass"
+   ]
   },
   {
    "owner_id": "codex:fixture-b",
@@ -177,7 +190,7 @@
    "footprint_bytes": 2254857830,
    "cpu_cores": null,
    "cpu_coverage": null,
-   "cpu_reason": "not measured",
+   "cpu_reason": "warming up",
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
    "member_count": 5,
@@ -216,6 +229,78 @@
    ]
   },
   {
+   "owner_id": "unknown:9101.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9101)",
+   "confidence": "unknown",
+   "footprint_bytes": 966367641,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 3,
+   "root": {
+    "pid": 9101,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null
+  },
+  {
+   "owner_id": "unknown:9188.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9188)",
+   "confidence": "unknown",
+   "footprint_bytes": 644245094,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 2,
+   "root": {
+    "pid": 9188,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null
+  },
+  {
+   "owner_id": "unknown:9240.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9240)",
+   "confidence": "unknown",
+   "footprint_bytes": 322122547,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 1,
+   "root": {
+    "pid": 9240,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null
+  },
+  {
    "owner_id": "claude:fixture-c",
    "kind": "claude",
    "agent": "claude",
@@ -223,11 +308,11 @@
    "project": "acme-web",
    "worktree": "copy",
    "activity": "Idle",
-   "confidence": "inferred",
+   "confidence": "exact",
    "footprint_bytes": 644245094,
-   "cpu_cores": null,
-   "cpu_coverage": null,
-   "growth_bytes_per_10min": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 2097152,
    "member_count": 2,
    "root": {
     "pid": 51002,
@@ -240,12 +325,7 @@
    "jobs": [],
    "actions": [
     "end-session"
-   ],
-   "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   ]
   }
- ],
- "_view": {
-  "select": "claude:fixture-a"
- }
+ ]
 }

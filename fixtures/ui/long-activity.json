@@ -123,5 +123,14 @@
    "instances": null,
    "shared_with": null
   }
- ]
+ ],
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": 6.2,
+  "cpu_coverage": 1.0
+ }
 }

@@ -106,7 +106,7 @@
    "confidence": "inferred",
    "footprint_bytes": 2254857830,
    "cpu_cores": null,
-   "cpu_coverage": 0.0,
+   "cpu_coverage": null,
    "cpu_reason": "warming up",
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
@@ -176,5 +176,14 @@
  "_view": {
   "select": "app:com.example.shellterm",
   "confirm": "quit-app"
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.737
  }
 }

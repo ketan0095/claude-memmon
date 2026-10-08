@@ -20,15 +20,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 
-# py's real owners generator, present once the S1 Python lane is in this tree.
-try:
-    import memmon
-    import memmon_owners
-    import memmon_procs
-    import testkit
-    HAVE_GENERATOR = hasattr(memmon_owners, "owners_payload")
-except ImportError:
-    HAVE_GENERATOR = False
+# py's real owners generator: the contract tests run against it, never skip.
+import re
+from unittest import mock
+
+import memmon
+import memmon_act
+import memmon_owners
+import memmon_procs
+import testkit
 FIXTURES = ROOT / "fixtures" / "ui"
 BIN = None
 _BUILD_DIR = None
@@ -106,7 +106,7 @@ class StubCase(unittest.TestCase):
 
 
 class ActOutcomeDecodingTests(StubCase):
-    """A21: stdout JSON is decoded first and must agree with the exit code."""
+    """stdout JSON is decoded first and must agree with the exit code."""
 
     def probe(self, body, timeout="5"):
         return run_json("--act-probe", "--script", self.stub(body), "--timeout", timeout,
@@ -172,7 +172,7 @@ class ActOutcomeDecodingTests(StubCase):
 
 
 class QuitAppEngineTests(unittest.TestCase):
-    """A15: per-instance outcomes on a fake AppControl; force only for survivors."""
+    """Per-instance outcomes on a fake AppControl; force only for survivors."""
 
     def scenario(self, name):
         return run_json("--selftest-quit-app", name)
@@ -223,6 +223,12 @@ class QuitAppEngineTests(unittest.TestCase):
         self.assertFalse(r["complete_after_quit"])
         self.assertFalse(r["complete_after_force"])
 
+    def test_instance_exiting_at_quit_time_is_already_quit_not_an_app(self):
+        r = self.scenario("raced-exit")
+        self.assertEqual([i["state"] for i in r["after_quit"]], ["exited", "already_exited"])
+        self.assertTrue(r["complete_after_quit"])
+        self.assertNotIn("terminate 102", r["quit_calls"])
+
     def test_instance_that_quit_before_force_is_decided_by_memmon(self):
         r = self.scenario("quit-before-force")
         self.assertEqual(r["force_calls"], [])
@@ -243,7 +249,7 @@ def app_token(instances, bundle="com.example.containers"):
 
 
 class QuitAppLockTests(StubCase):
-    """S1.5: Swift holds actions.lock and hands it to verify-app by descriptor."""
+    """Swift holds actions.lock and hands it to verify-app by descriptor."""
 
     VERIFY = """
 args = sys.argv[1:]
@@ -270,25 +276,38 @@ calls = REPORT + '.calls'
 n = int(open(calls).read()) + 1 if os.path.exists(calls) else 1
 open(calls, 'w').write(str(n))
 open(REPORT if n == 1 else f'{REPORT}.{n}', 'w').write(json.dumps(report))
+open(f'{REPORT}.argv.{n}', 'w').write(json.dumps(args))
 if SLEEP:
     # A slow memmon that would not die on SIGTERM either: only never
     # signalling it lets the caller return at once.
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(SLEEP)
-status = FIRST if n == 1 else LATER
-print(json.dumps({'result': RESULT, 'reason': REASON,
-                  'instances': [{'pid': p, 'status': st} for p, st in status.items()]}))
-sys.exit(CODE)
+r = RESPONSES[min(n, len(RESPONSES)) - 1]
+out = {'result': r['result'], 'reason': r['reason'],
+       'instances': [{'pid': p, 'status': st} for p, st in r['status'].items()]}
+if r['result'] in ('verified', 'already_exited'):
+    out['token'] = f'fresh-{n}'
+print(json.dumps(out))
+sys.exit(r['code'])
 """
 
-    def verify_stub(self, result="verified", reason=None, code=0, later=None, sleep=0):
-        first = {5101: "running", 5188: "running"}
-        later = later or {5101: "exited", 5188: "exited"}
+    def verify_stub(self, result="verified", reason=None, code=0, later=None, sleep=0, responses=None):
+        """memmon verify-app stand-in. Call n answers responses[n-1] (the last
+        repeats) and, when it verifies, mints the token `fresh-n`."""
+        if responses is None:
+            responses = [
+                {"result": result, "reason": reason, "code": code,
+                 "status": {5101: "running", 5188: "running"}},
+                {"result": "verified", "reason": None, "code": 0,
+                 "status": later or {5101: "exited", 5188: "exited"}}]
         body = (f"LOCK = {str(self.lock)!r}\nREPORT = {str(self.dir / 'verify.json')!r}\n"
-                f"RESULT = {result!r}\nREASON = {reason!r}\nCODE = {code}\nSLEEP = {sleep}\n"
-                f"FIRST = {first!r}\nLATER = {later!r}\n" + self.VERIFY)
+                f"SLEEP = {sleep}\nRESPONSES = {responses!r}\n" + self.VERIFY)
         return self.stub(body)
+
+    def verify_target(self, n):
+        args = json.loads((self.dir / f"verify.json.argv.{n}").read_text())
+        return args[args.index("--target") + 1]
 
     def verify_calls(self):
         p = self.dir / "verify.json.calls"
@@ -298,8 +317,8 @@ sys.exit(CODE)
         super().setUp()
         self.lock = self.dir / "coord" / "actions.lock"
 
-    def quit_probe(self, script, timeout=30, act_timeout=None):
-        extra = ["--timeout", str(act_timeout)] if act_timeout else []
+    def quit_probe(self, script, timeout=30, act_timeout=None, extra=()):
+        extra = (["--timeout", str(act_timeout)] if act_timeout else []) + list(extra)
         return run_json("--quit-probe", "--script", script, "--lock-path", str(self.lock),
                         "--token", app_token([(5101, 1791442800.0), (5188, 1791446400.0)]),
                         *extra, timeout=timeout)
@@ -324,6 +343,54 @@ sys.exit(CODE)
         self.assertEqual(after_watch, {"fd_open": True, "same_description_relock": True,
                                        "held_against_others": True})
         self.assertTrue(r["lock_free_after"])
+
+    def test_post_watch_check_uses_the_token_the_pre_quit_check_minted(self):
+        tok = app_token([(5101, 1791442800.0), (5188, 1791446400.0)])
+        r = self.quit_probe(self.verify_stub())
+        self.assertEqual(r["states"], ["exited", "exited"])
+        self.assertEqual(self.verify_target(1), tok)
+        self.assertEqual(self.verify_target(2), "fresh-1")
+        self.assertEqual(r["token"], "fresh-2")
+
+    FORCE_FLOW = [
+        {"result": "verified", "reason": None, "code": 0, "status": {5101: "running", 5188: "running"}},
+        {"result": "verified", "reason": None, "code": 0, "status": {5101: "exited", 5188: "running"}},
+        None,   # the check right before Force
+        {"result": "already_exited", "reason": None, "code": 0, "status": {5101: "exited", 5188: "exited"}},
+    ]
+
+    def force_probe(self, before_force):
+        flow = list(self.FORCE_FLOW)
+        flow[2] = before_force
+        return self.quit_probe(self.verify_stub(responses=flow),
+                               extra=["--stubborn", "5188", "--force-after"])
+
+    def test_force_rechecks_with_the_fresh_token_under_the_lock(self):
+        r = self.force_probe({"result": "verified", "reason": None, "code": 0,
+                              "status": {5101: "exited", 5188: "running"}})
+        self.assertEqual(r["states"], ["exited", "running"])
+        self.assertEqual(self.verify_target(3), "fresh-2")
+        self.assertEqual(self.verify_target(4), "fresh-3")
+        self.assertEqual(r["force_calls"], ["force 5188 locked"])
+        self.assertEqual(r["force_states"], ["exited", "force_stopped"])
+        held = json.loads((self.dir / "verify.json.3").read_text())
+        self.assertTrue(held["held_against_others"])
+
+    def test_force_refused_by_the_last_check_signals_nothing(self):
+        for reason in ("hosts_sessions", "instance_changed", "stale_token", "protected"):
+            with self.subTest(reason=reason):
+                for f in self.dir.glob("verify.json*"):
+                    f.unlink()
+                r = self.force_probe({"result": "refused", "reason": reason, "code": 4, "status": {}})
+                self.assertEqual(r["force_view"], "refused")
+                self.assertEqual(r["force_reason"], reason)
+                self.assertEqual(r["force_calls"], [])
+
+    def test_instance_gone_before_force_is_not_signalled(self):
+        r = self.force_probe({"result": "already_exited", "reason": None, "code": 0,
+                              "status": {5101: "exited", 5188: "exited"}})
+        self.assertEqual(r["force_calls"], [])
+        self.assertEqual(r["force_states"], ["exited", "exited"])
 
     def test_memmon_not_appkit_decides_an_instance_exited(self):
         r = self.quit_probe(self.verify_stub(later={5101: "exited", 5188: "running"}))
@@ -372,7 +439,7 @@ def luminance(hex_colour):
 
 
 class RenderTests(unittest.TestCase):
-    """A20: every fixture renders in both themes from the dynamic palette."""
+    """Every fixture renders in both themes from the dynamic palette."""
 
     def test_every_fixture_renders_in_both_themes(self):
         fixtures = sorted(FIXTURES.glob("*.json"))
@@ -407,7 +474,7 @@ class RenderTests(unittest.TestCase):
 
 
 class AccessibilityTests(unittest.TestCase):
-    """R5: walks the accessibility tree SwiftUI builds for each fixture."""
+    """Walks the accessibility tree SwiftUI builds for each fixture."""
 
     def test_overview_labels_rows_chips_meter_and_status_lines(self):
         rows = a11y("overview.json")
@@ -484,6 +551,17 @@ class AccessibilityTests(unittest.TestCase):
         for fixture in ("outcome-outside-force.json", "outcome-force-with-survivors.json"):
             self.assertFalse(any("Force" in l for l in labels(a11y(fixture))), fixture)
 
+    def test_self_exited_survivors_are_not_counted_as_force_stopped(self):
+        text = self.spoken("outcome-force-self-exited.json")
+        self.assertIn("Typecheck force-stopped · 1 ended by Force · 1 had already exited", text)
+        self.assertNotIn("2 force-stopped", text)
+
+    def test_unlisted_survivors_are_counted_never_dropped(self):
+        text = self.spoken("outcome-outside-unlisted.json")
+        self.assertIn("Typecheck partly stopped · 1 force-stopped · 3 more still running that memmon could not list",
+                      text)
+        self.assertNotIn("0 still running", text)
+
     def test_root_exited_says_nothing_was_signalled(self):
         text = self.spoken("outcome-root-exited.json")
         self.assertIn("Typecheck had exited — but 2 of its processes are still running · nothing was signalled", text)
@@ -543,7 +621,42 @@ class AccessibilityTests(unittest.TestCase):
 
     def test_cpu_total_only_with_full_coverage(self):
         self.assertIn("CPU partly measured", self.spoken("small.json"))
-        self.assertIn("CPU 5.6 / 18 cores", self.spoken("overview.json"))
+        self.assertIn("CPU partly measured", self.spoken("overview.json"))
+        self.assertIn("CPU 3.1 / 18 cores", self.spoken("helpers-only.json"))
+
+    def test_unattributed_cpu_needs_every_tree_fully_measured(self):
+        found = labels(a11y("unattributed-partial.json"))
+        row = next(l for l in found if l.startswith("Unattributed,"))
+        self.assertIn("CPU not available, partly measured", row)
+
+    def test_kept_owners_are_named_by_kind(self):
+        self.assertIn("1 nested session kept running · 1 app or service kept running",
+                      self.spoken("outcome-kept.json"))
+
+    def test_force_with_named_survivors_stays_partial(self):
+        text = self.spoken("outcome-force-survivors.json")
+        self.assertIn("Typecheck partly stopped · 1 force-stopped · 1 process still running", text)
+        self.assertFalse(any("Force" in l for l in labels(a11y("outcome-force-survivors.json"))))
+
+    def test_partial_landing_while_closed_is_a_banner_not_a_force(self):
+        for fixture, title in (("outcome-partial-closed.json", "Typecheck partly stopped"),
+                               ("quit-service-partial-closed.json", "Container VM still running")):
+            with self.subTest(fixture=fixture):
+                self.assertIn(title, self.spoken(fixture))
+                self.assertFalse(any(l.startswith("Force") for l in labels(a11y(fixture))))
+
+    def test_refusal_vocabulary_and_constants_match_memmon(self):
+        src = (ROOT / "memmon_act.py").read_text()
+        reasons = sorted(set(re.findall(r'Refused\("([a-z_]+)"\)', src))
+                         | set(re.findall(r'"reason": "([a-z_]+)"', src)))
+        self.assertIn("hosts_sessions", reasons)
+        r = run_json("--constants", "--reasons", ",".join(reasons))
+        for reason in reasons:
+            self.assertFalse(r["refusals"][reason].startswith("memmon declined"), reason)
+        # The menu bar outlives memmon's own act budget, and never offers an
+        # app Force longer than memmon accepts a token.
+        self.assertGreater(r["act_timeout"], memmon_act.ACT_BUDGET_S)
+        self.assertLessEqual(r["force_ttl"], memmon_owners.TOKEN_TTL_S)
 
     def test_line_two_wraps_to_at_most_two_lines(self):
         rows = a11y("long-activity.json")
@@ -589,7 +702,10 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Conversation, 1.2 GB · stays open when you stop a build", detail)
         self.assertFalse(any(l.startswith("Stop job: Conversation") for l in detail))
         shared = labels(a11y("shared-detail.json"))
-        pointer = next(l for l in shared if l.startswith("Docs pass,"))
+        # The generator's own title for a Codex frontend.
+        title = "Codex thread · runs in Codex daemon"
+        self.assertIn(f'owner.title = "{title}"', (ROOT / "memmon_owners.py").read_text())
+        pointer = next(l for l in shared if l.startswith(title + ","))
         self.assertIn("Codex thread · 1 process", pointer)
         self.assertIn("ownership confidence: shared", pointer)
         growth = labels(a11y("growth-sort.json"))
@@ -673,6 +789,30 @@ class HostedPopoverTests(unittest.TestCase):
         self.assertEqual(old["phase"], "closed")
         self.assertIn("more than 2 minutes old", old["banner"])
 
+    def test_app_force_window_counts_time_asleep(self):
+        fixture = str(FIXTURES / "quit-service-partial.json")
+        awake = run_json("--selftest-host", "force-ttl", "--fixture", fixture, "--sleep", "30")
+        self.assertEqual(awake["actions"], ["force"])
+        slept = run_json("--selftest-host", "force-ttl", "--fixture", fixture, "--sleep", "3600")
+        self.assertEqual(slept["actions"], [])
+        self.assertIn("more than 2 minutes old", slept["banner"])
+
+    def rebind(self, nxt):
+        return run_json("--selftest-host", "rebind", "--fixture", str(FIXTURES / "confirm-stop.json"),
+                        "--next", str(FIXTURES / "next" / nxt))
+
+    def test_open_confirm_follows_a_refresh_or_closes(self):
+        same = self.rebind("rebind-same.json")
+        self.assertEqual(same["phase"], "ask")
+        self.assertEqual(same["job_token"], "fresh-build-token")
+        self.assertEqual(same["owner_token"], "fresh-session-token")
+        changed = self.rebind("rebind-changed.json")
+        self.assertEqual(changed["phase"], "closed")
+        self.assertIn("Nothing done", changed["banner"])
+        gone = self.rebind("rebind-job-gone.json")
+        self.assertEqual(gone["phase"], "closed")
+        self.assertIn("no longer running", gone["banner"])
+
     def test_freshness_ticker_marks_a_live_sample_stale_after_95_s(self):
         r = self.host("ticker", "overview.json")
         self.assertEqual(r["before"], "Sampled 2s ago by the live reader")
@@ -682,9 +822,9 @@ class HostedPopoverTests(unittest.TestCase):
 
 
 class RefreshAndTitleTests(StubCase):
-    """C11/C24: a timed-out scan is never signalled or duplicated, and the
-    request made meanwhile still runs; C31: the status title never says green
-    without a fresh, known level."""
+    """A timed-out scan is never signalled or duplicated, the request made
+    meanwhile still runs, and the status title never says green without a
+    fresh, known level."""
 
     def test_timed_out_scan_is_single_flight_and_the_queued_refresh_runs(self):
         count = self.dir / "count"
@@ -698,7 +838,7 @@ class RefreshAndTitleTests(StubCase):
         self.assertTrue(r["after_timeout"]["still_sampling"])
         self.assertIn("still sampling", r["after_timeout"]["error"])
         self.assertEqual(r["while_busy_scans"], 1)
-        self.assertEqual(r["end"], {"scans": 2, "loaded": True, "still_sampling": False})
+        self.assertEqual(r["end"], {"scans": 2, "loaded": True, "still_sampling": False, "error": None})
         # The slow first scan ran to completion: it was never signalled.
         self.assertEqual(count.read_text(), "2")
         self.assertTrue((self.dir / "count.finished").exists())
@@ -709,6 +849,12 @@ class RefreshAndTitleTests(StubCase):
         self.assertIn("could not start memmon", r["first"]["error"])
         self.assertEqual(r["second"]["scans"], 2)
         self.assertFalse(r["second"]["refreshing"])
+
+    def test_still_sampling_error_clears_when_the_scan_ends(self):
+        script = self.stub("time.sleep(1.5)\nprint('late')\n")
+        r = run_json("--selftest-refresh", "--script", script, "--timeout", "0.3", "--single", timeout=30)
+        self.assertIn("still sampling", r["during"]["error"])
+        self.assertEqual(r["after"], {"error": None, "still_sampling": False})
 
     def title(self, payload, now):
         path = self.dir / "latest.json"
@@ -724,10 +870,16 @@ class RefreshAndTitleTests(StubCase):
         self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1181), "⚪ 2.0G")
 
 
-@unittest.skipUnless(HAVE_GENERATOR, "memmon_owners/testkit absent: needs the merged S1 tree")
 class GeneratorContractTests(unittest.TestCase):
     """Fixtures can drift from the contract, so one payload comes straight from
-    memmon_owners.owners_payload over a scripted process table."""
+    memmon.owners_json over a scripted process table, with only the sampler,
+    the gate log and the memory reader faked."""
+
+    GATE = {"installed": True, "paused": False, "policy": {"mode": "block-critical"},
+            "counts": {"stopped": 0, "warned": 0}, "history": {"events": []}, "pending_retry": []}
+    LEASE = {"id": "run-gen-1", "resource": "heavy", "label": "acme-api tests", "cwd": "/work/acme-api",
+             "wrapper_pid": 900, "child_pid": None, "created_at": 1_791_404_988.0, "state": "waiting",
+             "reason": "memory pressure: WATCH", "elapsed_seconds": 12}
 
     T0 = 1_791_400_000
 
@@ -743,7 +895,8 @@ class GeneratorContractTests(unittest.TestCase):
         ctx = memmon_owners.Context(sessions_dir=sessions,
                                     socks_dir=os.path.join(self.state.root, "socks"),
                                     codex_home=os.path.join(self.state.root, "codex"),
-                                    classify=lambda c: memmon.classify_command(c, {}))
+                                    classify=lambda c: memmon.classify_command(c, {}),
+                                    leases=[self.LEASE])
         testkit.session_file(sessions, 10, T0 + 10, job_id="0000a001")
 
         def shell(cmd):
@@ -755,11 +908,17 @@ class GeneratorContractTests(unittest.TestCase):
         src = testkit.FakeSource(procs, argv={20: shell("pnpm --filter web typecheck"),
                                               30: shell("pnpm dev")})
         inv = memmon_procs.snapshot(src, clock=lambda: T0 + 5000, mono=lambda: 10 ** 12)
-        part = memmon_owners.partition(inv, ctx)
-        payload = memmon_owners.owners_payload(
-            memmon_owners.Sample(inv, part, {10: 0.1}, "warming up"), ctx, now=inv.ts,
-            system={"ram_bytes": 48 << 30, "used_bytes": 30 << 30, "pressure_level": "normal",
-                    "score_level": "HEALTHY", "ncpu": 18, "cpu_cores": None, "reason": None})
+
+        def sample(window, source=None, ctx=None, sleep=None):
+            part = memmon_owners.partition(inv, ctx)
+            return memmon_owners.Sample(inv, part, {10: 0.1}, "warming up"), 1.0
+        with mock.patch.object(memmon, "owners_sample", sample), \
+                mock.patch.object(memmon, "gate_stats", return_value=self.GATE), \
+                mock.patch.object(memmon, "gate_installed", return_value=True), \
+                mock.patch.object(memmon, "pressure", return_value={"level": "HEALTHY"}), \
+                mock.patch.object(memmon, "read_vm", return_value={}):
+            payload = memmon.owners_json(1.0, ctx=ctx, system_reader=lambda: {
+                "ram_bytes": 48 << 30, "used_bytes": 30 << 30, "pressure_level": "normal"})
         payload["_now"] = payload["ts"] + 2
         payload["_view"] = view
         path = Path(self.out.name) / "generated.json"
@@ -780,10 +939,17 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertIn("ownership confidence: exact", row)
         self.assertTrue(any(l.startswith("Unattributed,") for l in found))
         self.assertIn("Memory pressure normal", " ".join(r["value"] for r in rows))
-        # No project for a scripted session, and no gate object in this payload:
-        # both must read as unknown rather than as a claim.
+        # No project for a scripted session reads as unknown, not as a claim.
         self.assertIn("No project detected", row)
-        self.assertIn("Status unavailable", " ".join(r["value"] for r in rows))
+        # owners_json's own assembly: partial CPU coverage gives no total, and
+        # the waiting runner lease reaches the Managed jobs card verbatim.
+        self.assertLess(payload["system"]["cpu_coverage"], 1)
+        self.assertIsNone(payload["system"]["cpu_cores"])
+        self.assertEqual(payload["runner_jobs"], [self.LEASE])
+        spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
+        self.assertIn("CPU partly measured", spoken)
+        self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, memory pressure: WATCH",
+                      [r["label"] or r["value"] for r in rows])
 
     def test_generated_session_detail_and_stop_confirm(self):
         _, _, session = self.generated({})

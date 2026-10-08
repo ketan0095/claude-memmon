@@ -13,7 +13,8 @@
      5
     ],
     "forceable": true,
-    "argv0": "node"
+    "argv0": "node",
+    "signalled": true
    },
    {
     "pid": 48313,
@@ -22,7 +23,8 @@
      9
     ],
     "forceable": true,
-    "argv0": "node"
+    "argv0": "node",
+    "signalled": true
    }
   ],
   "kept": [],

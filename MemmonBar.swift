@@ -503,10 +503,11 @@ struct OwnersSnap {
         g.group = unknown
         g.footprint = sum(unknown.map { $0.footprint })
         // A partial sum would understate the row, so CPU shows only when every
-        // unattributed tree was measured.
+        // process of every unattributed tree was measured.
         let cpus = unknown.compactMap { $0.cpu }
-        g.cpu = cpus.count == unknown.count ? cpus.reduce(0, +) : nil
-        g.cpuReason = unknown.first { $0.cpu == nil }?.cpuReason ?? "not measured"
+        let full = cpus.count == unknown.count && unknown.allSatisfy { ($0.cpuCoverage ?? 0) >= 1 }
+        g.cpu = full ? cpus.reduce(0, +) : nil
+        g.cpuReason = unknown.first { $0.cpu == nil }?.cpuReason ?? (cpus.isEmpty ? "not measured" : "partly measured")
         g.growth = nil
         g.growthReason = "not tracked"
         g.memberCount = unknown.reduce(0) { $0 + ($1.memberCount ?? 1) }
@@ -701,11 +702,37 @@ struct ActOutcome {
     var watchError: String?
     /// Per-instance liveness from verify-app's instances[].status.
     var alive: InstanceLiveness?
+    /// verify-app's freshly minted token, for the next check under the lock.
+    var token: String?
+
+    /// On a Force result: how many it signalled that are now gone. `exited`
+    /// also counts survivors that ended by themselves, which were not killed.
+    var killed: Int?
+    /// Observed processes the force token could not carry (it lists at most
+    /// a fixed number); assumed still running.
+    var observedUnlisted = 0
 
     /// How many listed survivors Force would act on, and how many it would not.
-    var forceSplit: (forceable: Int, outside: Int) {
-        let n = forceable ?? max(remaining - observed, 0)
-        return (n, observed > 0 ? observed : max(remaining - n, 0))
+    var forceSplit: (forceable: Int, outside: Int) { (forceable ?? 0, observed) }
+
+    /// Processes still running outside what was stopped, listed or not.
+    var outsideParts: [String] {
+        var parts: [String] = []
+        let listed = observed > 0 ? observed : (observedUnlisted > 0 ? 0 : remaining)
+        if listed > 0 { parts.append("\(listed) still running outside what was stopped") }
+        if observedUnlisted > 0 {
+            parts.append("\(observedUnlisted) more still running that memmon could not list")
+        }
+        return parts
+    }
+
+    /// What Force did: killed versus already gone, never one count for both.
+    var forceParts: [String] {
+        guard let k = killed else { return ["\(exited ?? 0) force-stopped"] }
+        var parts = ["\(k) force-stopped"]
+        let gone = (exited ?? 0) - k
+        if gone > 0 { parts.append("\(gone) had already exited") }
+        return parts
     }
 
     static func decode(_ data: Data) -> ActOutcome? {
@@ -715,11 +742,14 @@ struct ActOutcome {
                            captured: int(j["captured"]),
                            remaining: (j["remaining"] as? [Any])?.count ?? 0,
                            forceable: int(j["forceable"]),
-                           observed: (j["observed"] as? [Any])?.count ?? int(j["observed"]) ?? 0,
+                           observed: int(j["observed"]) ?? 0,
                            kept: strs(j["kept"]) ?? [], forceToken: str(j["force_token"]),
                            usedBefore: num(j["used_bytes_before"]),
                            usedAfter: num(j["used_bytes_after"]))
         o.watchError = str(j["watch_error"])
+        o.token = str(j["token"])
+        o.killed = int(j["killed"])
+        o.observedUnlisted = int(j["observed_unlisted"]) ?? 0
         if let list = j["instances"] as? [[String: Any]] {
             var alive: InstanceLiveness = [:]
             for i in list {
@@ -885,15 +915,16 @@ struct QuitApp {
     func quit(_ t: AppToken, alive initial: InstanceLiveness?) -> [InstanceOutcome] {
         var out = t.instances.map { InstanceOutcome(pid: $0.pid, state: .running) }
         var sent: [(Int, RunningAppHandle)] = []
+        var vanished: [Int] = []
         for (k, inst) in t.instances.enumerated() {
             if initial?[inst.pid] == false { out[k].state = .alreadyExited; continue }
             switch identity(inst, t.bundleId) {
-            case .notAnApp: out[k].state = .notAnApp
+            case .notAnApp: vanished.append(k)
             case .changed: out[k].state = .changed
             case .same(let h): _ = h.terminate(); sent.append((k, h))
             }
         }
-        settle(sent, t, &out, as: .exited)
+        settle(sent, t, &out, as: .exited, vanished: vanished, vanishedExit: .alreadyExited)
         return out
     }
 
@@ -917,11 +948,11 @@ struct QuitApp {
 
     /// Watches the signalled instances for up to `watch` seconds, then lets
     /// memmon's identity check, not AppKit, decide which of them exited. An
-    /// instance AppKit lost between the quit and Force (`vanished`) was not
-    /// signalled: it quit on its own or it is no longer reachable as an app.
+    /// instance AppKit has no app for (`vanished`) was not signalled: it
+    /// exited on its own (`vanishedExit`) or it is not reachable as an app.
     private func settle(_ sent: [(Int, RunningAppHandle)], _ t: AppToken,
                         _ out: inout [InstanceOutcome], as finished: InstanceState,
-                        vanished: [Int] = []) {
+                        vanished: [Int] = [], vanishedExit: InstanceState = .exited) {
         guard !sent.isEmpty || !vanished.isEmpty else { return }
         let deadline = control.now() + watch
         var pending = sent
@@ -944,7 +975,7 @@ struct QuitApp {
         }
         for k in vanished {
             switch alive?[t.instances[k].pid] {
-            case false?: out[k].state = .exited
+            case false?: out[k].state = vanishedExit
             case true?: out[k].state = .notAnApp
             case nil: out[k].state = .unverified
             }
@@ -991,11 +1022,28 @@ enum Copy {
             return ("this app hosts agent sessions; quit it from the app itself.", false)
         case "not_stoppable":
             return ("memmon cannot stop this kind of owner.", false)
+        case "attributed":
+            return ("this process now belongs to a session or app. Refresh and try again.", true)
+        case "bad_token", "unknown_action", "wrong_action":
+            return ("memmon could not read this request; nothing was signalled. Refresh and try again.", true)
+        case "bad_lock_fd":
+            return ("memmon could not confirm it held the action lock, so nothing was signalled. Try again.", false)
         case let r?:
             return ("memmon declined (\(r.replacingOccurrences(of: "_", with: " "))).", false)
         default:
             return ("memmon declined.", false)
         }
+    }
+
+    /// `kept` lists owner ids left running inside what was stopped: nested
+    /// agent sessions, or an app or VM started from it.
+    static func keptParts(_ kept: [String]) -> [String] {
+        let sessions = kept.filter { $0.hasPrefix("claude:") || $0.hasPrefix("codex:") }.count
+        let others = kept.count - sessions
+        var out: [String] = []
+        if sessions > 0 { out.append("\(plural(sessions, "nested session")) kept running") }
+        if others > 0 { out.append("\(plural(others, "app or service", "apps or services")) kept running") }
+        return out
     }
 
     /// Survivors are never reported as success: whatever the result word, a
@@ -1009,11 +1057,15 @@ enum Copy {
                           offersRefresh: true)
         case "outside_force":
             return Banner(tone: .warning, title: "\(subject) partly stopped",
-                          body: "· \(o.exited ?? 0) force-stopped · \(o.remaining) still running outside what was stopped",
+                          body: "· " + (o.forceParts + o.outsideParts).joined(separator: " · "),
                           offersRefresh: true)
         default:
+            let force = o.killed != nil ? o.forceParts : []
+            let unlisted = o.observedUnlisted > 0
+                ? ["\(o.observedUnlisted) more still running that memmon could not list"] : []
             return Banner(tone: .warning, title: "\(subject) partly stopped",
-                          body: "· \(left) still running", offersRefresh: true)
+                          body: "· " + (force + ["\(left) still running"] + unlisted).joined(separator: " · "),
+                          offersRefresh: true)
         }
     }
 
@@ -1028,7 +1080,7 @@ enum Copy {
     private static func outcomeBanner(_ view: ActView, subject: String, noun: String, forcing: Bool) -> Banner {
         switch view {
         case .success(let o):
-            if o.remaining > 0 { return partial(o, subject: subject) }
+            if o.remaining > 0 || o.observedUnlisted > 0 { return partial(o, subject: subject) }
             let (m, note) = measured(o)
             var parts: [String] = []
             let title: String
@@ -1046,10 +1098,15 @@ enum Copy {
             default:
                 title = "\(subject) stopped"
             }
-            if let n = o.exited, o.result != "already_exited" {
+            if o.result == "force_stopped", let k = o.killed {
+                // The title already says force-stopped; the body splits what
+                // Force ended from what had ended by itself.
+                parts.append("\(k) ended by Force")
+                if (o.exited ?? 0) > k { parts.append("\((o.exited ?? 0) - k) had already exited") }
+            } else if let n = o.exited, o.result != "already_exited" {
                 parts.append("\(n) of \(o.captured ?? n + o.remaining) processes exited")
             }
-            if !o.kept.isEmpty { parts.append("\(plural(o.kept.count, "nested session")) kept running") }
+            parts += keptParts(o.kept)
             if let m { parts.append(m) }
             return Banner(tone: .success, title: title, body: "· " + parts.joined(separator: " · "), note: note)
         case .refused(let o):
@@ -1099,9 +1156,11 @@ struct ConfirmRequest {
         case ask
         case working
         case partial(ActOutcome)
-        /// `watchEnded` is the uptime when the 10 s watch finished; Force is
+        /// `token` is the one memmon minted at its last check, which Force
+        /// re-verifies before signalling. `watchEnded` is when the 10 s watch
+        /// finished, on a clock that keeps running through sleep; Force is
         /// refused once that is more than 120 s ago.
-        case appPartial(AppToken, [InstanceOutcome], watchEnded: Double)
+        case appPartial(AppToken, [InstanceOutcome], token: String, watchEnded: Double)
     }
     var kind: Kind
     var owner: Owner
@@ -1131,7 +1190,12 @@ final class Model: ObservableObject {
     /// Which overlay button holds keyboard focus, as reported by the overlay.
     var overlayFocus: String?
     /// The clock the app-Force age bound reads; tests move it.
-    var uptime: () -> Double = { ProcessInfo.processInfo.systemUptime }
+    /// The clock the app-Force age bound reads. CLOCK_MONOTONIC keeps
+    /// counting while the Mac sleeps, unlike systemUptime; tests move it.
+    var clock: () -> Double = { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9 }
+    /// Whether the popover is on screen. A partial result that lands while it
+    /// is closed becomes a banner, never a Force overlay waiting to be found.
+    var popoverShown = true
     static let forceTTL = 120.0
     private var ticker: Timer?
     private var scannerBusy = false
@@ -1172,13 +1236,15 @@ final class Model: ObservableObject {
                 DispatchQueue.main.async {
                     self.scannerBusy = false
                     self.stillSampling = false
+                    // The scan this error was about has ended.
+                    if self.loadError?.hasSuffix(Model.stillSamplingNote) == true { self.loadError = nil }
                     self.runQueued()
                 }
             })
             var parsed: OwnersSnap?
             var failure: String?
             if r.timedOut {
-                failure = "memmon did not answer within \(String(format: "%g", CLI.ownersTimeout)) s; it is still sampling"
+                failure = "memmon did not answer within \(String(format: "%g", CLI.ownersTimeout)) s" + Model.stillSamplingNote
             } else if let e = r.launchError {
                 failure = e
             } else if let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any],
@@ -1188,12 +1254,46 @@ final class Model: ObservableObject {
                 failure = r.exit == 0 ? "memmon's answer could not be read" : "memmon reported an error"
             }
             DispatchQueue.main.async {
-                if let parsed { self.snap = parsed; self.loadError = nil } else { self.loadError = failure }
+                if let parsed {
+                    self.snap = parsed; self.loadError = nil
+                    self.rebindConfirm(parsed)
+                } else { self.loadError = failure }
                 self.refreshing = false
                 self.stillSampling = self.scannerBusy
                 self.runQueued()
             }
         }
+    }
+
+    static let stillSamplingNote = "; it is still sampling"
+
+    /// A confirm still being asked about follows the fresh list: the same
+    /// owner (same root, same instances, same job) gets the new token; one
+    /// that changed or left is closed rather than acted on with an old token.
+    func rebindConfirm(_ s: OwnersSnap) {
+        guard var c = confirm, case .ask = c.phase else { return }
+        let fresh = s.owners.first { $0.id == c.owner.id }
+        func same(_ a: Owner, _ b: Owner) -> Bool {
+            a.rootPid == b.rootPid && a.rootStart == b.rootStart
+                && a.instances?.map { $0.pid } == b.instances?.map { $0.pid }
+        }
+        guard let o = fresh, same(o, c.owner) else {
+            confirm = nil
+            banner = Banner(tone: .warning, title: "Nothing done",
+                            body: "— \(c.owner.title) changed while this was open. Check the list and try again.")
+            return
+        }
+        if case .job(let j) = c.kind {
+            guard let nj = o.jobs.first(where: { $0.id == j.id }) else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(j.label) is no longer running in \(o.title).")
+                return
+            }
+            c.kind = .job(nj)
+        }
+        c.owner = o
+        confirm = c
     }
 
     private func runQueued() {
@@ -1225,7 +1325,7 @@ final class Model: ObservableObject {
         case .partial(let o):
             banner = Copy.partial(o, subject: subject(c).0)
             refresh()
-        case .appPartial(_, let results, _):
+        case .appPartial(_, let results, _, _):
             banner = Copy.appBanner(c.owner.title, results, forced: false)
             refresh()
         default:
@@ -1273,7 +1373,7 @@ final class Model: ObservableObject {
 
     func force() {
         guard var c = confirm else { return }
-        if case .appPartial(_, _, let ended) = c.phase, uptime() - ended > Model.forceTTL {
+        if case .appPartial(_, _, _, let ended) = c.phase, clock() - ended > Model.forceTTL {
             confirm = nil
             banner = Banner(tone: .warning, title: "Not force-quit",
                             body: "— " + Copy.staleForce, offersRefresh: true)
@@ -1286,11 +1386,11 @@ final class Model: ObservableObject {
         case .partial(let o):
             guard let tok = o.forceToken else { cancel(); return }
             run(["act", "force", "--target", tok], c)
-        case .appPartial(let t, let prior, _):
+        case .appPartial(let t, let prior, let tok, _):
             c.phase = .working; confirm = c
             let control = appControl
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = Model.forceApp(token: c.owner.token ?? "", t, prior, control: control)
+                let result = Model.forceApp(token: tok, t, prior, control: control)
                 DispatchQueue.main.async { self.applyApp(result, c, t, forced: true) }
             }
         default:
@@ -1309,7 +1409,8 @@ final class Model: ObservableObject {
     }
 
     func apply(_ view: ActView, _ c: ConfirmRequest) {
-        if !c.forcing, case .partial(let o) = view, o.forceToken != nil, o.forceSplit.forceable > 0 {
+        if !c.forcing, popoverShown, case .partial(let o) = view, o.forceToken != nil,
+           o.forceSplit.forceable > 0 {
             var next = c
             next.phase = .partial(o)
             confirm = next
@@ -1324,6 +1425,7 @@ final class Model: ObservableObject {
     /// The overlay is not kept across a closed popover: a partial result
     /// reopened later would offer a Force on a stale picture.
     func popoverClosed() {
+        popoverShown = false
         if case .working? = confirm?.phase { return }
         if confirm != nil { cancel() }
     }
@@ -1331,7 +1433,8 @@ final class Model: ObservableObject {
     enum AppResult {
         case refused(ActOutcome)
         case error(String)
-        case done([InstanceOutcome])
+        /// `token` is the one minted by memmon's last check, for a later Force.
+        case done([InstanceOutcome], token: String)
     }
 
     /// verify-app with the held lock's descriptor inherited.
@@ -1350,6 +1453,19 @@ final class Model: ObservableObject {
         return o.alive
     }
 
+    /// Each verify-app answer carries a fresh token; the next check uses it,
+    /// so a post-watch or pre-Force check is never refused for the age of
+    /// the list the user first saw.
+    final class TokenChain {
+        private(set) var current: String
+        init(_ token: String) { current = token }
+        func verify(fd: Int32) -> ActView {
+            let v = verifyApp(current, fd: fd)
+            if case .success(let o) = v, let t = o.token { current = t }
+            return v
+        }
+    }
+
     /// Lock, have memmon verify every instance, quit and watch, then have
     /// memmon check again by process identity, all while holding the lock.
     static func quitApp(token: String, parsed: AppToken, control: AppControl,
@@ -1361,15 +1477,17 @@ final class Model: ObservableObject {
             return .error(e)
         case .held(let fd):
             defer { ActionsLock.release(fd) }
-            let first = verifyApp(token, fd: fd)
+            let chain = TokenChain(token)
+            let first = chain.verify(fd: fd)
             switch first {
             case .refused(let o): return .refused(o)
             case .error(let e): return .error(e)
             default: break
             }
-            let engine = QuitApp(control: control, verify: { liveness(verifyApp(token, fd: fd), parsed) },
+            let engine = QuitApp(control: control, verify: { liveness(chain.verify(fd: fd), parsed) },
                                  watch: watch)
-            return .done(engine.quit(parsed, alive: liveness(first, parsed)))
+            let out = engine.quit(parsed, alive: liveness(first, parsed))
+            return .done(out, token: chain.current)
         }
     }
 
@@ -1393,9 +1511,24 @@ final class Model: ObservableObject {
         case .failed(let e): return .error(e)
         case .held(let fd):
             defer { ActionsLock.release(fd) }
-            let engine = QuitApp(control: control, verify: { liveness(verifyApp(token, fd: fd), t) },
+            // memmon checks every instance again, under this lock, right
+            // before anything is force-quit: a refusal means nothing is signalled.
+            let chain = TokenChain(token)
+            let pre = chain.verify(fd: fd)
+            switch pre {
+            case .refused(let o): return .refused(o)
+            case .error(let e): return .error(e)
+            default: break
+            }
+            var before = prior
+            if let alive = liveness(pre, t) {
+                for k in before.indices where before[k].state == .running && alive[before[k].pid] == false {
+                    before[k].state = .exited
+                }
+            }
+            let engine = QuitApp(control: control, verify: { liveness(chain.verify(fd: fd), t) },
                                  watch: watch)
-            return .done(engine.force(t, after: prior))
+            return .done(engine.force(t, after: before), token: chain.current)
         }
     }
 
@@ -1407,10 +1540,10 @@ final class Model: ObservableObject {
         case .error(let e):
             confirm = nil
             banner = Copy.banner(.error(e), subject: c.owner.title, noun: "app")
-        case .done(let outcomes):
-            if !forced && outcomes.contains(where: { $0.state == .running }) {
+        case .done(let outcomes, let token):
+            if !forced, popoverShown, outcomes.contains(where: { $0.state == .running }) {
                 var next = c
-                next.phase = .appPartial(t, outcomes, watchEnded: uptime())
+                next.phase = .appPartial(t, outcomes, token: token, watchEnded: clock())
                 confirm = next
                 return
             }
@@ -2023,7 +2156,7 @@ struct ConfirmOverlay: View {
                            actButton: k > 0 ? "Force stop \(n)" : "Force stop",
                            actSpoken: "Force stop \(n) of the \(plural(m, "remaining process", "remaining processes"))",
                            actVariant: .secondaryDanger)
-        case .appPartial(_, let results, _):
+        case .appPartial(_, let results, _, _):
             let running = results.filter { $0.state == .running }.count
             let list = results.enumerated().map { k, r in "Instance \(k + 1) · \(r.state.label)" }
             return Content(icon: "exclamationmark.triangle", tint: P.amber,
@@ -3066,6 +3199,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        model.popoverShown = false
 
         configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
         popover.behavior = .transient
@@ -3086,6 +3220,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else if let b = statusItem.button {
             NSApp.activate(ignoringOtherApps: true)
+            model.popoverShown = true
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             model.refresh()          // sync on open — the only expensive work
             model.startTicking()
@@ -3137,6 +3272,8 @@ struct RenderOptions {
     var sort: SortKey = .memory
     var techOpen = false
     var openGate = false
+    /// The outcome lands while the popover is closed.
+    var popoverClosed = false
 }
 
 /// A fixture may name a `_base` fixture whose keys it overrides, and carries
@@ -3169,6 +3306,7 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.techOpen = ARGS.contains("--tech-open") || (view["tech_open"] as? Bool ?? false)
     o.openGate = ARGS.contains("--open-gate") || (view["open_gate"] as? Bool ?? false)
     o.dark = ARGS.contains("--dark")
+    o.popoverClosed = view["popover_closed"] as? Bool ?? false
     return o
 }
 
@@ -3203,6 +3341,7 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     }
     m.ask(kind, owner)
     guard let path = o.outcome else { return m }
+    if o.popoverClosed { m.popoverShown = false }
     guard let d = FileManager.default.contents(atPath: path),
           let out = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
         fail("cannot read outcome \(path)")
@@ -3218,7 +3357,7 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
            let o = ActOutcome.decode((try? JSONSerialization.data(withJSONObject: refused)) ?? Data()) {
             m.applyApp(.refused(o), m.confirm!, t, forced: forced)
         } else {
-            m.applyApp(.done(states), m.confirm!, t, forced: forced)
+            m.applyApp(.done(states, token: tok), m.confirm!, t, forced: forced)
         }
     } else {
         var r = CLIResult(exit: int(out["exit"]).map { Int32($0) }, stdout: Data())
@@ -3460,16 +3599,32 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 report["after_esc_banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
                 report["actions"] = model.actionLog
             case "force-ttl":
-                // Age the app partial result, then press Force.
+                // Age the app partial result, then press Force. `--sleep`
+                // moves the injected clock instead, as a Mac asleep would.
                 let age = argValue("--age").flatMap(Double.init) ?? 0
-                if case .appPartial(let t, let r, _)? = model.confirm?.phase {
-                    model.confirm?.phase = .appPartial(t, r, watchEnded: model.uptime() - age)
+                if case .appPartial(let t, let r, let tok, _)? = model.confirm?.phase {
+                    model.confirm?.phase = .appPartial(t, r, token: tok, watchEnded: model.clock() - age)
+                }
+                if let slept = argValue("--sleep").flatMap(Double.init) {
+                    let base = model.clock
+                    model.clock = { base() + slept }
                 }
                 model.force()
                 spin(0.2)
                 report["phase"] = phase(model)
                 report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
                 report["actions"] = model.actionLog
+            case "rebind":
+                // A refresh lands while the confirm is still asking.
+                guard let next = argValue("--next") else { fail("rebind needs --next <fixture>") }
+                let (j, _) = loadFixture(next)
+                guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                model.snap = s
+                model.rebindConfirm(s)
+                report["phase"] = phase(model)
+                if case .job(let jb)? = model.confirm?.kind { report["job_token"] = jb.token ?? NSNull() }
+                report["owner_token"] = model.confirm?.owner.token ?? NSNull()
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
             case "close":
                 model.popoverClosed()
                 spin(0.2)
@@ -3598,11 +3753,15 @@ func selftestQuitApp(_ scenario: String) {
         verifyFails = true
     case "quit-before-force":
         break
+    case "raced-exit":
+        // AppKit has no app for 102 at quit time because it is exiting.
+        fake.apps[102]?.listed = false
     default:
         fail("unknown scenario \(scenario)")
     }
     let engine = QuitApp(control: fake, verify: {
         if scenario == "appkit-says-gone" { fake.apps[102]?.alive = true }
+        if scenario == "raced-exit" { fake.apps[102]?.alive = false }
         return verifyFails ? nil : fake.liveness()
     })
     let first = engine.quit(token, alive: fake.liveness())
@@ -3656,6 +3815,19 @@ final class RefreshSelftest: NSObject, NSApplicationDelegate {
             print(String(data: data, encoding: .utf8)!)
             exit(0)
         }
+        if ARGS.contains("--single") {
+            // One slow scan, nothing queued: once it ends, its "still
+            // sampling" error must not linger.
+            m.refresh()
+            spin(0.8)
+            report["during"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling] as [String: Any]
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline && m.stillSampling { spin(0.1) }
+            report["after"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling] as [String: Any]
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
         m.refresh()
         spin(0.8)
         report["after_timeout"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling,
@@ -3666,7 +3838,7 @@ final class RefreshSelftest: NSObject, NSApplicationDelegate {
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline && !(m.loaded && !m.refreshing) { spin(0.1) }
         report["end"] = ["scans": m.scansStarted, "loaded": m.loaded,
-                         "still_sampling": m.stillSampling] as [String: Any]
+                         "still_sampling": m.stillSampling, "error": m.loadError ?? NSNull()] as [String: Any]
         let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
         print(String(data: data, encoding: .utf8)!)
         exit(0)
@@ -3700,7 +3872,7 @@ func actProbe() {
 func quitProbe() {
     guard let script = argValue("--script"), let lock = argValue("--lock-path"),
           let token = argValue("--token") else {
-        fail("usage: --quit-probe --script <stub> --lock-path <file> --token <tok> [--timeout s]")
+        fail("usage: --quit-probe --script <stub> --lock-path <file> --token <tok> [--timeout s] [--stubborn pid] [--force-after]")
     }
     CLI.script = script
     ActionsLock.path = lock
@@ -3717,19 +3889,33 @@ func quitProbe() {
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
         return true
     }
+    let stubborn = argValue("--stubborn").flatMap(Int32.init)
     for i in parsed.instances {
         fake.apps[i.pid] = FakeApp(pid: i.pid, bundle: parsed.bundleId, launched: i.launchDate ?? 0,
-                                   ignoresTerminate: false,
+                                   ignoresTerminate: i.pid == stubborn,
                                    log: { calls.append($0 + (lockHeld() ? " locked" : " unlocked")) })
     }
     var report: [String: Any] = [:]
     let started = ProcessInfo.processInfo.systemUptime
-    switch Model.quitApp(token: token, parsed: parsed, control: fake) {
-    case .refused(let o): report["view"] = "refused"; report["reason"] = o.reason ?? NSNull()
-    case .error(let e): report["view"] = "error"; report["message"] = e
-    case .done(let out):
-        report["view"] = "done"
-        report["states"] = out.map { $0.state.rawValue }
+    func record(_ r: Model.AppResult, _ prefix: String) -> ([InstanceOutcome], String)? {
+        switch r {
+        case .refused(let o): report[prefix + "view"] = "refused"; report[prefix + "reason"] = o.reason ?? NSNull()
+        case .error(let e): report[prefix + "view"] = "error"; report[prefix + "message"] = e
+        case .done(let out, let tok):
+            report[prefix + "view"] = "done"
+            report[prefix + "states"] = out.map { $0.state.rawValue }
+            report[prefix + "token"] = tok
+            return (out, tok)
+        }
+        return nil
+    }
+    let quit = record(Model.quitApp(token: token, parsed: parsed, control: fake), "")
+    if ARGS.contains("--force-after"), let (out, tok) = quit {
+        let quitCalls = calls
+        calls = []
+        _ = record(Model.forceApp(token: tok, parsed, out, control: fake), "force_")
+        report["force_calls"] = calls
+        calls = quitCalls
     }
     report["seconds"] = ProcessInfo.processInfo.systemUptime - started
     report["lock_free_after"] = !lockHeld()
@@ -3743,6 +3929,17 @@ if ARGS.contains("--selftest-quit-app") {
     exit(0)
 }
 if ARGS.contains("--act-probe") { actProbe(); exit(0) }
+if ARGS.contains("--constants") {
+    // What memmon.py's own constants and refusal vocabulary must agree with.
+    let reasons = (argValue("--reasons") ?? "").split(separator: ",").map(String.init)
+    var copy: [String: String] = [:]
+    for r in reasons { copy[r] = Copy.refusal(r, noun: "build", forcing: false).0 }
+    let out: [String: Any] = ["act_timeout": CLI.actTimeout, "owners_timeout": CLI.ownersTimeout,
+                              "force_ttl": Model.forceTTL, "refusals": copy]
+    let data = try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
 if ARGS.contains("--title-probe") {
     guard let path = argValue("--latest"), let now = argValue("--now").flatMap(Double.init),
           let d = FileManager.default.contents(atPath: path),

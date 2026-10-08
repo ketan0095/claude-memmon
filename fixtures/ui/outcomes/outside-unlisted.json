@@ -5,19 +5,7 @@
   "result": "partial",
   "reason": "outside_force",
   "exited": 1,
-  "remaining": [
-   {
-    "pid": 48399,
-    "start": [
-     1791449140,
-     2
-    ],
-    "forceable": false,
-    "role": "observed",
-    "signalled": false,
-    "argv0": "node"
-   }
-  ],
+  "remaining": [],
   "kept": [],
   "used_bytes_before": 40802189312,
   "used_bytes_after": 40265318400,
@@ -25,7 +13,7 @@
   "killed": 1,
   "named": 1,
   "forceable": 0,
-  "observed": 1,
-  "observed_unlisted": 0
+  "observed": 0,
+  "observed_unlisted": 3
  }
 }

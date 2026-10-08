@@ -189,7 +189,7 @@
    "confidence": "inferred",
    "footprint_bytes": 2254857830,
    "cpu_cores": null,
-   "cpu_coverage": 0.0,
+   "cpu_coverage": null,
    "cpu_reason": "warming up",
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
@@ -249,7 +249,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   },
   {
    "owner_id": "unknown:9188.1791400000",
@@ -272,7 +273,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   },
   {
    "owner_id": "unknown:9240.1791400000",
@@ -295,7 +297,8 @@
    },
    "token": null,
    "jobs": [],
-   "actions": []
+   "actions": [],
+   "cpu_coverage": null
   },
   {
    "owner_id": "claude:fixture-c",
@@ -328,7 +331,7 @@
    "owner_id": "codex-ui:7400.1791449900",
    "kind": "codex-ui",
    "agent": "codex",
-   "title": "Docs pass",
+   "title": "Codex thread · runs in Codex daemon",
    "activity": null,
    "confidence": "shared",
    "footprint_bytes": 107374182,
@@ -351,5 +354,14 @@
  ],
  "_view": {
   "select": "codex-app:7001.1791440000"
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.82
  }
 }

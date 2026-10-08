@@ -8,7 +8,7 @@
    "title": "Checkout refactor",
    "project": "acme-web",
    "worktree": "checkout",
-   "activity": "Building \u00b7 typecheck",
+   "activity": "Building · typecheck",
    "confidence": "exact",
    "footprint_bytes": 9556302233,
    "cpu_cores": 3.1,
@@ -48,7 +48,7 @@
     {
      "job_id": "48260.1791449050.500100",
      "kind": "server",
-     "label": "dev server \u00b7 port 3000",
+     "label": "dev server · port 3000",
      "action": "stop-server",
      "managed": false,
      "footprint_bytes": 966367641,
@@ -102,11 +102,11 @@
    "title": "Billing API tests",
    "project": "acme-api",
    "worktree": "main",
-   "activity": "Testing \u00b7 vitest run",
+   "activity": "Testing · vitest run",
    "confidence": "inferred",
    "footprint_bytes": 2254857830,
    "cpu_cores": null,
-   "cpu_coverage": 0.0,
+   "cpu_coverage": null,
    "cpu_reason": "warming up",
    "growth_bytes_per_10min": null,
    "growth_reason": "not enough history",
@@ -177,5 +177,14 @@
   "select": "app:com.example.shellterm",
   "confirm": "quit-app",
   "outcome": "outcomes/app-refused-hosts.json"
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.737
  }
 }

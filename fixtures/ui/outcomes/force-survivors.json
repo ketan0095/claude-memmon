@@ -3,17 +3,17 @@
  "after_force": true,
  "stdout": {
   "result": "partial",
-  "reason": "outside_force",
+  "reason": "survivors",
   "exited": 1,
   "remaining": [
    {
-    "pid": 48399,
+    "pid": 48313,
     "start": [
-     1791449140,
-     2
+     1791449101,
+     9
     ],
     "forceable": false,
-    "role": "observed",
+    "role": "survivor",
     "signalled": false,
     "argv0": "node"
    }
@@ -23,9 +23,9 @@
   "used_bytes_after": 40265318400,
   "measured_at": 1791450000.0,
   "killed": 1,
-  "named": 1,
+  "named": 2,
   "forceable": 0,
-  "observed": 1,
+  "observed": 0,
   "observed_unlisted": 0
  }
 }
