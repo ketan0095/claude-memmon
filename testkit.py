@@ -30,7 +30,7 @@ PATH_CONSTANTS = ("STATE_DIR", "HISTORY", "SNAPSHOT", "GATE_LOG", "PROFILE",
                   "SHELL_STATE", "PAUSE", "PENDING", "OWNERS_HISTORY",
                   "CPU_BASELINE", "ACTIONS_LOCK", "JOBS_DIR", "PROJECTS_DIR",
                   "CLAUDE_SESSIONS_DIR", "CC_SOCKS_DIR", "CODEX_HOME",
-                  "CLAUDE_ROSTER")
+                  "CLAUDE_ROSTER", "PRESSURE_FILE", "JOB_HISTORY", "PRESSURE_EPISODE")
 
 
 class TempState:
@@ -39,7 +39,8 @@ class TempState:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
-        self.saved = {n: getattr(memmon, n) for n in PATH_CONSTANTS}
+        # A constant this memmon.py does not define yet is skipped.
+        self.saved = {n: getattr(memmon, n) for n in PATH_CONSTANTS if hasattr(memmon, n)}
         r = self.root
         values = {
             "STATE_DIR": r, "HISTORY": f"{r}/history.jsonl",
@@ -52,9 +53,12 @@ class TempState:
             "JOBS_DIR": f"{r}/jobs", "PROJECTS_DIR": f"{r}/projects",
             "CLAUDE_SESSIONS_DIR": f"{r}/sessions", "CC_SOCKS_DIR": f"{r}/socks",
             "CODEX_HOME": f"{r}/codex", "CLAUDE_ROSTER": f"{r}/daemon/roster.json",
+            "PRESSURE_FILE": f"{r}/pressure.json", "JOB_HISTORY": f"{r}/job-history.json",
+            "PRESSURE_EPISODE": f"{r}/runner/coord/pressure-episode.json",
         }
         for n, v in values.items():
-            setattr(memmon, n, v)
+            if n in self.saved:
+                setattr(memmon, n, v)
         # memmon_owners has its own defaults for a bare Context().
         owner_paths = {"CLAUDE_SESSIONS_DIR": values["CLAUDE_SESSIONS_DIR"],
                        "CC_SOCKS_DIR": values["CC_SOCKS_DIR"],

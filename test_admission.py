@@ -188,9 +188,18 @@ class StrictTelemetryTests(Base):
                 prev, cur = dict(base, **prev_over), dict(base, **cur_over)
                 prev["mono"], cur["mono"] = 0.0, 60.0
                 with self.subTest(prev=prev_over, cur=cur_over, streak=streak):
-                    memmon._prev_vm = dict(prev, _ts=1_000_000.0, _lh_streak=streak)
-                    with mock.patch("memmon.time.time", return_value=1_000_060.0):
-                        legacy = memmon.pressure(dict(cur))
+                    if hasattr(memmon, "mono_now"):
+                        # pressure() on the sampler lane: mono baselines.
+                        memmon._prev_vm = dict(prev, _mono=1000.0, _boot="b", _lh_streak=streak)
+                        memmon._free_base = {"free_pct": prev["free_pct"], "mono": 1000.0,
+                                             "boot": "b"}
+                        memmon._last_rates = {}
+                        with mock.patch("memmon.mono_now", return_value=1060.0):
+                            legacy = memmon.pressure(dict(cur))
+                    else:
+                        memmon._prev_vm = dict(prev, _ts=1_000_000.0, _lh_streak=streak)
+                        with mock.patch("memmon.time.time", return_value=1_000_060.0):
+                            legacy = memmon.pressure(dict(cur))
                     strict = tm.score(cur, tm.rates_between(prev, cur),
                                       tm.free_delta_between(prev, cur), streak)
                     for key in ("level", "score", "reasons", "lh_streak", "next_level",
@@ -203,6 +212,9 @@ class StrictTelemetryTests(Base):
                         else:
                             self.assertAlmostEqual(strict[key], legacy[key], places=6, msg=key)
         memmon._prev_vm = {}
+        for name in ("_free_base", "_last_rates"):
+            if hasattr(memmon, name):
+                setattr(memmon, name, {})
 
     def test_no_rates_is_unknown_never_healthy(self):
         v = tm.score({"free_pct": 80, "ram_total": GiB}, None, None, 3)
