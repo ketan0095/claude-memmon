@@ -13,6 +13,14 @@ run_plain() { exec /bin/bash -c "$1"; }
 # routed into the queue could lose its deny (I-11).
 [ -n "${CLAUDE_PID:-}" ] || run_plain "$1"
 [ -z "${CLAUDE_PROJECT_DIR+set}" ] || run_plain "$1"
+# Only while `memmon route on` recorded it; a prefix set by hand, or left over
+# from a rollback, passes everything through.
+state=
+[ -f "$M/runner/coord/route.json" ] && { IFS= read -r state < "$M/runner/coord/route.json" || :; }
+case "$state" in
+  *'"state": "on"'*) ;;
+  *) run_plain "$1" ;;
+esac
 
 # Cheap prefilter on executable names; most commands stop here.
 case "$1" in
@@ -35,6 +43,8 @@ tab=$(printf '\t')
 case "$verdict" in
   "wrap$tab"*)
     label=${verdict#wrap"$tab"}
-    exec /usr/bin/python3 "$M/memmon.py" run --via route --label "$label" -- /bin/bash -c "$1" ;;
+    # -E -s: the session's PYTHON* variables and user site cannot stop the
+    # runner from starting; the wrapped command still gets the full env.
+    exec /usr/bin/python3 -E -s "$M/memmon.py" run --via route --label "$label" -- /bin/bash -c "$1" ;;
 esac
 run_plain "$1"

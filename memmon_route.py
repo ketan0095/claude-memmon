@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -44,8 +47,10 @@ LINE_OFF = "Route off"
 
 SERVER_WORDS = {"dev", "start", "serve", "watch"}
 DAEMON_EXES = {("colima", "start"), ("expo", "start")}
-INTERACTIVE = {"-it", "-ti", "--interactive", "--tty"}
+DOCKER_LONG = {"--detach", "--interactive", "--tty"}
 BACKGROUND_EXES = {"nohup", "setsid", "disown"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+SHORT_BUNDLE = re.compile(r"-[a-z]+")
 
 
 def _paths(state_dir):
@@ -71,9 +76,45 @@ def inner_command(invocation: str) -> str:
 
 
 def _lex(cmd: str) -> list:
+    # commenters="" as in memmon.shell_commands: a '#' inside a word must not
+    # hide the rest of the command from this check.
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    lex.commenters = ""
     return list(lex)
+
+
+def _backgrounds(tok: str) -> bool:
+    """A punctuation run that holds a lone '&' ('&', '&)', '&;'), as opposed
+    to '&&', '|&' or a redirection such as '>&', '&>' or '2>&1'."""
+    if not tok or any(c not in "();<>|&" for c in tok):
+        return False
+    for joined in ("&&", ">&", "&>", "|&"):
+        tok = tok.replace(joined, "")
+    return "&" in tok
+
+
+def _server_word(arg: str) -> bool:
+    """dev, start, serve or watch as a word or a script part (dev:web,
+    test:watch), and the watch flags (--watch, --watchAll, -w)."""
+    if arg.startswith("--watch") or arg == "-w":
+        return True
+    return any(part in SERVER_WORDS for part in arg.split(":"))
+
+
+def _docker_daemon(args: list) -> bool:
+    """docker … up, or run/exec detached or interactive in any spelling:
+    -d, -dit, -itd, --detach, --detach=true, --tty=true."""
+    if "up" in args:
+        return True
+    if not any(a in ("run", "exec", "create", "start") for a in args):
+        return False
+    for a in args:
+        if a.split("=", 1)[0] in DOCKER_LONG:
+            return True
+        if SHORT_BUNDLE.fullmatch(a) and set(a[1:]) & {"d", "i", "t"}:
+            return True
+    return False
 
 
 def route_classify(invocation: str, env=None, classify_fn=None, split_fn=None) -> tuple:
@@ -92,10 +133,11 @@ def route_classify(invocation: str, env=None, classify_fn=None, split_fn=None) -
         toks = _lex(cmd)
     except ValueError:
         return "pass", "unparseable"
-    if "&" in toks or "|&" in toks:
+    if any(_backgrounds(t) for t in toks):
         return "pass", "sent to the background"
-    commands = split_fn(cmd)
-    for words in commands:
+    for words in split_fn(cmd):
+        while words and ASSIGNMENT.match(words[0]):
+            words = words[1:]
         if not words:
             continue
         exe = os.path.basename(words[0]).lower()
@@ -105,19 +147,19 @@ def route_classify(invocation: str, env=None, classify_fn=None, split_fn=None) -
         if exe in ("memmon", "memmon.py") or (exe.startswith("python") and any(
                 os.path.basename(a) == "memmon.py" for a in args[:2])):
             return "pass", "already wrapped"
-        if "--watch" in args or any(a in SERVER_WORDS for a in args[:3]):
+        if any(_server_word(a) for a in args):
             return "pass", "server or watcher"
-        if exe == "docker" and ("up" in args or (
-                any(a in ("run", "exec") for a in args)
-                and any(a in ("-d", "--detach", "-i") or a in INTERACTIVE for a in args))):
+        if exe == "docker" and _docker_daemon(args):
             return "pass", "server or daemon"
         if (exe, args[0] if args else "") in DAEMON_EXES:
             return "pass", "server or daemon"
-        if any(a in INTERACTIVE for a in args):
+        if any(a.split("=", 1)[0] in ("--interactive", "--tty") for a in args):
             return "pass", "interactive"
     hit = classify_fn(cmd)
     if not hit.get("matched"):
         return "pass", "not heavy"
+    if any(_server_word(w) for w in (hit.get("shape") or "").lower().split()[1:]):
+        return "pass", "server or watcher"
     label = (hit.get("shape") or hit.get("rule") or "heavy command")[:60]
     return "wrap", label
 
@@ -135,16 +177,33 @@ def _read_settings(path):
     return data
 
 
-def _write_atomic(path, text):
+def _write_atomic(path, text, mode=None):
     path = str(path)
     tmp = f"{path}.memmon.{os.getpid()}.tmp"
-    with open(tmp, "w") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_settings(path, data):
-    _write_atomic(path, json.dumps(data, indent=2) + "\n")
+    """Replace the file a symlink points at, never the link, keeping its mode:
+    settings.json often holds tokens and may be a managed dotfile."""
+    real = os.path.realpath(path)
+    try:
+        mode = stat.S_IMODE(os.stat(real).st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    _write_atomic(real, json.dumps(data, indent=2) + "\n", mode)
 
 
 def status(state_dir, settings_path=None) -> dict:
@@ -153,7 +212,11 @@ def status(state_dir, settings_path=None) -> dict:
         current = (_read_settings(settings_path or SETTINGS).get("env") or {}).get(KEY)
     except (OSError, ValueError):
         current = None
-    on = current == str(p["script"]) and not p["off"].exists()
+    try:
+        recorded = json.loads(p["json"].read_text()).get("state")
+    except (OSError, ValueError, AttributeError):
+        recorded = None
+    on = current == str(p["script"]) and not p["off"].exists() and recorded == "on"
     return {"state": "on" if on else "off", "line": LINE_ON if on else LINE_OFF,
             "g1": "verified" if G1_VERIFIED else "unverified", "prefix": current}
 
@@ -181,13 +244,17 @@ def route_on(state_dir, settings_path=None, verified=None) -> tuple:
         return 1, (f"refusing: {KEY} is already set to another prefix ({current}). "
                    "Remove it yourself if you want memmon to route.")
     p["coord"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        previous = json.loads(p["json"].read_text()).get("previous") if current == ours else current
+    except (OSError, ValueError, AttributeError):
+        previous = None
+    # The launcher routes only while this record says on.
+    _write_atomic(p["json"], json.dumps({"state": "on", "prefix": ours,
+                                         "previous": previous, "ts": round(time.time(), 3)}))
     if current != ours:
         if os.path.exists(settings_path):
             stamp = time.strftime("%Y%m%d%H%M%S")
-            with open(settings_path) as src:
-                _write_atomic(f"{settings_path}.bak.{stamp}", src.read())
-        _write_atomic(p["json"], json.dumps({"state": "on", "prefix": ours,
-                                             "previous": current, "ts": round(time.time(), 3)}))
+            shutil.copy2(os.path.realpath(settings_path), f"{settings_path}.bak.{stamp}")
         env[KEY] = ours
         cfg["env"] = env
         _write_settings(settings_path, cfg)

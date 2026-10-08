@@ -36,6 +36,8 @@ else:
     if sys.argv[1] == "run":
         with open(os.path.join(state, "wrapped.jsonl"), "a") as fh:
             fh.write(__import__("json").dumps(sys.argv[2:]) + "\\n")
+        with open(os.path.join(state, "wrapped-env.json"), "w") as fh:
+            fh.write(__import__("json").dumps({{"PYTHONPATH": os.environ.get("PYTHONPATH")}}))
         sys.exit(0)
     sys.exit(99)
 """
@@ -68,6 +70,8 @@ class RouteScriptTests(unittest.TestCase):
         (self.state / "runner" / "coord").mkdir(parents=True)
         (self.state / "memmon.py").write_text(SHIM.format(repo=HERE))
         shutil.copy(os.path.join(HERE, "memmon_route.py"), self.state / "memmon_route.py")
+        self.route_json = self.state / "runner/coord/route.json"
+        self.route_json.write_text(json.dumps({"state": "on", "prefix": "x", "previous": None}))
         self.bin = self.home / "bin"
         self.bin.mkdir()
         for tool in TOOLS:
@@ -209,6 +213,26 @@ class RouteScriptTests(unittest.TestCase):
                 self.assertEqual(rows[0][6:], ["-c", assembled(cmd)])
         self.assertEqual(self.calls(), [], "a wrapped command runs only inside the runner")
 
+    def test_launcher_routes_only_while_route_is_recorded_on(self):
+        """ROUTE-7: a prefix set by hand, or left from a rollback, passes."""
+        self.route_json.write_text(json.dumps({"state": "off"}))
+        self.assert_passes("pnpm typecheck", expect_calls=1)
+        self.route_json.unlink()
+        self.assert_passes("pnpm typecheck", expect_calls=2)
+
+    def test_hostile_python_env_cannot_stop_the_launch(self):
+        """ROUTE-5: PYTHONHOME/PYTHONPATH from the session are ignored by the
+        runner's interpreter but still reach the wrapped command."""
+        shadow = self.home / "shadow"
+        shadow.mkdir()
+        (shadow / "json.py").write_text("raise SystemExit('shadow json')\n")
+        out = self.route("pnpm typecheck", extra={"PYTHONPATH": str(shadow),
+                                                  "PYTHONHOME": "/nonexistent/acme-venv"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len(self.wrapped()), 1)
+        env = json.loads((self.state / "wrapped-env.json").read_text())
+        self.assertEqual(env["PYTHONPATH"], str(shadow))
+
     def test_minimal_path_still_wraps(self):
         """B18."""
         out = self.route("pnpm typecheck", path="/usr/bin:/bin")
@@ -246,6 +270,26 @@ class RouteClassifyTests(unittest.TestCase):
         self.assertEqual(self.check("docker build .")[0], "wrap")
         self.assertEqual(self.check("pnpm test", env=HOOK)[1], "not a Bash tool call")
         self.assertEqual(self.check("ls")[1], "not heavy")
+
+    def test_servers_watchers_daemons_and_background_never_wrap(self):
+        """ROUTE-1..4: wrapping too little is safe, too much is the bug."""
+        for cmd in ("pnpm dev:web", "pnpm run dev:web", "pnpm --filter acme-web run dev",
+                    "pnpm -r --parallel run dev",
+                    "NODE_ENV=development PORT=3000 HOST=0.0.0.0 pnpm dev",
+                    "tsc -w", "tsc -b -w", "jest --watchAll", "npx jest --watchAll",
+                    "webpack -w", "pnpm test:watch", "pnpm build:watch", "pnpm start",
+                    "docker run -dit ubuntu", "docker run -itd ubuntu",
+                    "docker run --detach=true ubuntu", "docker run --tty=true ubuntu",
+                    "docker compose up", "(pnpm test &)", "(pnpm build &) ; echo hi",
+                    "echo a#b; pnpm build &", "git log --format=%h#x; pnpm test &",
+                    "pnpm test &; echo x"):
+            with self.subTest(cmd):
+                self.assertEqual(self.check(cmd)[0], "pass")
+        for cmd in ("pnpm build", "pnpm --filter acme-web build", "pnpm test&&echo x",
+                    "pnpm build 2>&1 | tail", "docker build -t acme/web .",
+                    "CI=1 pnpm test", "echo '#' && pnpm typecheck"):
+            with self.subTest(cmd):
+                self.assertEqual(self.check(cmd)[0], "wrap")
 
     def test_cli_fails_open(self):
         import contextlib, io
@@ -319,6 +363,33 @@ class RouteLifecycleTests(unittest.TestCase):
     def test_off_flag_alone_turns_routing_off(self):
         route.route_on(self.state, self.settings, verified=True)
         (self.state / "runner/coord/route.off").touch()
+        self.assertEqual(route.status(self.state, self.settings)["state"], "off")
+
+    def test_settings_mode_and_symlink_survive(self):
+        """ROUTE-6: a settings.json reached through a symlink stays a symlink,
+        its target keeps its own mode (0640 here, to tell it from a default),
+        and the backup carries the same mode."""
+        dot = Path(self.tmp.name) / "dotfiles"
+        dot.mkdir()
+        target = dot / "settings.json"
+        target.write_text(json.dumps({"env": {"SECRET_TOKEN": "synthetic"}}))
+        os.chmod(target, 0o640)
+        self.settings.unlink()
+        self.settings.symlink_to(target)
+        self.assertEqual(route.route_on(self.state, self.settings, verified=True)[0], 0)
+        self.assertTrue(self.settings.is_symlink())
+        self.assertEqual(json.loads(target.read_text())["env"][route.KEY], self.ours)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+        backups = list(Path(self.tmp.name).glob("settings.json.bak.*"))
+        self.assertEqual([b.stat().st_mode & 0o777 for b in backups], [0o640])
+        route.route_off(self.state, self.settings)
+        self.assertTrue(self.settings.is_symlink())
+        self.assertNotIn(route.KEY, json.loads(target.read_text())["env"])
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+
+    def test_status_needs_the_on_record(self):
+        route.route_on(self.state, self.settings, verified=True)
+        (self.state / "runner/coord/route.json").write_text(json.dumps({"state": "off"}))
         self.assertEqual(route.status(self.state, self.settings)["state"], "off")
 
     def test_stub_passes_through(self):
