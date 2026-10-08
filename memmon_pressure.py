@@ -37,7 +37,7 @@ ORPHAN_NOTE = "orphaned · stop it where it was started"
 GROUP_NOTE = "runs in its session's process group · stop it where it was started"
 
 STRIP_RUNTIMES = {"node", "bun", "deno"}
-SCRIPT_EXTS = (".mjs", ".cjs", ".js")
+SCRIPT_EXTS = (".mjs", ".cjs", ".js", ".ts")   # .ts: bun and deno run it directly
 # Owners whose whole is never a suggestion and whose members are not walked:
 # managed leases are S2.5's, and a service is a VM or daemon as a whole.
 SKIP_OWNER_KINDS = {"job", "service"}
@@ -58,21 +58,28 @@ def heavy_command(inv, pid: int) -> str:
     """The command line S2 classifies. A leading node/bun/deno runtime, its
     options, and the script's directory and .mjs/.cjs/.js extension are
     stripped, so `node --max-old-space-size=8192 …/tsc -b` reads as `tsc -b`
-    and `node …/vitest.mjs run` as `vitest run`. Anything else reads as S1's
-    process_command does."""
+    and `node …/vitest.mjs run` as `vitest run`. bun and deno are stripped only
+    before a script path. Anything else reads as S1's process_command does."""
     argv = inv.argv(pid) or []
     base = os.path.basename(argv[0]).lower() if argv else ""
     if base in STRIP_RUNTIMES:
         i = 1
         while i < len(argv) and argv[i].startswith("-") and argv[i] not in mo.RUNTIME_CODE_FLAGS:
             i += 2 if argv[i] in mo.RUNTIME_VALUE_FLAGS else 1
-        if i < len(argv) and not argv[i].startswith("-"):
+        # bun and deno take subcommands (`bun test`, `bun run build`, `deno
+        # task dev`): only a script path is stripped, so a launcher keeps its
+        # verb for classify_job's launcher branch.
+        is_script = i < len(argv) and (base == "node" or "/" in argv[i]
+                                       or argv[i].endswith(SCRIPT_EXTS))
+        if is_script and not argv[i].startswith("-"):
             script = os.path.basename(argv[i])
             for ext in SCRIPT_EXTS:
                 if script.endswith(ext):
                     script = script[:-len(ext)]
                     break
             return " ".join([script] + argv[i + 1:])
+        if base != "node":
+            return " ".join([base] + argv[1:])
     return mo.process_command(inv, pid)
 
 
@@ -306,7 +313,7 @@ def without_tokens(rows: list) -> list:
 def new_episode_state(boot: str | None = None) -> dict:
     return {"v": 1, "boot": boot, "active": False, "episode": 0, "started_ts": None,
             "calm_s": 0.0, "last_calm_mono": None, "notified": {},
-            "last_notify_ts": None}
+            "last_notify_ts": None, "last_notify_mono": None}
 
 
 def episode_step(state: dict, *, now_ts: float, mono: float, boot: str | None,
@@ -315,12 +322,12 @@ def episode_step(state: dict, *, now_ts: float, mono: float, boot: str | None,
     notify). An episode starts at the first run where under_pressure holds and
     ends after 10 min of readings where it does not; UNKNOWN readings and
     sampling gaps neither extend nor end it. One notification per job per
-    episode, never more than one every 5 min."""
+    episode, never more than one every 5 min. The floor is measured on
+    CLOCK_MONOTONIC_RAW, so a wall-clock change neither stalls nor skips it;
+    that clock restarts at boot, so a new boot starts with no floor."""
     st = dict(state or {})
     if st.get("v") != 1 or st.get("boot") != boot:
-        floor = st.get("last_notify_ts")
         st = new_episode_state(boot)
-        st["last_notify_ts"] = floor
     st["notified"] = dict(st.get("notified") or {})
     if gap:
         st["last_calm_mono"] = None
@@ -331,11 +338,11 @@ def episode_step(state: dict, *, now_ts: float, mono: float, boot: str | None,
                       notified={})
         st["calm_s"], st["last_calm_mono"] = 0.0, None
         fresh = [r for r in rows if r["job_id"] not in st["notified"]]
-        last = st.get("last_notify_ts")
-        if fresh and (last is None or now_ts - last >= NOTIFY_FLOOR_S):
+        last = st.get("last_notify_mono")
+        if fresh and (last is None or mono - last >= NOTIFY_FLOOR_S):
             out.append(fresh[0])
-            st["notified"][fresh[0]["job_id"]] = now_ts
-            st["last_notify_ts"] = now_ts
+            st["notified"][fresh[0]["job_id"]] = mono
+            st["last_notify_ts"], st["last_notify_mono"] = now_ts, mono
     elif unknown:
         st["last_calm_mono"] = None
     elif st["active"]:
@@ -348,17 +355,46 @@ def episode_step(state: dict, *, now_ts: float, mono: float, boot: str | None,
     return st, out
 
 
-def run_episode(path: str, **kw) -> list:
-    """episode_step under an flock on the sibling .lock file, with the state
-    replaced atomically. Returns the rows to notify."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+class _EpisodeLock:
+    """flock on the sibling .lock file; the state itself is replaced atomically."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+def run_episode(path: str, **kw) -> tuple:
+    """episode_step under the episode lock. Returns (rows to notify, the
+    floor's (last_notify_ts, last_notify_mono) before this step), so a failed
+    send can be rolled back."""
+    with _EpisodeLock(path):
         state = mo.read_json(path, None)
+        before = ((state or {}).get("last_notify_ts"), (state or {}).get("last_notify_mono"))
         state, out = episode_step(state, **kw)
         mo.write_json_atomic(path, state)
-        return out
-    finally:
-        os.close(fd)
+        return out, before
+
+
+def rollback_notification(path: str, job_id: str, mono: float, before: tuple) -> None:
+    """Undo one send that failed: the job is fresh again and the floor goes
+    back, unless a later run has already moved either on."""
+    with _EpisodeLock(path):
+        st = mo.read_json(path, None)
+        if not st:
+            return
+        notified = dict(st.get("notified") or {})
+        if notified.get(job_id) == mono:
+            del notified[job_id]
+        st["notified"] = notified
+        if st.get("last_notify_mono") == mono:
+            st["last_notify_ts"], st["last_notify_mono"] = before
+        mo.write_json_atomic(path, st)
 

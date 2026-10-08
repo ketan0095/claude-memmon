@@ -10,6 +10,7 @@ import io
 import json
 import os
 import signal
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -127,6 +128,20 @@ class StripTests(unittest.TestCase):
         self.assertEqual(self.cmd(["bun", "--smol", "/r/x/build.cjs"]), "build")
         self.assertEqual(self.cmd(["/bin/zsh", "-c", "pnpm vitest run"]), "pnpm vitest run")
         self.assertEqual(self.cmd(["node", "-e", "1"]), "node -e 1")
+
+    def test_bun_and_deno_keep_their_subcommands(self):
+        # PRES-1: only a script path is stripped after bun or deno.
+        self.assertEqual(self.cmd(["bun", "test"]), "bun test")
+        self.assertEqual(self.cmd(["bun", "run", "build"]), "bun run build")
+        self.assertEqual(self.cmd(["bun", "dev"]), "bun dev")
+        self.assertEqual(self.cmd(["/opt/homebrew/bin/deno", "task", "dev"]), "deno task dev")
+        self.assertEqual(self.cmd(["bun", "/r/x/vitest.ts", "run"]), "vitest run")
+        k = kind_of()
+        for argv, kind in ((["bun", "test"], "test"), (["bun", "run", "build"], "build"),
+                           (["bun", "dev"], "server"), (["bun", "run", "dev"], "server")):
+            with self.subTest(argv=argv):
+                src = FakeSource([P(5, comm="bun")], argv={5: argv})
+                self.assertEqual(k(mp.snapshot(src), 5)[0], kind)
 
     def test_classifies_through_s1_classify_job(self):
         k = kind_of()
@@ -444,6 +459,46 @@ class EpisodeTests(unittest.TestCase):
             st, _ = self.step(st, m)
         self.assertTrue(st["active"], st)                  # 9 min counted, not 19
         self.assertAlmostEqual(st["calm_s"], 540.0)
+
+    def test_floor_runs_on_the_monotonic_clock(self):
+        # PRES-4: a wall clock moved back an hour neither stalls the floor,
+        # nor does a forward jump skip it.
+        st, out = mpx.episode_step(None, now_ts=T0, mono=1000.0, boot=BOOT, pressured=True,
+                                   unknown=False, gap=False, rows=[{"job_id": "a"}])
+        self.assertEqual(len(out), 1)
+        st, out = mpx.episode_step(st, now_ts=T0 + 7200, mono=1060.0, boot=BOOT,
+                                   pressured=True, unknown=False, gap=False,
+                                   rows=[{"job_id": "b"}])
+        self.assertEqual(out, [])                          # 1 min on mono
+        st, out = mpx.episode_step(st, now_ts=T0 - 3600, mono=1301.0, boot=BOOT,
+                                   pressured=True, unknown=False, gap=False,
+                                   rows=[{"job_id": "b"}])
+        self.assertEqual([r["job_id"] for r in out], ["b"])
+
+    def test_failed_send_is_retried_by_the_next_run(self):
+        # SAMPLER-3 / PRES-3: osascript times out. The job and the floor are
+        # given back, so the next pressured run sends it.
+        st = SamplerState(self)
+        sc = Scene(self, memmon.CLAUDE_SESSIONS_DIR)
+        sent = []
+
+        def flaky(text, title="memmon", subtitle="", **kw):
+            if not sent:
+                sent.append(None)
+                raise subprocess.TimeoutExpired(["osascript"], 10)
+            sent.append(text)
+        r1 = SamplerPathTests.reading("CRITICAL", {"swapin_mbs": 0.0}, mono=50_000.0)
+        r2 = SamplerPathTests.reading("CRITICAL", {"swapin_mbs": 0.0}, mono=50_060.0)
+        with mock.patch.object(memmon, "notify", flaky), \
+                mock.patch("memmon_runner.jobs", return_value=sc.leases):
+            for r in (r1, r2):
+                snap = {"ts": r["record"]["ts"], "vm": {}, "pressure": r["pressure"],
+                        "orphan_total": 0, "sessions": [], "apps": {}, "worktrees": []}
+                memmon.sampler_owners(snap, r, source=sc.src, ctx=sc.ctx)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("vitest in", sent[1])
+        state = st.read(memmon.PRESSURE_EPISODE)
+        self.assertEqual(state["last_notify_mono"], 50_060.0)
 
     def test_floor_holds_across_episodes_and_boot_resets(self):
         st, out = self.step(None, 0, pressured=True, rows=[{"job_id": "a"}])

@@ -958,7 +958,8 @@ class LegacyCompatTests(unittest.TestCase):
                                     # S2.8's documented row additions (D10 update)
                                     "mono", "uptime", "boot", "level_reason", "rates",
                                     "rates_source", "lh_streak", "kernel_level",
-                                    "under_pressure", "pressure_suggestions"})
+                                    "under_pressure", "pressure_suggestions",
+                                    "suggestions_ts"})
 
     def test_runway_copy_is_a_trend_to_the_floor(self):
         # P11: the estimate is to the 20 % floor, never "runs out".

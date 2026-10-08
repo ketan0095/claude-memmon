@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import linecache
 import os
 import plistlib
 import shutil
@@ -313,10 +314,7 @@ class GapTests(unittest.TestCase):
         self.assertEqual(rows[0]["gap"]["cause"], "starved")
         self.assertEqual(rows[0]["boot"], BOOT)
         self.assertEqual(rows[0]["mono"], rec["mono"])
-        # One notice, worded without a cause it cannot know.
-        self.assertEqual(len(self.st.notes), 1)
-        self.assertIn("couldn't sample for 21 min while the Mac was awake",
-                      self.st.notes[0][0])
+        self.assertEqual(self.st.notes, [])      # posted by sampler_run, not log_sample
 
     def test_last_gap_carries_forward_until_the_next(self):
         T = FakeTelemetry()
@@ -332,6 +330,34 @@ class GapTests(unittest.TestCase):
         self.assertAlmostEqual(blk["age_s"], 30, places=0)
         self.assertFalse(blk["stale"])
 
+    def sampler_run(self, T, collect=None):
+        snap = {"ts": time.time(), "vm": {}, "pressure": {}, "orphan_total": 0,
+                "sessions": [], "apps": {}, "worktrees": []}
+        with mock.patch.object(memmon, "collect", collect or (lambda pres: dict(
+                snap, pressure=pres))), \
+                mock.patch.object(memmon, "sampler_owners"), \
+                mock.patch.object(memmon, "learn"), \
+                mock.patch("sys.stderr", io.StringIO()):
+            return memmon.sampler_run(budget_s=5.0, source=T, clock=T)
+
+    def test_starved_gap_notice_survives_a_budget_killed_run(self):
+        # SAMPLER-2: the run that discovers the gap dies in collect. The
+        # notice is already out, once; the next run does not repeat it.
+        T = FakeTelemetry()
+        self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 21 * 60, uptime=T.u - 21 * 60,
+                                                      ts=time.time() - 1260))
+
+        def starved(pres):
+            raise memmon.SamplerBudget()
+        self.assertEqual(self.sampler_run(T, starved), 0)
+        self.assertTrue(self.st.read(memmon.SNAPSHOT)["partial"])
+        self.assertEqual(len(self.st.notes), 1)
+        self.assertIn("couldn't sample for 21 min while the Mac was awake",
+                      self.st.notes[0][0])
+        T.sleep(60)
+        self.sampler_run(T)
+        self.assertEqual(len(self.st.notes), 1)
+
     def test_sleep_gap_and_short_starved_gap_are_not_notified(self):
         for awake in (60, 240):
             with self.subTest(awake=awake):
@@ -339,12 +365,22 @@ class GapTests(unittest.TestCase):
                 T = FakeTelemetry()
                 self.st.write(memmon.PRESSURE_FILE,
                               prev_file(T.m - 1200, uptime=T.u - awake))
-                reading = memmon.sampler_reading(T, T)
-                snap = {"ts": time.time(), "vm": {}, "pressure": reading["pressure"],
-                        "orphan_total": 0, "sessions": [], "apps": {}, "worktrees": []}
-                with mock.patch.object(memmon, "learn"):
-                    memmon.log_sample(snap, reading)
+                self.sampler_run(T)
                 self.assertEqual(self.st.notes, [])
+
+    def test_starved_gap_outlives_a_later_sleep_gap(self):
+        # SAMPLER-6: the 24 h notice reads last_starved_gap, which a later
+        # sleep (or reboot) gap does not replace.
+        T = FakeTelemetry()
+        self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 1260, uptime=T.u - 1260))
+        starved = memmon.sampler_reading(T, T)["record"]["gap"]
+        self.assertEqual(starved["cause"], "starved")
+        T.m += 3600                                        # an hour asleep
+        rec = memmon.sampler_reading(T, T)["record"]
+        self.assertEqual(rec["gap"]["cause"], "sleep")
+        self.assertEqual(rec["last_gap"]["cause"], "sleep")
+        self.assertEqual(rec["last_starved_gap"], starved)
+        self.assertEqual(memmon.sampler_block()["last_starved_gap"], starved)
 
     def test_report_lists_gaps_skips_partial_and_counts_unknown_unscored(self):
         now = time.time()
@@ -407,6 +443,54 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(memmon.sampler_run(budget_s=5.0, source=T, clock=T), 0)
         self.assertEqual(col.call_args.kwargs["pres"]["rates_source"], "in_run")
         self.assertNotIn("partial", self.st.read(memmon.SNAPSHOT))
+
+    def test_budget_during_history_trim_keeps_history(self):
+        # SAMPLER-1: the budget fires mid-trim, at the write of the kept rows.
+        # The old truncate-then-write lost the file; now the old file stays,
+        # the full row is in it once, and no partial row follows.
+        T = FakeTelemetry()
+        with open(memmon.HISTORY, "w") as fh:
+            fh.writelines(json.dumps({"ts": i, "swap_used": GB}) + "\n" for i in range(50))
+        here = os.path.abspath(memmon.__file__)
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != here:
+                return None
+            if event == "line" and ".writelines(" in linecache.getline(here, frame.f_lineno) \
+                    and frame.f_code.co_name in ("_trim_history", "_replace_lines"):
+                sys.settrace(None)
+                raise memmon.SamplerBudget()
+            return tracer
+        snap = {"ts": time.time(), "vm": {}, "pressure": {}, "orphan_total": 0,
+                "sessions": [], "apps": {}, "worktrees": []}
+        with mock.patch.object(memmon, "HISTORY_TRIM_AT", 100), \
+                mock.patch.object(memmon, "HISTORY_KEEP_ROWS", 40), \
+                mock.patch.object(memmon, "collect", lambda pres: dict(snap, pressure=pres)), \
+                mock.patch.object(memmon, "sampler_owners"), \
+                mock.patch.object(memmon, "learn"), mock.patch("sys.stderr", io.StringIO()):
+            sys.settrace(tracer)
+            try:
+                rc = memmon.sampler_run(budget_s=5.0, source=T, clock=T)
+            finally:
+                sys.settrace(None)
+        self.assertEqual(rc, 0)
+        with open(memmon.HISTORY) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertGreaterEqual(len(rows), 41)
+        self.assertEqual([r for r in rows if r.get("partial")], [])
+        self.assertEqual(rows[-1]["rates_source"], "in_run")
+        self.assertNotIn("partial", self.st.read(memmon.SNAPSHOT))
+        self.assertEqual([f for f in os.listdir(self.st.root) if f.endswith(".tmp")], [])
+
+    def test_trim_still_trims(self):
+        with open(memmon.HISTORY, "w") as fh:
+            fh.writelines(json.dumps({"ts": i}) + "\n" for i in range(50))
+        with mock.patch.object(memmon, "HISTORY_TRIM_AT", 100), \
+                mock.patch.object(memmon, "HISTORY_KEEP_ROWS", 40):
+            memmon._trim_history()
+        with open(memmon.HISTORY) as fh:
+            rows = [json.loads(line)["ts"] for line in fh]
+        self.assertEqual(rows, list(range(10, 50)))
 
     def test_budget_is_not_an_exception(self):
         self.assertTrue(issubclass(memmon.SamplerBudget, BaseException))
@@ -473,6 +557,41 @@ class UnknownReaderTests(unittest.TestCase):
             clock[0] += 400
             p = memmon.pressure(dict(self.vm))
         self.assertEqual((p["level"], p["level_reason"]), ("UNKNOWN", "baseline over 300 s old"))
+
+    def test_no_baseline_from_defaulted_counters(self):
+        # SAMPLER-4: both sampler vm_stat reads failed, so neither file holds
+        # real counters. A reader with real since-boot counters must not
+        # score them against zeros as thrash.
+        self.reset(None)
+        now = memmon.mono_now()
+        self.st.write(memmon.PRESSURE_FILE, {k: v for k, v in prev_file(now - 30).items()
+                                             if k not in ("swapins", "swapouts")})
+        snap = {"ts": time.time(), "vm": {"free_pct": 40, "swap_used": GB},
+                "pressure": {"level": "UNKNOWN", "rates": "unavailable"},
+                "orphan_total": 0, "sessions": [], "apps": {}, "worktrees": []}
+        reading = {"record": {"mono": now - 30, "uptime": now - 2030, "boot": BOOT}}
+        row = memmon._log_row(snap, reading)
+        self.assertIsNone(row["swapins"])
+        self.st.write(memmon.SNAPSHOT, row)
+        memmon._prev_vm.clear()
+        p = memmon.pressure({**self.vm, "swapins": 90_000_000, "swapouts": 90_000_000})
+        self.assertEqual(p["level"], "UNKNOWN")
+        # Real counters, but the row's own rates were unavailable: refused too.
+        self.reset(None)
+        self.st.write(memmon.SNAPSHOT, {**prev_file(now - 30), "rates": "unavailable"})
+        self.assertEqual(memmon.pressure(dict(self.vm))["level"], "UNKNOWN")
+
+    def test_once_shows_the_unknown_reason(self):
+        # SAMPLER-5
+        self.reset(None)
+        with mock.patch.object(memmon, "read_top", return_value=({}, "")), \
+                mock.patch.object(memmon, "read_ps", return_value={}):
+            text = memmon.render(memmon.collect(), on=False)
+        self.assertIn("UNKNOWN", text)
+        self.assertIn("no valid rate baseline", text)
+        self.assertNotIn("no pressure signals", text)
+        self.assertNotIn("→ WATCH", text)
+        self.assertNotIn("Scope new work", text)
 
     def test_pressure_flag_prints_unknown_and_exits_0(self):
         self.reset(None)
@@ -579,6 +698,27 @@ class NotifyTests(unittest.TestCase):
             memmon.log_sample(snap)
         self.assertEqual(st.notes, [("1 blocked command(s) can be retried", "memmon",
                                      "Memory pressure cleared")])
+
+
+class DashboardRowTests(unittest.TestCase):
+    def test_dashboard_row_keeps_the_samplers_suggestions(self):
+        # PRES-2: the live dashboard writes latest.json between sampler runs;
+        # the gate must still name the sampler's top suggestion.
+        st = SamplerState(self)
+        now = time.time()
+        top = {"label": "vitest in acme-web", "footprint": 9 * GB, "job_id": "1.2.3"}
+        st.write(memmon.SNAPSHOT, {"ts": now - 30, "pressure": "DANGER", "under_pressure": True,
+                                   "pressure_suggestions": [top], "suggestions_ts": now - 30})
+        snap = {"ts": now, "vm": {}, "pressure": {"level": "DANGER", "rates": "ok"},
+                "orphan_total": 0, "sessions": [], "apps": {}, "worktrees": []}
+        with mock.patch.object(memmon, "learn"):
+            memmon.log_sample(snap)
+        row = st.read(memmon.SNAPSHOT)
+        self.assertEqual(row["pressure_suggestions"], [top])
+        self.assertTrue(row["under_pressure"])
+        self.assertEqual(memmon.top_suggestion(row, now + 1), top)
+        # Carried suggestions still age out on the sampler's clock.
+        self.assertIsNone(memmon.top_suggestion(row, now + 200))
 
 
 class AtomicWriteTests(unittest.TestCase):

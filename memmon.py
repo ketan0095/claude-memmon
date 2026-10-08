@@ -405,7 +405,9 @@ def _seed_from_files(now: float, boot: str | None) -> None:
                            "_mono": row["mono"], "_boot": boot}
             _prev_vm, _free_base = base, free
             return
-        if RATE_MIN_S <= age <= RATE_MAX_S and _has_counters(row):
+        # A row whose own rates were unavailable has no trustworthy counters.
+        if (RATE_MIN_S <= age <= RATE_MAX_S and _has_counters(row)
+                and row.get("rates") != "unavailable"):
             _prev_vm, _free_base = base, free
             return
 
@@ -848,6 +850,9 @@ def build_advice(snap: dict) -> str:
     hot = [s for s in snap.get("sessions") or []
            if s.get("swap", 0) > 0.5 * max(s.get("mem", 1), 1)]
 
+    if level == "UNKNOWN":
+        return (f"Pressure unknown: {p.get('level_reason') or 'no valid rate baseline'}. "
+                "No verdict until the next reading has a baseline.")
     if level == "HEALTHY":
         if p.get("to_next"):
             return (f"Safe to start work — {p['to_next']} more point"
@@ -1541,6 +1546,10 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
         detail = " · ".join(p.get("reasons") or []) or "no pressure signals"
         nxt = (f"  {p['to_next']} pt → {p['next_level']}"
                if p.get("to_next") else "")
+        if p.get("level") == "UNKNOWN":
+            detail, nxt = p.get("level_reason") or "no valid rate baseline", ""
+        elif p.get("level_reason"):
+            detail += f" ({p['level_reason']})"
         head = f" ▌ {p['level']:<9}"
         L.append(col(head, p["color"], on)
                  + col(detail, "grey" if p["level"] == "HEALTHY" else p["color"], on)
@@ -1793,6 +1802,12 @@ def gap_record(prev: dict | None, cur: dict) -> dict | None:
     return gap
 
 
+def notifiable_gap(gap: dict | None) -> bool:
+    """A starved gap with at least 5 min of unsampled awake time."""
+    return bool(gap) and gap.get("cause") == "starved" and \
+        (gap.get("awake_s") or 0) >= STARVED_NOTICE_S
+
+
 def _previous_row(boot: str | None) -> dict | None:
     """The newest earlier reading: this boot's pressure.json or latest.json,
     whichever is later by mono; else any row, which then marks a reboot."""
@@ -1858,7 +1873,10 @@ def sampler_reading(source=None, clock=None) -> dict:
         "level_reason", "lh_streak", *RATE_FIELDS, "free_delta_min")},
         "under_pressure": memmon_pressure.under_pressure(
             pres["level"], pres["rates"], vm.get("kernel_level")),
-        "gap": gap, "last_gap": gap or (prev_file or {}).get("last_gap")}
+        "gap": gap, "last_gap": gap or (prev_file or {}).get("last_gap"),
+        # Kept apart so a later sleep or reboot gap cannot end its 24 h notice.
+        "last_starved_gap": gap if notifiable_gap(gap) else (
+            (prev_file or {}).get("last_starved_gap"))}
     memmon_owners.write_json_atomic(PRESSURE_FILE, record)
     return {"record": record, "pressure": pres, "vm": vm}
 
@@ -1891,12 +1909,18 @@ def sampler_owners(snap: dict, reading: dict, source=None, ctx=None, clock=None,
                               ram_bytes=rec.get("ram_total"))
     snap["pressure_suggestions"] = mp.without_tokens(rows)
     gap = rec.get("gap")
-    for row in mp.run_episode(PRESSURE_EPISODE, now_ts=rec["ts"], mono=rec["mono"],
-                              boot=rec["boot"], pressured=rec["under_pressure"],
-                              unknown=rec["level"] == "UNKNOWN",
-                              gap=bool(gap and gap["cause"] != "reboot"), rows=rows):
-        notify(suggestion_text(row), "memmon · memory under pressure",
-               "Open memmon to review it; nothing was stopped")
+    sends, before = mp.run_episode(
+        PRESSURE_EPISODE, now_ts=rec["ts"], mono=rec["mono"], boot=rec["boot"],
+        pressured=rec["under_pressure"], unknown=rec["level"] == "UNKNOWN",
+        gap=bool(gap and gap["cause"] != "reboot"), rows=rows)
+    for row in sends:
+        # The state says "sent" before the send (at most once). A send that
+        # fails gives the job and the 5 min floor back, so the next run retries.
+        try:
+            notify(suggestion_text(row), "memmon · memory under pressure",
+                   "Open memmon to review it; nothing was stopped")
+        except Exception:
+            mp.rollback_notification(PRESSURE_EPISODE, row["job_id"], rec["mono"], before)
     return tick
 
 
@@ -1910,7 +1934,8 @@ def _log_row(snap: dict, reading: dict | None) -> dict:
         "swap_total": vm.get("swap_total", 0), "free_pct": vm.get("free_pct", 0),
         "load": vm.get("load", 0), "orphan": snap["orphan_total"],
         # Counters, so the next run can compute paging rates against this point.
-        "swapins": vm.get("swapins", 0), "swapouts": vm.get("swapouts", 0),
+        # null when vm_stat was not read: a defaulted 0 reads as since-boot thrash.
+        "swapins": vm.get("swapins"), "swapouts": vm.get("swapouts"),
         "pressure": p.get("level", "?"),
         # Carries the low-headroom streak across process boundaries: every CLI
         # invocation is a fresh process, so without this the streak could never
@@ -1923,7 +1948,17 @@ def _log_row(snap: dict, reading: dict | None) -> dict:
         "overhead": (snap.get("overhead") or {}).get("mem", 0),
     }
     row.update(_s2_fields(p, rec, vm))
-    row["pressure_suggestions"] = snap.get("pressure_suggestions") or []
+    if reading is not None:
+        row["pressure_suggestions"] = snap.get("pressure_suggestions") or []
+        row["suggestions_ts"] = row["ts"]
+    else:
+        # The live dashboard never scans for suggestions. It carries the
+        # sampler's list, the under_pressure it was computed under and when,
+        # rather than writing an empty list the gate would trust.
+        prev = _read_row(SNAPSHOT) or {}
+        row["under_pressure"] = bool(prev.get("under_pressure"))
+        row["pressure_suggestions"] = prev.get("pressure_suggestions") or []
+        row["suggestions_ts"] = prev.get("suggestions_ts")
     return row
 
 
@@ -1942,11 +1977,15 @@ def _s2_fields(p: dict, rec: dict, vm: dict) -> dict:
     return out
 
 
-def _append_row(row: dict) -> None:
+def _append_row(row: dict, reading: dict | None = None) -> None:
     import memmon_owners
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(HISTORY, "a") as fh:
         fh.write(json.dumps(row) + "\n")
+    if reading is not None:
+        # From here a budget expiry only re-publishes this row; it never
+        # appends a partial one after it.
+        reading["row"] = row
     memmon_owners.write_json_atomic(SNAPSHOT, row)
 
 
@@ -1970,19 +2009,12 @@ def log_sample(snap: dict, reading: dict | None = None) -> None:
                    "Memory pressure cleared")
         except Exception:
             pass
-    gap = (reading or {}).get("record", {}).get("gap")
-    if gap and gap["cause"] == "starved" and gap["awake_s"] >= STARVED_NOTICE_S:
-        try:
-            notify(gap_notice(gap), "memmon", "Sampling gap")
-        except Exception:
-            pass
-
     try:
         learn(snap)
     except Exception:
         pass
 
-    _append_row(row)
+    _append_row(row, reading)
     _trim_history()
 
 
@@ -2033,6 +2065,15 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> 
     reading, done = None, False
     try:
         reading = sampler_reading(source, clock)
+        # Posted as soon as pressure.json holds the gap: the slow collection
+        # below is exactly what a starved machine may not finish. A gap is
+        # discovered by one run only, so this posts once.
+        gap = reading["record"].get("gap")
+        if notifiable_gap(gap):
+            try:
+                notify(gap_notice(gap), "memmon", "Sampling gap")
+            except Exception:
+                pass
         snap = collect(pres=reading["pressure"])
         try:
             sampler_owners(snap, reading)
@@ -2042,7 +2083,10 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> 
         done = True
     except SamplerBudget:
         signal.setitimer(signal.ITIMER_REAL, 0)
-        if not done:
+        if (reading or {}).get("row"):
+            import memmon_owners
+            memmon_owners.write_json_atomic(SNAPSHOT, reading["row"])
+        elif not done:
             write_partial(reading)
             print("memmon: sampler budget exceeded; partial row written",
                   file=sys.stderr)
@@ -2062,14 +2106,31 @@ HISTORY_KEEP_ROWS = 10_080         # 7 days at 1/min
 ERRLOG_TRIM_AT = 1 * MB
 
 
+def _replace_lines(path: str, lines: list) -> None:
+    """Rewrite a file through a unique temp file and os.replace, so an
+    interruption (the sampler's budget is an asynchronous BaseException)
+    leaves either the old file or the new one, never a truncated one."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.writelines(lines)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _trim_history() -> None:
     try:
-        if os.path.getsize(HISTORY) < HISTORY_TRIM_AT:
-            return
-        with open(HISTORY) as fh:
-            rows = fh.readlines()
-        with open(HISTORY, "w") as fh:
-            fh.writelines(rows[-HISTORY_KEEP_ROWS:])
+        if os.path.getsize(HISTORY) >= HISTORY_TRIM_AT:
+            with open(HISTORY) as fh:
+                rows = fh.readlines()
+            _replace_lines(HISTORY, rows[-HISTORY_KEEP_ROWS:])
     except Exception:
         pass
     # launchd appends the sampler's stderr forever; nothing else bounds it.
@@ -2078,11 +2139,9 @@ def _trim_history() -> None:
         if os.path.getsize(err) > ERRLOG_TRIM_AT:
             with open(err) as fh:
                 tail = fh.readlines()[-200:]
-            with open(err, "w") as fh:
-                fh.writelines(tail)
+            _replace_lines(err, tail)
     except Exception:
         pass
-
 
 def report(days: int) -> str:
     if not os.path.isfile(HISTORY):
@@ -2484,7 +2543,8 @@ def top_suggestion(cached: dict, now: float) -> dict | None:
     and says under_pressure. The gate reads nothing else, so its budget holds."""
     if not suggestions_enabled() or not cached.get("under_pressure"):
         return None
-    if not 0 <= now - cached.get("ts", 0) <= STALE_DISPLAY_S:
+    made = cached.get("suggestions_ts", cached.get("ts")) or 0
+    if not 0 <= now - made <= STALE_DISPLAY_S:
         return None
     rows = cached.get("pressure_suggestions") or []
     return rows[0] if rows and isinstance(rows[0], dict) else None
@@ -3081,7 +3141,8 @@ def sampler_block(now: float | None = None) -> dict:
         last, (int, float)) else None
     return {"last_ts": last, "age_s": None if age is None else round(age, 1),
             "stale": age is None or age > STALE_DISPLAY_S,
-            "last_gap": rec.get("last_gap")}
+            "last_gap": rec.get("last_gap"),
+            "last_starved_gap": rec.get("last_starved_gap")}
 
 
 def pressure_suggestions(sample, ctx, payload: dict, history=None) -> list:
