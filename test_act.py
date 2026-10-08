@@ -1216,7 +1216,7 @@ class SignalSiteTests(unittest.TestCase):
 
     # Refusals memmon emits that the menu bar has no copy for yet; the ui
     # lane adds them. Remove an entry once MemmonBar.swift has its case.
-    PENDING_UI_COPY = {"bad_args"}
+    PENDING_SWIFT_COPY = {"bad_args"}
 
     def test_every_refusal_reason_has_menu_bar_copy(self):
         # Every emitter, not only the engine: memmon.py refuses too.
@@ -1233,7 +1233,7 @@ class SignalSiteTests(unittest.TestCase):
         body = swift[swift.index("static func refusal("):]
         body = body[:body.index("default:")]
         cases = set(re.findall(r'"([a-z_]+)"', body))
-        self.assertLessEqual(reasons - cases, self.PENDING_UI_COPY)
+        self.assertLessEqual(reasons - cases, self.PENDING_SWIFT_COPY)
 
     def test_signal_site_pattern_catches_every_spelling(self):
         for line in ("os.kill(p, 9)", "os.killpg(g, 15)", "self.kill(pid, sig)",
