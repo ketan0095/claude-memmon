@@ -1060,7 +1060,7 @@ class HeaderAndRingTests(unittest.TestCase):
 
     def test_dismiss_calls_memmon_with_the_entry_id(self):
         out = self.probe("stale-paused.json", "--dismiss", "1791449760000.fixture-a")
-        self.assertEqual(out["actions"], ["dismiss-blocked 1791449760000.fixture-a"])
+        self.assertEqual(out["actions"], ["memmon --dismiss-blocked 1791449760000.fixture-a"])
 
     def test_an_open_confirm_alone_keeps_its_section_open(self):
         payload = effective(FIXTURES / "overview.json")

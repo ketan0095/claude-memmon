@@ -1636,9 +1636,11 @@ final class Model: ObservableObject {
     }
 
     func dismissBlocked(_ id: String) {
-        guard live else { actionLog.append("dismiss-blocked \(id)"); return }
+        // One argv for both paths, so a fixture logs exactly what memmon would get.
+        let args = ["--dismiss-blocked", id]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
         DispatchQueue.global(qos: .userInitiated).async {
-            _ = CLI.run(["--dismiss-blocked", id], timeout: CLI.ownersTimeout)
+            _ = CLI.run(args, timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
         }
     }
