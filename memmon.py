@@ -2991,13 +2991,13 @@ def job_tokens(cmd: str) -> list:
     return out
 
 
-def _owners_ctx(titles: bool = True):
+def _owners_ctx(titles: bool = True, leases: list | None = None):
     import memmon_owners
     from memmon_runner import jobs
     ctx = memmon_owners.Context(
         sessions_dir=CLAUDE_SESSIONS_DIR, socks_dir=CC_SOCKS_DIR,
         codex_home=CODEX_HOME, jobs_dir=JOBS_DIR, roster_path=CLAUDE_ROSTER,
-        leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
+        leases=jobs(STATE_DIR) if leases is None else leases, rv_map=map_pids_to_jobs,
         lsof=lambda args: _sh(["lsof", *args], timeout=5))
     if titles:
         prof = load_profile()
@@ -3060,17 +3060,16 @@ def system_block(reader=None) -> dict:
     return out
 
 
-def runner_block(system: dict) -> dict | None:
-    """The runner's mode, committed budget, admission and queue: `memmon jobs
-    --json` without its rows, which are already runner_jobs. Display only."""
+def runner_snapshot(system: dict) -> dict:
+    """`memmon jobs --json` (schema 2), reusing the health card's strict read.
+    Display only: nothing here admits."""
     try:
         import memmon_runner
         strict = ({k: system[k] for k in ("ram_bytes", "used_bytes", "pressure_level")}
                   if system.get("used_bytes") is not None else None)
-        snap = memmon_runner.snapshot(STATE_DIR, system=strict)
+        return memmon_runner.snapshot(STATE_DIR, system=strict)
     except Exception as exc:
         return {"reason": f"{type(exc).__name__}: {exc}"}
-    return {k: v for k, v in snap.items() if k != "jobs"}
 
 
 def sampler_block(now: float | None = None) -> dict:
@@ -3163,7 +3162,10 @@ def owners_sample(cpu_window: float, source=None, ctx=None, sleep=time.sleep):
 def owners_json(cpu_window: float = 1.0, expand: list | None = None,
                 source=None, ctx=None, system_reader=None) -> dict:
     import memmon_owners
-    ctx = ctx or _owners_ctx()
+    system = system_block(system_reader)
+    runner = runner_snapshot(system)
+    # The partition and runner_jobs see the same v2 rows.
+    ctx = ctx or _owners_ctx(leases=runner.get("jobs"))
     sample, window = owners_sample(cpu_window, source, ctx)
     used_by = None
     if expand:
@@ -3178,7 +3180,7 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     hist = memmon_owners.read_json(OWNERS_HISTORY, {})
     payload = memmon_owners.owners_payload(
         sample, ctx, history=hist, cpu_window_s=window,
-        system=system_block(system_reader),
+        system=system,
         protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
         gate=gate_stats(), used_by=used_by)
     # A machine-wide CPU figure is only a sum when every member was measured;
@@ -3193,8 +3195,8 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     system["cpu_cores"] = round(sum(seen), 3) if complete else None
     if not seen:
         system["cpu_reason"] = sample.cpu_reason or "not measured"
-    payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
-    payload["runner"] = runner_block(system)
+    payload["runner_jobs"] = ctx.leases       # v2 rows, a strict superset of v1
+    payload["runner"] = {k: v for k, v in runner.items() if k != "jobs"}
     payload["coverage"] = coverage_lines(payload["protection"])
     import memmon_pressure
     payload["under_pressure"] = memmon_pressure.under_pressure(
@@ -3392,7 +3394,8 @@ def main() -> int:
         return cli(sys.argv[1:], STATE_DIR, lambda: pressure(read_vm(fast=True)))
     if len(sys.argv) > 1 and sys.argv[1] in ("route", "route-classify"):
         import memmon_route
-        return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command)
+        return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
+                                split=shell_commands)
     if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap"):
         return {"owners": owners_cli, "act": act_cli,
                 "reap": reap_cli}[sys.argv[1]](sys.argv[2:])

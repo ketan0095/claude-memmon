@@ -152,14 +152,28 @@ memmon jobs
 memmon jobs --json
 ```
 
+`memmon run [--label L] [--resource R] [--reserve GB] [--interruptible]
+[--timeout S] -- cmd` waits for a ticket, then admits when the job's estimate
+fits the committed-memory budget (80 % of RAM) and memory has stayed at Watch
+or better for 30 s. A job's first run reserves 4 GB until memmon learns its
+peak. Tickets are first come, first served (at most 32 waiting); a ticket whose
+resource is busy is skipped, never one that merely does not fit. `memmon
+run-mode protect|observe|paused` switches modes; `paused` is the v1 behaviour
+(HEALTHY/WATCH start, DANGER/CRITICAL wait), and `observe` admits as v1 does
+while logging what protect would have held.
+
 All callers on the same Mac/user share the default `heavy` slot. Only one
-wrapped command holds that slot at a time. The runner also checks live memory
-pressure before launching: HEALTHY/WATCH can start; DANGER/CRITICAL wait. Each
-wait is bounded (600 seconds by default), with progress on stderr every 15
-seconds explaining the resource owner or pressure level. The terminal dashboard
-and menu-bar popover show running and waiting jobs when refreshed. `jobs --json`
-returns `{ "schema_version": 1, "jobs": [...] }`; each row includes a run ID,
-resource, label, working directory, wrapper/child PIDs, state, reason and age.
+wrapped command holds that slot at a time. Each wait is bounded (600 seconds by
+default), with progress on stderr explaining the hold. A running job is watched
+every 2 s; growth past its reservation while the budget is over, or DANGER or
+CRITICAL for two ticks, flags it for intervention, which the menu bar shows
+with a confirmed Stop. Without MemmonBar, the stderr `memmon:` line and
+`memmon jobs` are the only intervention signals. Only a job started with
+`--interruptible`, with `auto_cancel_interruptible` on (`memmon run-mode
+--auto-cancel-interruptible on`), is ever cancelled by policy: after 10 s at
+CRITICAL. `jobs --json` returns schema 2, a strict superset of v1: mode, the
+committed budget, admission, queue and per-job state, reason, reservation,
+estimate and footprint. It never includes command arguments.
 
 **Use it from both agents:** replace the command the agent would execute with
 `memmon run --label "<task>" -- <that command>`. Codex can call this directly
@@ -172,18 +186,37 @@ different resource names do not serialize each other and no slot locks files.
 
 The wait timeout limits **acquisition**, not command runtime. Commands inherit
 stdin/stdout/stderr, receive literal arguments (no implicit shell), and preserve
-their exit status. Exit `124` means the wait expired without starting; `125`
-means runner/pressure failure; `126`/`127` mean launch failure/missing executable;
-cancellation returns `128 + signal`. A child can also return those same codes,
-so use the accompanying stderr message to distinguish runner failures.
+their exit status. An admitted job's stderr is byte-identical; memmon writes
+`memmon:` lines only when it holds, refuses or intervenes.
+
+| Exit | Meaning |
+|---|---|
+| child's code | admitted; passed through unchanged |
+| 2 | nested runner, or a usage error |
+| 75 | cancelled by policy; trust the stderr line `memmon: cancelled by policy …`, since a child can exit 75 too |
+| 124 | gave up: the wait expired, or `memmon: admission queue full (32)` |
+| 125 | telemetry unavailable at the deadline, or the runner itself unavailable |
+| 126 / 127 | could not start / command not found |
+| 128+sig | the wrapper was cancelled |
+
+A child can return any of these codes too, so use the accompanying stderr
+message to tell runner outcomes apart.
 
 Kernel locks release on process exit and need no stale PID deletion or lease
 expiry. The direct command inherits its resource lock: even SIGKILL of the
 wrapper does not admit another command while that child is alive. Catchable
 cancellation is forwarded to the launched command's own process group; after
 five seconds a still-running direct child is killed. Detached/background jobs
-that close inherited descriptors are outside this contract. Acquisition is not
-FIFO; contending jobs retry until their individual deadline.
+that close inherited descriptors are outside this contract.
+
+**Route mode is not available yet.** `memmon route on` would point Claude Code's
+`CLAUDE_CODE_SHELL_PREFIX` at a launcher that wraps heavy Bash commands in
+`memmon run`. It refuses until gate G1 is verified: the launcher must tell a
+Bash tool call apart from hooks, MCP startup and the status line, and the
+status-line case has not been verified. Until then the Claude integration is
+advisory only (the gate's `additionalContext`). Use `memmon run` from CLAUDE.md
+or AGENTS.md. `memmon route status` explains the refusal, and `memmon route off`
+always works.
 
 Runner metadata is local under `~/.claude/memmon/runner`. It records labels and
 working directories, **not command arguments**; avoid secrets in labels. Stale
@@ -714,7 +747,7 @@ names the top job and tells the agent to ask the user first. `memmon owners`
 prints the same list.
 
 The way to keep such work out of this list is to start it through
-`memmon run` (or route mode), which puts it under admission and monitoring.
+`memmon run`, which puts it under admission and monitoring.
 `"pressure_suggestions": false` in `config.json` turns all of this off.
 
 ## The gate

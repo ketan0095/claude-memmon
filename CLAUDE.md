@@ -123,19 +123,36 @@ typechecks and tests that should share one machine-wide slot. Claude, Codex and
 terminal commands use the same runner. `memmon jobs` explains who is running or
 waiting; the menu-bar dashboard shows those jobs too.
 
-Wrap repo-wide test, build and typecheck runs this way (or turn on route mode).
-That is what puts them under admission and monitoring; anything started
-directly is only ever listed under pressure, never stopped by memmon.
+Wrap repo-wide test, build and typecheck runs this way. That is what puts them
+under admission and monitoring; anything started directly is only ever listed
+under pressure, never stopped by memmon.
 
-Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit 124
-means the command never started. Do not replace this with a `pgrep` waiting loop,
-wrap the same command twice, or wrap an entire multi-hour agent session. Only
-wrapped jobs coordinate; existing jobs and other resource governors remain
-independent. A runner slot is not a worktree lock or permission to edit files.
+The default mode is `protect`: a job waits for a ticket, then starts when its
+estimate (4 GB until memmon has seen its peak; `--reserve GB` overrides) fits
+the committed-memory budget of 80 % of RAM and memory has stayed at Watch or
+better for 30 s. `memmon run-mode paused` restores the old behaviour (start at
+HEALTHY or WATCH), `observe` admits the old way and logs what protect would have
+held. Without MemmonBar, the stderr `memmon:` line and `memmon jobs` are the
+only signals that a running job needs attention. Nothing is cancelled by policy
+unless the job was started with `--interruptible` and auto-cancel is on.
 
-The runner starts only at HEALTHY/WATCH pressure, independent of the Bash gate
-mode or pause switch. It preserves output and exit status. Use it for foreground,
-non-interactive commands, not dev servers, daemon launchers or interactive shells.
+Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit
+codes: the child's own; 2 nested runner; 75 cancelled by policy (trust the
+stderr line, a child can exit 75 too); 124 gave up waiting or the queue is full
+(32); 125 telemetry unavailable at the deadline or the runner unavailable;
+126/127 launch failure; 128+signal cancelled. Exit 124 or 125 means the command
+never started. Do not replace this with a `pgrep` waiting loop, wrap the same
+command twice, or wrap an entire multi-hour agent session. Only wrapped jobs
+coordinate; existing jobs and other resource governors remain independent. A
+runner slot is not a worktree lock or permission to edit files.
+
+Use it for foreground, non-interactive commands, not dev servers, daemon
+launchers or interactive shells.
+
+`memmon route on` (wrapping Claude's heavy Bash commands automatically) refuses
+for now: the launcher cannot yet be shown to tell a Bash tool call from a
+status-line command. Do not work around it; use `memmon run` explicitly.
+`memmon route off` always works.
 
 ## Showing it in the terminal
 

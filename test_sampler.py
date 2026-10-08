@@ -31,20 +31,12 @@ PAGE = 16384
 
 
 class SamplerState:
-    """TempState plus the S2 sampler paths and a clean in-process baseline."""
-
-    PATHS = ("PRESSURE_FILE", "JOB_HISTORY", "PRESSURE_EPISODE")
+    """TempState, a clean in-process baseline and a recording notifier."""
 
     def __init__(self, tc):
         self.ts = TempState()
         tc.addCleanup(self.ts.close)
         r = self.ts.root
-        for name, value in (("PRESSURE_FILE", f"{r}/pressure.json"),
-                            ("JOB_HISTORY", f"{r}/job-history.json"),
-                            ("PRESSURE_EPISODE", f"{r}/runner/coord/pressure-episode.json")):
-            p = mock.patch.object(memmon, name, value)
-            p.start()
-            tc.addCleanup(p.stop)
         for name in ("_prev_vm", "_free_base", "_last_rates"):
             p = mock.patch.object(memmon, name, {})
             p.start()
