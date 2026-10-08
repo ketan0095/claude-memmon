@@ -8,6 +8,7 @@
   "remaining": [],
   "kept": [
    "claude:fixture-nested",
+   "codex-proc:7001.1791440000",
    "app:com.example.browser"
   ],
   "used_bytes_before": 42090679500,

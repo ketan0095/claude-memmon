@@ -14,6 +14,7 @@
   "named": 2,
   "forceable": 0,
   "observed": 0,
-  "observed_unlisted": 3
+  "observed_unlisted": 3,
+  "exited_unsignalled": 0
  }
 }

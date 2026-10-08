@@ -15,7 +15,8 @@
     "forceable": false,
     "role": "survivor",
     "signalled": false,
-    "argv0": "node"
+    "argv0": "node",
+    "skip_reason": "protected"
    }
   ],
   "kept": [],
@@ -26,6 +27,7 @@
   "named": 2,
   "forceable": 0,
   "observed": 0,
-  "observed_unlisted": 0
+  "observed_unlisted": 0,
+  "exited_unsignalled": 0
  }
 }

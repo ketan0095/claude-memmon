@@ -223,6 +223,12 @@ class QuitAppEngineTests(unittest.TestCase):
         self.assertFalse(r["complete_after_quit"])
         self.assertFalse(r["complete_after_force"])
 
+    def test_unreadable_instance_is_unverified_never_quit_or_forced(self):
+        r = self.scenario("unreadable")
+        self.assertEqual([i["state"] for i in r["after_quit"]], ["exited", "unverified"])
+        self.assertFalse(r["complete_after_quit"])
+        self.assertNotIn("force_calls", r)
+
     def test_instance_exiting_at_quit_time_is_already_quit_not_an_app(self):
         r = self.scenario("raced-exit")
         self.assertEqual([i["state"] for i in r["after_quit"]], ["exited", "already_exited"])
@@ -392,6 +398,10 @@ sys.exit(r['code'])
         self.assertEqual(r["force_calls"], [])
         self.assertEqual(r["force_states"], ["exited", "exited"])
 
+    def test_unverified_recheck_is_never_success(self):
+        r = self.quit_probe(self.verify_stub(later={5101: "exited", 5188: "unverified"}))
+        self.assertEqual(r["states"], ["exited", "unverified"])
+
     def test_memmon_not_appkit_decides_an_instance_exited(self):
         r = self.quit_probe(self.verify_stub(later={5101: "exited", 5188: "running"}))
         self.assertEqual(r["states"], ["exited", "running"])
@@ -551,6 +561,27 @@ class AccessibilityTests(unittest.TestCase):
         for fixture in ("outcome-outside-force.json", "outcome-force-with-survivors.json"):
             self.assertFalse(any("Force" in l for l in labels(a11y(fixture))), fixture)
 
+    def test_app_force_that_forced_nothing_is_not_called_force_quit(self):
+        text = self.spoken("quit-service-forced-none.json")
+        self.assertIn("Container VM quit · nothing needed forcing · 2 of 2 instances exited", text)
+        self.assertNotIn("force-quit", text)
+
+    def test_runner_wrappers_are_never_outside_what_was_stopped(self):
+        rows = a11y("outcome-partial-runner.json")
+        text = " ".join(r["label"] + " " + r["value"] for r in rows)
+        self.assertIn("1 of 2 can be force-stopped.", text)
+        self.assertIn("1 is a memmon run wrapper; it exits once its job ends.", text)
+        self.assertNotIn("outside what was stopped", text)
+        self.assertIn("Force stop 1 of the 2 remaining processes", labels(rows))
+        forced = self.spoken("outcome-force-runner.json")
+        self.assertIn("Typecheck partly stopped · 1 force-stopped · 1 memmon run wrapper — exits once its job ends",
+                      forced)
+        self.assertNotIn("outside what was stopped", forced)
+
+    def test_protected_survivors_that_ended_are_not_already_exited(self):
+        text = self.spoken("outcome-force-protected-gone.json")
+        self.assertIn("1 ended by force · 1 had already exited · 1 ended on their own while protected", text)
+
     def test_self_exited_survivors_are_not_counted_as_force_stopped(self):
         text = self.spoken("outcome-force-self-exited.json")
         self.assertIn("Typecheck force-stopped · 1 ended by force · 1 had already exited", text)
@@ -634,7 +665,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("CPU not available, partly measured", row)
 
     def test_kept_owners_are_named_by_kind(self):
-        self.assertIn("1 nested session kept running · 1 app or service kept running",
+        self.assertIn("2 nested sessions kept running · 1 app or service kept running",
                       self.spoken("outcome-kept.json"))
 
     def test_force_with_named_survivors_stays_partial(self):
@@ -793,6 +824,18 @@ class HostedPopoverTests(unittest.TestCase):
         self.assertEqual(old["phase"], "closed")
         self.assertIn("more than 2 minutes old", old["banner"])
 
+    def test_app_force_clock_defaults_to_one_that_counts_sleep(self):
+        src = (ROOT / "MemmonBar.swift").read_text()
+        self.assertIn("var clock: () -> Double = { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9 }", src)
+        before = time.clock_gettime(time.CLOCK_MONOTONIC)
+        probed = float(run_bin("--clock-probe").strip())
+        after = time.clock_gettime(time.CLOCK_MONOTONIC)
+        self.assertTrue(before - 1 <= probed <= after + 1, (before, probed, after))
+        # On a Mac that has slept since boot, the uptime clock lags behind.
+        uptime = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+        if after - uptime > 10:
+            self.assertGreater(abs(probed - uptime), 5)
+
     def test_app_force_window_counts_time_asleep(self):
         fixture = str(FIXTURES / "quit-service-partial.json")
         awake = run_json("--selftest-host", "force-ttl", "--fixture", fixture, "--sleep", "30")
@@ -801,9 +844,56 @@ class HostedPopoverTests(unittest.TestCase):
         self.assertEqual(slept["actions"], [])
         self.assertIn("more than 2 minutes old", slept["banner"])
 
-    def rebind(self, nxt):
-        return run_json("--selftest-host", "rebind", "--fixture", str(FIXTURES / "confirm-stop.json"),
+    def rebind(self, nxt, fixture="confirm-stop.json"):
+        return run_json("--selftest-host", "rebind", "--fixture", str(FIXTURES / fixture),
                         "--next", str(FIXTURES / "next" / nxt))
+
+    def test_top_level_managed_job_confirm_names_the_job_once(self):
+        found = labels(a11y("confirm-managed-job.json"))
+        self.assertIn("Stop acme-web typecheck?", found)
+        text = " ".join(found)
+        self.assertNotIn("in acme-web typecheck", text)
+        self.assertNotIn("keeps running", text)
+
+    def test_top_level_managed_job_confirm_follows_its_owner(self):
+        same = self.rebind("rebind-managed-same.json", "confirm-managed-job.json")
+        self.assertEqual(same["phase"], "ask")
+        self.assertEqual(same["job_token"], "fresh-managed-token")
+        gone = self.rebind("rebind-managed-gone.json", "confirm-managed-job.json")
+        self.assertEqual(gone["phase"], "closed")
+        self.assertIn("can no longer be stopped from here", gone["banner"])
+
+    def test_confirm_closes_when_its_action_changed(self):
+        kind = self.rebind("rebind-job-kind-changed.json")
+        self.assertEqual(kind["phase"], "closed")
+        self.assertIn("changed while this was open", kind["banner"])
+        hosts = self.rebind("rebind-quit-hosts.json", "quit-service.json")
+        self.assertEqual(hosts["phase"], "closed")
+        self.assertIn("Not quit — Container VM now hosts agent sessions", hosts["banner"])
+        # Per kind only: a stop-command confirm has no token and stays open.
+        command = self.rebind("rebind-stop-command.json", "stop-command.json")
+        self.assertEqual(command["phase"], "ask")
+
+    def test_a_real_refresh_rebinds_the_open_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "payload.json"
+            stub = Path(tmp) / "memmon_stub.py"
+            stub.write_text(f"print(open({str(payload)!r}).read())\n")
+            def go(nxt):
+                return run_json("--selftest-host", "refresh-rebind", "--fixture", str(FIXTURES / "confirm-stop.json"),
+                                "--next", str(FIXTURES / "next" / nxt), "--script", str(stub),
+                                "--payload", str(payload), timeout=60)
+            same = go("rebind-same.json")
+            self.assertEqual((same["phase"], same["job_token"]), ("ask", "fresh-build-token"))
+            changed = go("rebind-changed.json")
+            self.assertEqual(changed["phase"], "closed")
+            self.assertIn("Nothing done", changed["banner"])
+
+    def test_partial_after_the_popover_closed_is_a_banner(self):
+        r = run_json("--selftest-host", "closed-then-partial", "--fixture", str(FIXTURES / "confirm-stop.json"),
+                     "--outcome", str(FIXTURES / "outcomes" / "partial.json"))
+        self.assertEqual(r["phase"], "closed")
+        self.assertIn("partly stopped", r["banner"])
 
     def test_open_confirm_follows_a_refresh_or_closes(self):
         same = self.rebind("rebind-same.json")

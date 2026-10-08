@@ -14,7 +14,8 @@
     ],
     "forceable": true,
     "argv0": "node",
-    "signalled": true
+    "signalled": true,
+    "role": "survivor"
    },
    {
     "pid": 48313,
@@ -24,7 +25,8 @@
     ],
     "forceable": true,
     "argv0": "node",
-    "signalled": true
+    "signalled": true,
+    "role": "survivor"
    }
   ],
   "kept": [],
