@@ -642,11 +642,23 @@ class PlistTests(unittest.TestCase):
         self.assertEqual(cfg["ProgramArguments"][-1], "--log")
         with open(self.calls) as fh:
             self.assertIn("launchctl bootstrap", fh.read())
+        dest = os.path.join(self.home, ".claude/memmon")
+        route = os.path.join(dest, "memmon_route.sh")
+        with open(route) as fh, open(os.path.join(HERE, "memmon_route.sh")) as src:
+            self.assertEqual(fh.read(), src.read())
+        self.assertTrue(os.access(route, os.X_OK))
+        self.assertFalse(os.path.exists(os.path.join(dest, "runner/coord/route.json")))
         out = self.install("--uninstall")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertFalse(os.path.exists(plist))
-        dest = os.path.join(self.home, ".claude/memmon")
-        self.assertFalse(os.path.exists(os.path.join(dest, "memmon_pressure.py")))
+        for mod in ("memmon_pressure", "memmon_telemetry", "memmon_route", "memmon"):
+            self.assertFalse(os.path.exists(os.path.join(dest, f"{mod}.py")), mod)
+        # Route off ran first, and the launcher stays as a pass-through stub.
+        self.assertTrue(os.path.exists(os.path.join(dest, "runner/coord/route.off")))
+        import memmon_route
+        with open(route) as fh:
+            self.assertEqual(fh.read(), memmon_route.STUB)
+        self.assertTrue(os.access(route, os.X_OK))
 
 
 if __name__ == "__main__":

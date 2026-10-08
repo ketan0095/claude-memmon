@@ -55,6 +55,21 @@ if [[ -d "$AGENTS" ]]; then
 fi
 
 if [[ $UNINSTALL == 1 ]]; then
+  # Route off before anything else: route.off takes effect at once, even in
+  # sessions already running, and the settings key goes only if it is still
+  # memmon's. The launcher then becomes a pass-through stub and stays, because
+  # running sessions may still call that path.
+  if [[ -f "$DEST" ]]; then
+    /usr/bin/python3 "$DEST" route off || true
+  fi
+  if [[ -f "$DEST_DIR/memmon_route.sh" ]]; then
+    cat > "$DEST_DIR/.memmon_route.sh.$$" <<'STUB'
+#!/bin/sh
+exec /bin/bash -c "$1"
+STUB
+    chmod +x "$DEST_DIR/.memmon_route.sh.$$"
+    mv -f "$DEST_DIR/.memmon_route.sh.$$" "$DEST_DIR/memmon_route.sh"
+  fi
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   launchctl bootout "gui/$(id -u)/$BAR_LABEL" 2>/dev/null || true
   pkill -f "MemmonBar.app/Contents/MacOS/MemmonBar" 2>/dev/null || true
@@ -82,7 +97,7 @@ PY
          "$DEST_DIR/memmon_runner.py" "$DEST_DIR/memmon_procs.py" \
          "$DEST_DIR/memmon_owners.py" "$DEST_DIR/memmon_act.py" \
          "$DEST_DIR/memmon_common.py" "$DEST_DIR/memmon_pressure.py" \
-         "$DEST_DIR/memmon_telemetry.py" \
+         "$DEST_DIR/memmon_telemetry.py" "$DEST_DIR/memmon_route.py" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
   exit 0
@@ -109,7 +124,7 @@ mkdir -p "$DEST_DIR" "$BIN_DIR"
 # deleted, and the monitor has to keep working after that.
 # Publish the dependency before the entrypoint, without exposing partial files
 # to an already-running sampler or another CLI invocation during an upgrade.
-for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry; do
+for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry memmon_route; do
   cp "$SRC_DIR/$mod.py" "$DEST_DIR/.$mod.py.$$"
   mv -f "$DEST_DIR/.$mod.py.$$" "$DEST_DIR/$mod.py"
 done
@@ -118,6 +133,11 @@ mv -f "$DEST_DIR/.memmon.py.$$" "$DEST"
 chmod +x "$DEST"
 cp "$SRC_DIR/memmon-gate.sh" "$GATE"
 chmod +x "$GATE"
+# The route launcher is installed but not enabled; `memmon route on` points
+# Claude Code's shell prefix at it.
+cp "$SRC_DIR/memmon_route.sh" "$DEST_DIR/.memmon_route.sh.$$"
+chmod +x "$DEST_DIR/.memmon_route.sh.$$"
+mv -f "$DEST_DIR/.memmon_route.sh.$$" "$DEST_DIR/memmon_route.sh"
 cp "$SRC_DIR/README.md" "$DEST_DIR/README.md" 2>/dev/null || true
 
 cat > "$BIN" <<EOF
