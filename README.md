@@ -485,7 +485,7 @@ expires after 120 seconds:
 | `stop-job` / `stop-server` | one build, test or dev server inside a session | the session's conversation and every other owner |
 | `stop-managed-job` | the child of a `memmon run`; its wrapper then exits 143 | the wrapper and everything else |
 | `end-session` | a Claude session or a `codex exec`, down to any nested session | nested sessions (reported as kept) |
-| `verify-app` | nothing — checks every instance of an app before the menu bar quits it, and answers with a fresh token for the check after the quit | — |
+| `verify-app` | nothing — checks every instance of an app before the menu bar quits it, and answers with a fresh token for the check after the quit (where a reused PID reads `exited` and an unreadable one `unverified`) | — |
 
 Every signal goes to one process at a time, immediately after re-reading that
 process's identity (PID plus start time to the microsecond) and finding it
@@ -502,13 +502,24 @@ and only `memmon act force --target <token>` sends SIGKILL to them — after
 re-reading each one again, and skipping any that has since become another
 owner's root. Processes the stop only observed (a reparented child found in the
 group, say) are listed as `forceable: false`; force never touches them and its
-result stays `partial` while they run, including any beyond the 64 a token can
-list (`observed_unlisted`). A force result counts `killed` (sent SIGKILL, now
-gone) separately from `exited` (every named survivor now gone, however it went;
-kept under that name for compatibility), and each remaining row says whether
-force signalled it (`signalled`). A stop never signals a `memmon run` wrapper
-while its child runs, because the wrapper would pass the signal to the child's
-whole process group: the child is stopped by PID and the wrapper then exits.
+result stays `partial` while they run. A token lists at most 64 of them; the
+rest are re-counted at force time from the process groups they were seen in
+(`observed_unlisted`). A force result splits the named survivors that are gone
+three ways: `killed` (sent SIGKILL, now gone), `exited_unsignalled` (left alone
+as protected, or the signal could not be delivered, and gone anyway) and the
+rest, which had already exited before force ran; `exited` is the total, kept
+under that name for compatibility. Each remaining row has a `role` (`survivor`,
+`observed` or `runner`), whether it was actually `signalled`, and for a
+survivor force left alone a `skip_reason` (`protected` or `signal_failed`).
+
+A stop never signals a `memmon run` wrapper while its child may still run,
+because the wrapper would pass the signal to the child's whole process group.
+That holds when the lease row has no child start time (older runners), when the
+start is only known to the second, while the wrapper is still starting its
+child, and for a wrapper started during the grace period. The child is stopped
+by PID and the wrapper then exits on its own; one still alive at the end is
+listed with role `runner`, and force waits for it once it has killed its child.
+A dry run lists such wrappers as stopping once their job ends.
 A reap's force token is accepted only by `memmon reap --force`, which re-checks
 each survivor against the orphan or prewarm rule; `memmon act` refuses it. If a job's process exited before the stop
 but what it started is still running in its group, the result is `partial`
