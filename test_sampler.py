@@ -14,6 +14,7 @@ import linecache
 import os
 import plistlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -481,6 +482,38 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(rows[-1]["rates_source"], "in_run")
         self.assertNotIn("partial", self.st.read(memmon.SNAPSHOT))
         self.assertEqual([f for f in os.listdir(self.st.root) if f.endswith(".tmp")], [])
+
+    def test_budget_between_append_and_row_flag(self):
+        # A real SIGALRM lands right after the history append, before the
+        # row flag: it must not add a partial row after the full one.
+        T = FakeTelemetry()
+        here = os.path.abspath(memmon.__file__)
+        fired = []
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != here:
+                return None
+            if (event == "line" and frame.f_code.co_name == "_append_row" and not fired
+                    and 'reading["row"] = row' in linecache.getline(here, frame.f_lineno)):
+                fired.append(1)
+                os.kill(os.getpid(), signal.SIGALRM)
+            return tracer
+        snap = {"ts": time.time(), "vm": {}, "pressure": {}, "orphan_total": 0,
+                "sessions": [], "apps": {}, "worktrees": []}
+        with mock.patch.object(memmon, "collect", lambda pres: dict(snap, pressure=pres)), \
+                mock.patch.object(memmon, "sampler_owners"), \
+                mock.patch.object(memmon, "learn"), mock.patch("sys.stderr", io.StringIO()):
+            sys.settrace(tracer)
+            try:
+                rc = memmon.sampler_run(budget_s=5.0, source=T, clock=T)
+            finally:
+                sys.settrace(None)
+        self.assertEqual((rc, fired), (0, [1]))
+        with open(memmon.HISTORY) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("partial", rows[0])
+        self.assertNotIn("partial", self.st.read(memmon.SNAPSHOT))
 
     def test_trim_still_trims(self):
         with open(memmon.HISTORY, "w") as fh:

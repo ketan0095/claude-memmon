@@ -1979,13 +1979,19 @@ def _s2_fields(p: dict, rec: dict, vm: dict) -> dict:
 
 def _append_row(row: dict, reading: dict | None = None) -> None:
     import memmon_owners
+    import signal
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(HISTORY, "a") as fh:
-        fh.write(json.dumps(row) + "\n")
-    if reading is not None:
-        # From here a budget expiry only re-publishes this row; it never
-        # appends a partial one after it.
-        reading["row"] = row
+    # The append and the flag are one step as far as the budget goes: SIGALRM
+    # is held until both are done, so an expiry either precedes the row (and a
+    # partial row follows) or only re-publishes it, never both.
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        with open(HISTORY, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        if reading is not None:
+            reading["row"] = row
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
     memmon_owners.write_json_atomic(SNAPSHOT, row)
 
 
