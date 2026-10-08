@@ -437,11 +437,13 @@ class Engine:
         def release(snap, rows) -> list:
             """Held wrappers that can no longer reach a running child: safe
             to stop now. A held row is re-read each pass, so a wrapper held
-            in its starting window follows its child once it is recorded."""
+            in its starting window follows its child once it is recorded. A
+            row that disappears keeps its last value, so the hold still
+            follows that child rather than failing open."""
             out = []
             for w, (ws, _) in list(held.items()):
-                row = rows.get(w)
-                held[w] = ever_held[w] = (ws, row or held[w][1])
+                row = rows.get(w) or held[w][1]
+                held[w] = ever_held[w] = (ws, row)
                 note_child(snap, w, row)
                 if not self._holds(snap, w, row) and _same(snap.procs.get(w), ws):
                     captured[w] = held.pop(w)[0]

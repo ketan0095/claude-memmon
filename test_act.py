@@ -408,6 +408,21 @@ class FakeActTests(unittest.TestCase):
         runner = next(r for r in out["remaining"] if r["pid"] == 30)
         self.assertEqual((runner["role"], runner["signalled"]), ("runner", False))
 
+    def test_wrapper_stays_held_when_its_lease_row_disappears(self):
+        # A re-read that misses the row must not release the wrapper while
+        # its child still runs.
+        lease = self.runner_fixture()
+        rows = [lease]
+        self.eng.leases_fn = lambda: list(rows)
+
+        def drop(pid, sig):
+            if pid == 31:
+                rows.clear()
+        self.src.on_kill = drop
+        _, signalled = self.end_session()
+        self.assertIn(31, signalled)
+        self.assertFalse(signalled & {30, 45}, signalled)
+
     def test_wrapper_held_for_a_one_second_child_start(self):
         # A runner whose memmon read ps starts records (sec, 0).
         self.runner_fixture(child_start=[T0 + 31, 0])
