@@ -317,26 +317,37 @@ class Engine:
             return {}
         return self.root_rule_fn(inv, list(dict.fromkeys(pids)))
 
-    def _lease_children(self, captured: dict) -> dict:
-        """Captured `memmon run` wrappers -> (child pid, child start, child
-        pgid or None). On SIGTERM a wrapper signals its child's whole process
-        group, which can hold processes nobody captured, so a wrapper is never
-        signalled while its child runs: the child is stopped per PID instead,
-        and the wrapper then exits on its own."""
-        out = {}
-        for row in (self.leases_fn() if self.leases_fn else None) or []:
-            w, c = row.get("wrapper_pid"), row.get("child_pid")
-            if w in captured and c:
-                out[w] = (c, list(row.get("child_start") or []), None)
-        return out
+    def _lease_rows(self) -> dict:
+        """wrapper pid -> its live `memmon run` lease row."""
+        rows = (self.leases_fn() if self.leases_fn else None) or []
+        return {r["wrapper_pid"]: r for r in rows if r.get("wrapper_pid")}
 
-    def _child_running(self, inv, child: tuple) -> bool:
-        """The lease child still holds its PID. An unreadable start counts as
-        running: a wrapper is released only once its child is provably gone."""
-        cp = inv.procs.get(child[0])
+    def _holds(self, snap, w: int, row) -> bool:
+        """True while SIGTERM to wrapper `w` could reach a child that runs.
+        On SIGTERM a wrapper signals its child's whole process group, which
+        can hold processes nobody captured, so a wrapper is never signalled
+        while its child runs: the child is stopped per PID instead, and the
+        wrapper then exits on its own.
+
+        Fail closed. A child counts as running while its PID is live unless
+        its start provably differs: an unreadable start, a row without one
+        (older runners never wrote it) or a one-second start from ps (usec 0)
+        all count as running. Before the child is recorded (the starting
+        window) the wrapper is held while it has any live descendant. Not for
+        the stop-managed-job lease check, which stays exact."""
+        if row is None:
+            return False                    # the wrapper is finishing
+        c = row.get("child_pid")
+        if not c:
+            return row.get("state") != "waiting" and any(
+                not snap.procs[d].zombie for d in snap.descendants(w))
+        cp = snap.procs.get(c)
         if cp is None or cp.zombie:
             return False
-        return cp.start is None or _same(cp, child[1])
+        want = list(row.get("child_start") or [])
+        if not want or cp.start is None or list(cp.start) == want:
+            return True
+        return len(want) == 2 and want[1] == 0 and cp.start[0] == want[0]
 
     def _plan(self, inv, part, targets: list, mine: set) -> tuple:
         """What a stop of `targets` captures, from one snapshot: the members
@@ -357,13 +368,12 @@ class Engine:
             for r in inv.descendants(t):
                 if r in stop and r in part.root_owner:
                     kept.setdefault(part.root_owner[r], (r, inv.procs[r].start))
-        held: dict = {}                     # wrapper -> (start, child)
-        lease_pgids: set = set()
-        for w, child in self._lease_children(captured).items():
-            if self._child_running(inv, child):
-                held[w] = (captured.pop(w), child)
-                lease_pgids.add(inv.procs[child[0]].pgid)
-        return stop, captured, depth, kept, held, lease_pgids
+        held: dict = {}                     # wrapper -> (start, lease row)
+        rows = self._lease_rows()
+        for w in [w for w in captured if w in rows]:
+            if self._holds(inv, w, rows[w]):
+                held[w] = (captured.pop(w), rows[w])
+        return stop, captured, depth, kept, held, rows
 
     def _graceful(self, inv, part, targets: list, owner_id, origin: str,
                   body: dict | None, mine: set, owner_root=None, selected=()) -> dict:
@@ -374,19 +384,31 @@ class Engine:
         while its identity is unchanged, and a process that turns out to be
         another owner's root (found by the root rules, applied only to newly
         seen PIDs) is kept with its subtree."""
-        stop, captured, depth, kept, held, lease_pgids = self._plan(inv, part, targets, mine)
+        stop, captured, depth, kept, held, rows = self._plan(inv, part, targets, mine)
         excluded: set = set()               # never signalled, never walked
+        ever_held: dict = dict(held)        # every wrapper held at some point
+        child_pgid: dict = {}               # wrapper -> its child's pgid
+
+        def note_child(snap, w, row):
+            cp = snap.procs.get((row or {}).get("child_pid"))
+            if cp is not None:
+                child_pgid[w] = (cp.pid, cp.pgid)
+        for w, (_, row) in held.items():
+            note_child(inv, w, row)
         pgids = {inv.procs[t].pgid for t in targets}
         if self.after_capture:
             self.after_capture(list(captured))
         used_before = self._used()
         self._first_term = self.mono()
+        first_sent = len(self.sent)
         for pid in sorted(captured, key=lambda q: -depth[q]):
             self._signal(pid, captured[pid], signal.SIGTERM)
 
-        def discover(snap, parents) -> list:
+        def discover(snap, parents, rows) -> list:
             """Uncaptured descendants of `parents` that are not another
-            owner's root; such roots and their subtrees join `excluded`."""
+            owner's root; such roots and their subtrees join `excluded`. A
+            wrapper among them whose child runs is held, never signalled; its
+            child stays a candidate and is stopped per PID."""
             cand = []
             for a in parents:
                 if not _same(snap.procs.get(a), captured[a]):
@@ -401,15 +423,30 @@ class Engine:
                 kept.setdefault(oid, (r, snap.procs[r].start))
                 excluded.add(r)
                 excluded.update(snap.descendants(r))
-            return [d for d in dict.fromkeys(cand) if d not in excluded]
+            out = []
+            for d in dict.fromkeys(cand):
+                if d in excluded:
+                    continue
+                if d in rows and self._holds(snap, d, rows[d]):
+                    held[d] = ever_held[d] = (snap.procs[d].start, rows[d])
+                    note_child(snap, d, rows[d])
+                    continue
+                out.append(d)
+            return out
 
-        def release(snap) -> list:
-            """Held wrappers whose child is gone: safe to stop now."""
-            out = [w for w, (ws, child) in held.items()
-                   if not self._child_running(snap, child) and _same(snap.procs.get(w), ws)]
-            for w in out:
-                captured[w] = held.pop(w)[0]
-                depth[w] = 0
+        def release(snap, rows) -> list:
+            """Held wrappers that can no longer reach a running child: safe
+            to stop now. A held row is re-read each pass, so a wrapper held
+            in its starting window follows its child once it is recorded."""
+            out = []
+            for w, (ws, _) in list(held.items()):
+                row = rows.get(w)
+                held[w] = ever_held[w] = (ws, row or held[w][1])
+                note_child(snap, w, row)
+                if not self._holds(snap, w, row) and _same(snap.procs.get(w), ws):
+                    captured[w] = held.pop(w)[0]
+                    depth[w] = 0
+                    out.append(w)
             return out
 
         deadline = self.mono() + self.grace_s
@@ -418,7 +455,8 @@ class Engine:
             fresh = []
             if alive or held:
                 now_inv = memmon_procs.snapshot(self.source, clock=self.clock)
-                fresh = discover(now_inv, alive) + release(now_inv)
+                rows = self._lease_rows()
+                fresh = discover(now_inv, alive, rows) + release(now_inv, rows)
                 for d in fresh:
                     captured.setdefault(d, now_inv.procs[d].start)
                     self._signal(d, captured[d], signal.SIGTERM)
@@ -431,14 +469,25 @@ class Engine:
         final = memmon_procs.snapshot(self.source, clock=self.clock)
         survivors = [p for p in captured if _same(final.procs.get(p), captured[p])]
         remaining = {p: final.procs[p] for p in survivors}
-        for d in discover(final, survivors):
+        for d in discover(final, survivors, self._lease_rows()):
             remaining.setdefault(d, final.procs[d])
-        # A wrapper still held is reported, never signalled, when it is a
-        # target or its child was part of this stop; one guarding a child
-        # that is another owner stays with that owner.
-        for w, (ws, child) in held.items():
-            if _same(final.procs.get(w), ws) and (w in targets or child[0] in captured):
+        mine_owner = {owner_id, None} | ({part.owner_of.get(t) for t in targets})
+        # A wrapper still held is reported as a runner, never signalled, when
+        # it is a target or belongs to this stop's own owner; one guarding a
+        # child that is a kept owner stays with that owner.
+        kept_roots = {pid for pid, _ in kept.values()}
+        runners = {}
+        for w, (ws, row) in held.items():
+            child = (row or {}).get("child_pid")
+            if (_same(final.procs.get(w), ws) and child not in kept_roots
+                    and (w in targets or part.owner_of.get(w) in mine_owner)):
                 remaining.setdefault(w, final.procs[w])
+                cp = child_pgid.get(w, (None,))[0]
+                runners[w] = {"pid": w, "start": list(ws),
+                              "child": {"pid": cp, "start": list(captured.get(cp) or [])}}
+        # A lease child's group is swept only when the child was part of this
+        # stop.
+        lease_pgids = {pg for w, (c, pg) in child_pgid.items() if c in captured}
         # The sweep reports, never signals. It skips only what this action
         # deliberately leaves alone: kept owners, guarding wrappers and the
         # targets' own ancestors. Anything else still in the group is a known
@@ -449,10 +498,9 @@ class Engine:
             while a in inv.procs and a not in ancestors:
                 ancestors.add(a)
                 a = inv.procs[a].ppid
-        mine_owner = {owner_id, None} | ({part.owner_of.get(t) for t in targets})
         for pid, p in final.procs.items():
             if (not _same(p, captured.get(pid, ())) and pid not in mine
-                    and pid not in ancestors and pid not in excluded and pid not in held
+                    and pid not in ancestors and pid not in excluded and pid not in ever_held
                     and not p.zombie and p.visible and part.owner_of.get(pid) not in kept):
                 oid = part.owner_of.get(pid)
                 # A lease child's own group is swept only for this stop's own
@@ -463,9 +511,14 @@ class Engine:
 
         forceable = set(survivors)
         exited = sum(1 for p in captured if p not in forceable)
+        delivered = {pid for pid, sig in self.sent[first_sent:] if sig == signal.SIGTERM}
         rows = [{"pid": p.pid, "start": list(p.start), "forceable": p.pid in forceable,
-                 "signalled": p.pid in forceable, "argv0": os.path.basename((final.argv(p.pid) or [p.comm])[0] or p.comm)}
+                 "role": ("survivor" if p.pid in forceable else
+                          "runner" if p.pid in runners else "observed"),
+                 "signalled": p.pid in delivered,
+                 "argv0": os.path.basename((final.argv(p.pid) or [p.comm])[0] or p.comm)}
                 for p in sorted(remaining.values(), key=lambda q: q.pid)]
+        observed = [r for r in rows if r["role"] == "observed"]
         alive_kept = sorted(oid for oid, (pid, start) in kept.items()
                             if _same(final.procs.get(pid), start))
         out = outcome("stopped" if not rows else "partial",
@@ -475,7 +528,7 @@ class Engine:
                       measured_at=self.clock())
         out["captured"] = len(captured)
         out["forceable"] = len(forceable)
-        out["observed"] = len(rows) - len(forceable)
+        out["observed"] = len(observed)
         if survivors:
             out["force_token"] = memmon_owners.mint_token({
                 "v": 1, "action": "force", "origin": origin, "owner_id": owner_id,
@@ -483,8 +536,12 @@ class Engine:
                 "survivors": [{"pid": p, "start": list(captured[p]),
                                "selected": p in selected} for p in survivors],
                 "observed": [{"pid": r["pid"], "start": r["start"]}
-                             for r in rows if not r["forceable"]][:OBSERVED_CAP],
-                "observed_total": len(rows) - len(forceable),
+                             for r in observed[:OBSERVED_CAP]],
+                "observed_total": len(observed),
+                # The groups the unlisted ones were in, to re-count them.
+                "observed_pgids": sorted({final.procs[r["pid"]].pgid
+                                          for r in observed[OBSERVED_CAP:]}),
+                "runners": list(runners.values()),
                 "snapshot_ts": round(self.clock(), 3)})
         return out
 
@@ -510,12 +567,12 @@ class Engine:
         own_root = (body.get("owner_root") or {}).get("pid")
         roots = self._fresh_roots(inv, [s.get("pid") for s in survivors])
         part = self.partition_fn(inv) if body.get("origin") == "reap" else None
-        live, skipped = [], []
+        live, skipped, why = [], [], {}
         for s in survivors:
             pid, start = s.get("pid"), s.get("start") or []
             p = inv.procs.get(pid)
             if not _same(p, start):
-                continue
+                continue                    # already gone: "had already exited"
             protected = (pid == 1 or pid in mine or not p.visible or p.uid != os.getuid()
                          or (pid in roots and pid != own_root))
             if part is not None:
@@ -524,43 +581,71 @@ class Engine:
                 if s.get("selected"):
                     protected = (protected or still_selected is None
                                  or not still_selected(inv, pid))
-            if protected or not self._signal(pid, start, signal.SIGKILL):
-                skipped.append((pid, start))
+            if protected:
+                why[pid] = "protected"
+            elif not self._signal(pid, start, signal.SIGKILL):
+                why[pid] = "signal_failed"
+            else:
+                live.append((pid, start))
                 continue
-            live.append((pid, start))
+            skipped.append((pid, start))
         sent = list(live)
+        # A held `memmon run` wrapper exits once force kills its child; wait
+        # for it too, so it is not reported as still running.
+        killed_ids = {(p, tuple(s)) for p, s in sent}
+        tokens_runners = body.get("runners") or []
+        runners = [(r.get("pid"), r.get("start") or []) for r in tokens_runners]
+        waiting = [(r.get("pid"), r.get("start") or []) for r in tokens_runners
+                   if ((r.get("child") or {}).get("pid"),
+                       tuple((r.get("child") or {}).get("start") or [])) in killed_ids]
         deadline = self.mono() + self.force_wait_s
-        while live and self.mono() < deadline:
+        while (live or waiting) and self.mono() < deadline:
             live = [(p, s) for p, s in live if self._alive(p, s)]
-            if live:
+            waiting = [(p, s) for p, s in waiting if self._alive(p, s)]
+            if live or waiting:
                 self.sleep(self.poll_s)
         final = memmon_procs.snapshot(self.source, clock=self.clock)
         alive = lambda p, s: _same(final.procs.get(p), s)
         listed = body.get("observed") or []
         observed = [(o.get("pid"), o.get("start") or []) for o in listed
                     if alive(o.get("pid"), o.get("start") or [])]
-        # The token lists at most OBSERVED_CAP observed processes; the rest are
-        # unknown to force and assumed still running.
-        unlisted = max(0, int(body.get("observed_total") or len(listed)) - len(listed))
+        name = lambda p: os.path.basename((final.argv(p) or [""])[0])
         rows = ([{"pid": p, "start": list(s), "forceable": False, "role": "survivor",
-                  "signalled": (p, s) in sent,
-                  "argv0": os.path.basename((final.argv(p) or [""])[0])}
+                  "signalled": (p, s) in sent, "skip_reason": why.get(p), "argv0": name(p)}
                  for p, s in live + skipped if alive(p, s)]
                 + [{"pid": p, "start": list(s), "forceable": False, "role": "observed",
-                    "signalled": False, "argv0": os.path.basename((final.argv(p) or [""])[0])}
-                   for p, s in observed])
+                    "signalled": False, "argv0": name(p)} for p, s in observed]
+                + [{"pid": p, "start": list(s), "forceable": False, "role": "runner",
+                    "signalled": False, "argv0": name(p)} for p, s in runners if alive(p, s)])
+        unlisted = self._unlisted(final, body, mine, rows)
         reason = None
         if any(r["role"] == "survivor" for r in rows):
             reason = "survivors"
-        elif observed or unlisted:
+        elif rows or unlisted:
             reason = "outside_force"
-        gone = sum(1 for s in survivors if not alive(s.get("pid"), s.get("start") or []))
+        gone = lambda items: sum(1 for p, s in items if not alive(p, s))
         return outcome("force_stopped" if reason is None else "partial", reason,
-                       exited=gone, killed=sum(1 for p, s in sent if not alive(p, s)),
+                       exited=gone([(s.get("pid"), s.get("start") or []) for s in survivors]),
+                       killed=gone(sent), exited_unsignalled=gone(skipped),
                        remaining=rows, named=len(survivors), forceable=0,
                        observed=len(observed), observed_unlisted=unlisted,
                        used_bytes_before=used_before, used_bytes_after=self._used(),
                        measured_at=self.clock())
+
+    def _unlisted(self, final, body: dict, mine: set, rows: list) -> int:
+        """Observed processes the token could not list, re-counted: live
+        members of the groups they were seen in, never more than there were."""
+        listed = body.get("observed") or []
+        total = max(0, int(body.get("observed_total") or len(listed)) - len(listed))
+        if not total:
+            return 0
+        named = ({o.get("pid") for o in listed} | {r["pid"] for r in rows}
+                 | {s.get("pid") for s in body.get("survivors") or []})
+        groups = set(body.get("observed_pgids") or [])
+        live = sum(1 for pid, p in final.procs.items()
+                   if p.pgid in groups and pid not in named and pid not in mine
+                   and p.visible and not p.zombie and p.uid == os.getuid())
+        return min(total, live)
 
     def force(self, token: str, origin: str | None = None, still_selected=None) -> dict:
         """The explicit second step. Signals only the identities the token
@@ -620,13 +705,13 @@ class Engine:
         tset = set(chosen)
         top = [t for t in chosen if not _has_ancestor_in(inv, t, tset)]
         if dry_run:
-            _, captured, _, kept, _, _ = self._plan(inv, part, top, mine)
+            _, captured, _, kept, held, _ = self._plan(inv, part, top, mine)
             out = outcome("would_stop", None, refused=refused,
                           kept=sorted(kept), measured_at=self.clock())
-            out["would_signal"] = [{"pid": d, "start": list(inv.procs[d].start),
-                                    "argv0": os.path.basename(
-                                        (inv.argv(d) or [inv.procs[d].comm])[0])}
-                                   for d in sorted(captured)]
+            row = lambda d: {"pid": d, "start": list(inv.procs[d].start),
+                             "argv0": os.path.basename((inv.argv(d) or [inv.procs[d].comm])[0])}
+            out["would_signal"] = [row(d) for d in sorted(captured)]
+            out["would_hold"] = [row(d) for d in sorted(held)]   # stopped once their job ends
             return out
         out = self._graceful(inv, part, top, None, "reap", None, mine, selected=tset)
         if out.get("force_token") and selector:
@@ -641,14 +726,15 @@ class Engine:
         """Check every instance a quit-app token names. The answer carries a
         fresh token for the next check (after the quit, or before a force
         quit). On such a re-check an instance whose PID now holds another
-        process is reported exited: the one that was named is gone."""
+        process is reported exited: the one that was named is gone. If the
+        PID's start cannot be read, it is "unverified"."""
         recheck = bool(body.get("checked"))
         inv = memmon_procs.snapshot(self.source, clock=self.clock)
         mine = self._self_tree()
         part = self.partition_fn(inv)
         hosting = {p for o in part.owners.values() if o.kind in memmon_owners.HOSTED_KINDS
                    for p in _ancestors(inv, o.root)}
-        rows, running = [], 0
+        rows, running, unverified = [], 0, 0
         for inst in body.get("instances") or []:
             p = inv.procs.get(inst.get("pid"))
             if p is None or p.zombie:
@@ -656,7 +742,10 @@ class Engine:
                 continue
             if p.start is None or list(p.start) != list(inst.get("start") or []):
                 if recheck:
-                    rows.append({**inst, "status": "exited"})
+                    # Readable and different: the named instance is gone. An
+                    # unreadable start proves nothing either way.
+                    unverified += p.start is None
+                    rows.append({**inst, "status": "unverified" if p.start is None else "exited"})
                     continue
                 raise Refused("instance_changed")
             if p.pid in mine or not p.visible or p.uid != os.getuid():
@@ -677,7 +766,7 @@ class Engine:
             "v": 1, "action": "quit-app", "owner_id": body.get("owner_id"),
             "bundle_id": body.get("bundle_id"), "instances": body.get("instances") or [],
             "checked": True, "snapshot_ts": round(now, 3)})
-        if not running:
+        if not running and not unverified:
             return outcome("already_exited", None, instances=rows, token=token,
                            measured_at=now)
         return outcome("verified", None, instances=rows, token=token,

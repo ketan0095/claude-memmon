@@ -1879,12 +1879,17 @@ def _stop_report(out: dict, what: str) -> str:
     if r == "would_stop":
         L = [f"{what}: would send SIGTERM to {len(out['would_signal'])} process(es):"]
         L += [f"  {row['pid']:>7}  {row['argv0']}" for row in out["would_signal"]]
+        L += [f"  {row['pid']:>7}  {row['argv0']}  (memmon run wrapper: would stop once its "
+              "job ends)" for row in out.get("would_hold") or []]
         L += [f"would keep running: {row}" for row in out.get("kept") or []]
         out = {**out, "kept": []}
     elif "named" in out:                     # a force result
         gone, killed = out.get("exited", 0), out.get("killed", 0)
+        alone = out.get("exited_unsignalled", 0)
         L = [f"{what}: {r} — {gone} of {out['named']} named survivor(s) gone: "
-             f"{killed} killed by SIGKILL, {gone - killed} had already exited"]
+             f"{killed} killed by SIGKILL, {gone - killed - alone} had already exited"]
+        if alone:
+            L.append(f"{alone} ended on their own while protected")
     elif out.get("reason") == "root_exited":
         L = [f"{what}: the job had already exited, but processes it started are "
              "still running in its group (nothing was signalled)"]
@@ -1904,12 +1909,19 @@ def _stop_report(out: dict, what: str) -> str:
         L.append(f"{len(out['remaining'])} still running:")
         for row in out["remaining"]:
             note = ""
-            if not row.get("signalled", row.get("forceable")):
-                note = ("  (not force-killed: no longer safe to)" if row.get("role") == "survivor"
+            if row.get("role") == "runner":
+                note = "  (memmon run wrapper, never signalled: it exits once its job ends)"
+            elif row.get("skip_reason") == "signal_failed":
+                note = "  (SIGKILL could not be delivered)"
+            elif row.get("skip_reason") == "protected":
+                note = "  (not force-killed: it is protected now)"
+            elif not row.get("signalled", row.get("forceable")):
+                note = ("  (signalled, but the signal was not delivered)" if row.get("forceable")
                         else "  (observed, never signalled)")
             L.append(f"  {row['pid']:>7}  {row['argv0']}{note}")
     if out.get("observed_unlisted"):
-        L.append(f"{out['observed_unlisted']} more still running that memmon could not list")
+        L.append(f"{out['observed_unlisted']} more still running that memmon could not list "
+                 "(re-counted in the groups they were seen in)")
     if out.get("watch_error"):
         L.append(f"the respawn watch stopped early ({out['watch_error']}); a daemon "
                  "restart after this point would not be reported")

@@ -247,6 +247,58 @@ class FakeActTests(unittest.TestCase):
         self.assertIn("1 killed by SIGKILL, 1 had already exited", text)
         self.assertNotIn("never signalled", text)
 
+    def test_protected_survivor_that_ends_on_its_own_is_not_already_exited(self):
+        # One survivor is killed; another became a session (protected) and
+        # ends on its own while force waits. It was neither killed nor gone
+        # before force ran.
+        self.src.ignore_term = {21, 22}
+        out = self.run_act("stop-job", self.job_token())
+        start = self.src.table[22].start
+        self.src.table[22] = P(22, ppid=1, pgid=22, start=start)
+        session_file(self.sessions, 22, start[0], job_id="0000dddd")
+        real_kill = self.src.kill
+
+        def kill(pid, sig):
+            real_kill(pid, sig)
+            if pid == 21 and sig == signal.SIGKILL:
+                self.src.table.pop(22, None)
+        self.eng.kill = kill
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual((forced["result"], forced["exited"], forced["killed"],
+                          forced["exited_unsignalled"]), ("force_stopped", 2, 1, 1))
+        self.assertNotIn((22, signal.SIGKILL), self.src.signals)
+        text = memmon._stop_report(forced, "force")
+        self.assertIn("1 killed by SIGKILL, 0 had already exited", text)
+        self.assertIn("1 ended on their own while protected", text)
+
+    def test_force_row_says_why_a_survivor_was_not_killed(self):
+        self.src.ignore_term = {21, 22}
+        out = self.run_act("stop-job", self.job_token())
+        real_kill = self.src.kill
+
+        def kill(pid, sig):
+            if pid == 22 and sig == signal.SIGKILL:
+                raise PermissionError
+            real_kill(pid, sig)
+        self.eng.kill = kill
+        forced = self.run_act("force", out["force_token"])
+        rows = {r["pid"]: r for r in forced["remaining"]}
+        self.assertEqual((rows[22]["skip_reason"], rows[22]["signalled"]), ("signal_failed", False))
+        self.assertIn("22  proc  (SIGKILL could not be delivered)",
+                      memmon._stop_report(forced, "force"))
+
+    def test_graceful_signalled_is_what_was_delivered(self):
+        real_kill = self.src.kill
+
+        def kill(pid, sig):
+            if pid == 22:
+                raise PermissionError
+            real_kill(pid, sig)
+        self.eng.kill = kill
+        out = self.run_act("stop-job", self.job_token())
+        row = next(r for r in out["remaining"] if r["pid"] == 22)
+        self.assertEqual((row["forceable"], row["signalled"]), (True, False))
+
     def test_observed_beyond_the_token_cap_keep_force_partial(self):
         # 70 observed processes; the token lists 64. Even with all 64 gone,
         # force cannot vouch for the other 6.
@@ -264,6 +316,10 @@ class FakeActTests(unittest.TestCase):
         self.assertEqual((forced["observed"], forced["observed_unlisted"]), (0, 6))
         self.assertIn("6 more still running that memmon could not list",
                       memmon._stop_report(forced, "force"))
+        for pid in range(100, 170):
+            self.src.table.pop(pid, None)
+        again = self.run_act("force", out["force_token"])
+        self.assertEqual((again["result"], again["observed_unlisted"]), ("force_stopped", 0))
 
     def test_reused_parent_is_not_walked(self):
         # A captured parent whose PID now belongs to another process is not
@@ -324,6 +380,116 @@ class FakeActTests(unittest.TestCase):
         self.eng.leases_fn = lambda: [row]
         return row
 
+    def runner_fixture(self, **row):
+        """Wrapper 30 under the session's tool shell, its TERM-ignoring child
+        31 leading its own group, and a disowned session 45 in that group."""
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31, start=(T0 + 31, 31))
+        self.src.table[45] = P(45, ppid=1, pgid=31, start=(T0 + 45, 0))
+        session_file(self.sessions, 45, T0 + 45, job_id="0000cccc")
+        self.src.ignore_term = {31}
+        lease = {"id": "run1", "state": "running", "wrapper_pid": 30, "child_pid": 31,
+                 "child_start": [T0 + 31, 31], **row}
+        if lease.get("child_start") is None:
+            lease.pop("child_start")
+        self.eng.leases_fn = lambda: [lease]
+        return lease
+
+    def end_session(self):
+        out = self.run_act("end-session", tok("end-session", self.root, self.root))
+        return out, {p for p, _ in self.src.signals}
+
+    def test_wrapper_held_for_a_lease_row_without_child_start(self):
+        # Runners before this version never wrote child_start.
+        self.runner_fixture(child_start=None)
+        out, signalled = self.end_session()
+        self.assertFalse(signalled & {30, 45}, signalled)
+        self.assertIn(31, signalled)
+        runner = next(r for r in out["remaining"] if r["pid"] == 30)
+        self.assertEqual((runner["role"], runner["signalled"]), ("runner", False))
+
+    def test_wrapper_held_for_a_one_second_child_start(self):
+        # A runner whose memmon read ps starts records (sec, 0).
+        self.runner_fixture(child_start=[T0 + 31, 0])
+        _, signalled = self.end_session()
+        self.assertFalse(signalled & {30, 45}, signalled)
+
+    def test_wrapper_held_in_its_starting_window(self):
+        # The lease row does not name the child yet; the wrapper is held
+        # while it has a live descendant.
+        self.runner_fixture(state="starting", child_pid=None, child_start=None)
+        _, signalled = self.end_session()
+        self.assertFalse(signalled & {30, 45}, signalled)
+        self.assertIn(31, signalled)
+
+    def test_starting_window_hold_releases_once_the_wrapper_has_no_child(self):
+        self.runner_fixture(state="starting", child_pid=None, child_start=None)
+        self.src.ignore_term = set()
+        self.end_session()
+        order = [p for p, _ in self.src.signals]
+        self.assertLess(order.index(31), order.index(30))
+        self.assertNotIn(45, order)
+
+    def test_wrapper_born_during_grace_is_held(self):
+        # The job starts a `memmon run` after the first SIGTERM.
+        self.src.ignore_term = {21}
+        lease = {"id": "run1", "state": "running", "wrapper_pid": 30, "child_pid": 31,
+                 "child_start": [T0 + 31, 31]}
+        rows = []
+        self.eng.leases_fn = lambda: list(rows)
+
+        def spawn(pid, sig):
+            if pid == 22 and 30 not in self.src.table:
+                self.src.table[30] = P(30, ppid=21, pgid=20, comm="python3")
+                self.src.table[31] = P(31, ppid=30, pgid=31, start=(T0 + 31, 31))
+                self.src.table[45] = P(45, ppid=1, pgid=31, start=(T0 + 45, 0))
+                session_file(self.sessions, 45, T0 + 45, job_id="0000cccc")
+                self.src.ignore_term = {21, 31}
+                rows.append(lease)
+        self.src.on_kill = spawn
+        out = self.run_act("stop-job", self.job_token())
+        signalled = {p for p, _ in self.src.signals}
+        self.assertFalse(signalled & {30, 45}, signalled)
+        self.assertIn(31, signalled)
+        self.assertIn(30, [r["pid"] for r in out["remaining"] if r["role"] == "runner"])
+
+    def test_stop_managed_job_lease_check_stays_exact(self):
+        # The lenient hold rule never loosens the lease identity check.
+        self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
+        self.src.table[31] = P(31, ppid=30, pgid=31, start=(T0 + 31, 31))
+        self.eng.leases_fn = lambda: [{"id": "run1", "wrapper_pid": 30, "child_pid": 31,
+                                       "child_start": [T0 + 31, 0]}]
+        out = self.run_act("stop-managed-job", tok("stop-managed-job", self.root,
+                                                   self.src.table[31], run_id="run1"))
+        self.assertEqual((out["result"], out["reason"]), ("refused", "lease_mismatch"))
+        self.assertEqual(self.src.signals, [])
+
+    def test_force_waits_for_the_runner_of_a_killed_child(self):
+        # SIGKILL of the TERM-ignoring child lets its wrapper exit, and then
+        # the result is force_stopped, not a runner left outside force.
+        self.runner_fixture()
+        self.src.table.pop(45)
+        out, _ = self.end_session()
+        self.assertEqual(out["result"], "partial", out)
+        body = mo.decode_token(out["force_token"])
+        self.assertEqual(body["runners"], [{"pid": 30, "start": list(self.src.table[30].start),
+                                            "child": {"pid": 31, "start": [T0 + 31, 31]}}])
+        self.assertEqual(body["observed_total"], 0)
+        # The runner notices its child died a poll later, then exits.
+        self.eng.sleep = lambda s: (31 not in self.src.table) and self.src.table.pop(30, None)
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual(forced["result"], "force_stopped", forced)
+        self.assertNotIn((30, signal.SIGKILL), self.src.signals)
+
+    def test_a_runner_that_outlives_force_stays_outside_force(self):
+        self.runner_fixture()
+        self.src.table.pop(45)
+        out, _ = self.end_session()
+        forced = self.run_act("force", out["force_token"])
+        self.assertEqual((forced["result"], forced["reason"]), ("partial", "outside_force"))
+        self.assertEqual([(r["pid"], r["role"]) for r in forced["remaining"]], [(30, "runner")])
+        self.assertNotIn(30, [p for p, _ in self.src.signals])
+
     def test_runner_wrapper_guarding_a_kept_owner_is_not_signalled(self):
         # A `memmon run` wrapper killpg()s its child's group on SIGTERM;
         # that group holds a nested session, so the wrapper is signalled only
@@ -364,11 +530,18 @@ class FakeActTests(unittest.TestCase):
         self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
         self.src.table[31] = P(31, ppid=30, pgid=31, start=(T0 + 31, 0))
         session_file(self.sessions, 31, T0 + 31, job_id="0000bbbb")
+        self.src.table[32] = P(32, ppid=31, pgid=31)      # the kept session's own work
         self.lease()
+
+        def born(pid, sig):                               # and more of it, mid-stop
+            self.src.table.setdefault(33, P(33, ppid=31, pgid=31, start=(T0 + 33, 3)))
+        self.src.on_kill = born
         out = self.run_act("end-session", tok("end-session", self.root, self.root))
         signalled = {p for p, _ in self.src.signals}
-        self.assertFalse(signalled & {30, 31})
+        self.assertFalse(signalled & {30, 31, 32, 33})
         self.assertEqual(out["kept"], ["claude:0000bbbb"])
+        # Its group is not this stop's, so nothing in it is a survivor.
+        self.assertEqual((out["result"], out["remaining"]), ("stopped", []))
 
     def test_unreadable_lease_child_holds_its_wrapper(self):
         self.src.table[30] = P(30, ppid=20, pgid=20, comm="python3")
@@ -380,6 +553,9 @@ class FakeActTests(unittest.TestCase):
         out = self.run_act("end-session", tok("end-session", self.root, self.root))
         self.assertNotEqual(out["result"], "error", out)
         self.assertNotIn(30, {p for p, _ in self.src.signals})
+        # The wrapper is still alive and this stop's own: it is reported.
+        self.assertEqual(out["result"], "partial", out)
+        self.assertEqual([(r["pid"], r["role"]) for r in out["remaining"]], [(30, "runner")])
 
     def test_kept_owner_that_exited_is_not_reported_kept(self):
         self.src.table[30] = P(30, ppid=21, pgid=30, start=(T0 + 30, 0))
@@ -555,6 +731,21 @@ class FakeActTests(unittest.TestCase):
         text, out = memmon.reap_report(snap, True, engine=self.eng)
         self.assertEqual(out["refused"], [{"pid": 80, "reason": "target_changed"}], text)
         self.assertEqual(self.src.signals, [])
+
+    def test_reap_dry_run_lists_held_wrappers(self):
+        self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
+        self.src._argv[80] = ["node", "/r/node_modules/.bin/vitest"]
+        self.src.table[83] = P(83, ppid=80, comm="python3")
+        self.src.table[84] = P(84, ppid=83, pgid=84)
+        self.eng.leases_fn = lambda: [{"id": "r", "state": "running", "wrapper_pid": 83,
+                                       "child_pid": 84,
+                                       "child_start": list(self.src.table[84].start)}]
+        snap = {"orphans": [{"pid": 80, "mem": MB, "age": 7200, "orphaned": True,
+                             "tag": "vitest", "worktree": ""}], "orphan_total": MB}
+        text, out = memmon.reap_report(snap, False, engine=self.eng)
+        self.assertEqual([r["pid"] for r in out["would_signal"]], [80, 84])
+        self.assertEqual([r["pid"] for r in out["would_hold"]], [83])
+        self.assertIn("(memmon run wrapper: would stop once its job ends)", text)
 
     def test_reap_refuses_a_listed_pid_reused_since(self):
         self.src.table[80] = P(80, start=(T0 - 7200, 0), comm="node")
@@ -904,6 +1095,17 @@ class VerifyAppTests(unittest.TestCase):
         self.src.table[70].start = None
         self.assertEqual(self.eng.run("verify-app", token)["reason"], "instance_changed")
 
+    def test_recheck_of_an_unreadable_instance_is_unverified(self):
+        # After the quit the PID is held by something memmon cannot read:
+        # that is not proof the named instance exited.
+        first = self.eng.run("verify-app", self.token())
+        self.src.table.pop(60)
+        self.src.table[70] = P(70, visible=False, uid=0)
+        self.src.table[70].start = None
+        again = self.eng.run("verify-app", first["token"])
+        self.assertEqual([i["status"] for i in again["instances"]], ["exited", "unverified"])
+        self.assertEqual(again["result"], "verified")
+
     def test_verify_app_refuses_a_helper_as_an_instance(self):
         helper = os.path.join(self.state.root, "Applications", "Brave Browser.app",
                               "Contents", "Frameworks", "Brave Helper.app", "Contents",
@@ -958,7 +1160,11 @@ class PolicyTests(unittest.TestCase):
 SIGNAL_SITE = re.compile(
     r"\bos\.kill\s*\(|\bkillpg\s*\(|\bself\.kill\s*\(|\.kill\s*\(|\.terminate\s*\("
     r"|\bsend_signal\s*\(|\bpthread_kill\s*\(|(?<![\"'])\b(?:pkill|killall)\b(?![\"'])"
-    r"|\[\s*[\"']kill[\"']|(^|[;&|\s])kill\s+-")
+    r"|\[\s*[\"'](?:kill|pkill|killall)[\"']"           # argv lists
+    r"|[\"'](?:kill|pkill|killall)\s+-?\w"               # shell strings: os.system, shell=True
+    r"|(^|[;&|\s])kill\s+-"                              # shell scripts
+    r"|\bfrom\s+os\s+import\b.*\b(?:kill|killpg)\b"
+    r"|\bgetattr\s*\(\s*os\s*,\s*[\"']kill")
 BAR = 'pkill {}-f "MemmonBar.app/Contents/MacOS/MemmonBar" 2>/dev/null || true'
 
 
@@ -974,8 +1180,9 @@ class SignalSiteTests(unittest.TestCase):
         # (through its injected kill), the runner's _stop (its own child's
         # group) and install.sh stopping the menu bar app it installs. Tests
         # signal only what they spawned and are excluded here.
+        from collections import Counter
         from test_owners import tracked_files
-        hits = set()
+        hits = Counter()                    # (file, function, line) -> sites
         for path in tracked_files(self):
             name = os.path.basename(path)
             if not name.endswith((".py", ".sh")) or name.startswith("test") or \
@@ -989,9 +1196,13 @@ class SignalSiteTests(unittest.TestCase):
                 if m:
                     func = m.group(1)
                 if SIGNAL_SITE.search(line.split("#")[0]):
-                    hits.add((name, func if name.endswith(".py") else line.strip()))
-        self.assertEqual(hits, {("memmon_act.py", "_signal"), ("memmon_runner.py", "_stop"),
-                                ("install.sh", BAR.format("")), ("install.sh", BAR.format("-9 "))})
+                    hits[(name, func if name.endswith(".py") else None, line.strip())] += 1
+        self.assertEqual(hits, Counter({
+            ("memmon_act.py", "_signal", "self.kill(pid, sig)"): 1,
+            ("memmon_runner.py", "_stop", "os.killpg(child.pid, signum)"): 1,
+            ("memmon_runner.py", "_stop", "os.killpg(child.pid, signal.SIGKILL)"): 1,
+            ("install.sh", None, BAR.format("")): 2,          # uninstall and reinstall
+            ("install.sh", None, BAR.format("-9 ")): 1}))
 
     def test_timing_constants_match_the_menu_bar(self):
         # The menu bar waits actTimeout for an act call that the engine keeps
@@ -1003,13 +1214,38 @@ class SignalSiteTests(unittest.TestCase):
         self.assertLess(ma.ACT_BUDGET_S, num("actTimeout"))
         self.assertEqual(ma.TOKEN_TTL_S, num("forceTTL"))
 
+    # Refusals memmon emits that the menu bar has no copy for yet; the ui
+    # lane adds them. Remove an entry once MemmonBar.swift has its case.
+    PENDING_UI_COPY = {"bad_args"}
+
+    def test_every_refusal_reason_has_menu_bar_copy(self):
+        # Every emitter, not only the engine: memmon.py refuses too.
+        reasons = set()
+        for name in ("memmon_act.py", "memmon.py"):
+            with open(os.path.join(HERE, name)) as fh:
+                src = fh.read()
+            reasons |= set(re.findall(r'Refused\("([a-z_]+)"\)', src))
+            reasons |= set(re.findall(r'outcome\("refused",\s*"([a-z_]+)"', src))
+            reasons |= set(re.findall(r'"reason": "([a-z_]+)"', src))
+        self.assertTrue({"bad_args", "hosts_sessions", "attributed"} <= reasons, reasons)
+        with open(os.path.join(HERE, "MemmonBar.swift")) as fh:
+            swift = fh.read()
+        body = swift[swift.index("static func refusal("):]
+        body = body[:body.index("default:")]
+        cases = set(re.findall(r'"([a-z_]+)"', body))
+        self.assertLessEqual(reasons - cases, self.PENDING_UI_COPY)
+
     def test_signal_site_pattern_catches_every_spelling(self):
         for line in ("os.kill(p, 9)", "os.killpg(g, 15)", "self.kill(pid, sig)",
                      "proc.kill()", "proc.terminate()", "p.send_signal(15)",
                      "signal.pthread_kill(t, 15)", "pkill -f x", "killall Dock",
-                     'subprocess.run(["kill", "-9", pid])', "kill -TERM $pid"):
+                     'subprocess.run(["kill", "-9", pid])', "kill -TERM $pid",
+                     'subprocess.run(["pkill", "-f", x])', 'os.system("kill -9 %d" % pid)',
+                     'subprocess.run("killall Dock", shell=True)', "from os import kill",
+                     "from os import getpid, killpg", 'getattr(os, "kill")(pid, 9)'):
             self.assertRegex(line, SIGNAL_SITE)
-        self.assertNotRegex('words = {"kill", "pgrep", "pkill"}', SIGNAL_SITE)
+        for line in ('words = {"kill", "pgrep", "pkill"}', '"skill level"', "kill_switch = 1"):
+            self.assertNotRegex(line, SIGNAL_SITE)
 
 
 # ------------------------------------------------------- real processes
