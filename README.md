@@ -473,17 +473,19 @@ freshly started owner, or one seen across a sleep, says "not enough history".
 ### Stopping something
 
 `memmon act` is the only part of memmon that signals a process memmon did not
-start (`memmon run` signals only its own child), and the menu bar goes through
-it too. It is the confirmed step: a script or agent shows the row to a person
-first and acts only on their say-so; nothing in memmon stops anything on its own. Each action takes a token from `memmon owners --json` that
-names the exact processes it was shown, and expires after 120 seconds:
+start (`memmon run` signals its own child's process group, escalating to
+SIGKILL after 5 s), and the menu bar goes through it too. It is the confirmed
+step: a script or agent shows the row to a person first and acts only on their
+say-so; nothing in memmon stops anything on its own. Each action takes a token
+from `memmon owners --json` that names the exact processes it was shown, and
+expires after 120 seconds:
 
 | Action | Stops | Keeps running |
 |---|---|---|
 | `stop-job` / `stop-server` | one build, test or dev server inside a session | the session's conversation and every other owner |
 | `stop-managed-job` | the child of a `memmon run`; its wrapper then exits 143 | the wrapper and everything else |
 | `end-session` | a Claude session or a `codex exec`, down to any nested session | nested sessions (reported as kept) |
-| `verify-app` | nothing — checks every instance of an app before the menu bar quits it | — |
+| `verify-app` | nothing — checks every instance of an app before the menu bar quits it, and answers with a fresh token for the check after the quit | — |
 
 Every signal goes to one process at a time, immediately after re-reading that
 process's identity (PID plus start time to the microsecond) and finding it
@@ -500,7 +502,15 @@ and only `memmon act force --target <token>` sends SIGKILL to them — after
 re-reading each one again, and skipping any that has since become another
 owner's root. Processes the stop only observed (a reparented child found in the
 group, say) are listed as `forceable: false`; force never touches them and its
-result stays `partial` while they run. If a job's process exited before the stop
+result stays `partial` while they run, including any beyond the 64 a token can
+list (`observed_unlisted`). A force result counts `killed` (sent SIGKILL, now
+gone) separately from `exited` (every named survivor now gone, however it went;
+kept under that name for compatibility), and each remaining row says whether
+force signalled it (`signalled`). A stop never signals a `memmon run` wrapper
+while its child runs, because the wrapper would pass the signal to the child's
+whole process group: the child is stopped by PID and the wrapper then exits.
+A reap's force token is accepted only by `memmon reap --force`, which re-checks
+each survivor against the orphan or prewarm rule; `memmon act` refuses it. If a job's process exited before the stop
 but what it started is still running in its group, the result is `partial`
 (`root_exited`) with those processes listed and nothing signalled. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial,
 or respawned), 4 (refused) or 1 (error), and it reports memory in use before and
