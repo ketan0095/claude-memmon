@@ -538,7 +538,7 @@ class AccessibilityTests(unittest.TestCase):
     def test_force_counts_only_what_its_token_names(self):
         rows = a11y("outcome-partial-outside.json")
         text = " ".join(r["label"] + " " + r["value"] for r in rows)
-        self.assertIn("Force stop 1 of 2 — 1 is outside what was stopped and won't be signalled.", text)
+        self.assertIn("1 of 2 can be force-stopped; the other is outside what was stopped and won't be signalled.", text)
         self.assertIn("Force stop 1 of the 2 remaining processes", labels(rows))
 
     def test_survivors_are_never_reported_as_success(self):
@@ -553,13 +553,14 @@ class AccessibilityTests(unittest.TestCase):
 
     def test_self_exited_survivors_are_not_counted_as_force_stopped(self):
         text = self.spoken("outcome-force-self-exited.json")
-        self.assertIn("Typecheck force-stopped · 1 ended by Force · 1 had already exited", text)
+        self.assertIn("Typecheck force-stopped · 1 ended by force · 1 had already exited", text)
         self.assertNotIn("2 force-stopped", text)
 
     def test_unlisted_survivors_are_counted_never_dropped(self):
         text = self.spoken("outcome-outside-unlisted.json")
-        self.assertIn("Typecheck partly stopped · 1 force-stopped · 3 more still running that memmon could not list",
-                      text)
+        # One of the two named survivors ended by itself: it is not force-stopped.
+        self.assertIn("Typecheck partly stopped · 1 force-stopped · 1 had already exited · "
+                      "3 more still running that memmon could not list", text)
         self.assertNotIn("0 still running", text)
 
     def test_root_exited_says_nothing_was_signalled(self):
@@ -587,7 +588,7 @@ class AccessibilityTests(unittest.TestCase):
     def test_watch_error_is_a_note_on_a_stop_that_stands(self):
         text = self.spoken("outcome-watch-error.json")
         self.assertIn("Checkout refactor stopped · 9 of 9 processes exited", text)
-        self.assertIn("(memmon could not keep watching for a restart)", text)
+        self.assertIn("(measured; other apps also change) · (memmon could not keep watching for a restart)", text)
         self.assertNotIn("Result unknown", text)
 
     def test_helpers_only_app_row_offers_nothing_to_quit(self):
@@ -623,6 +624,9 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("CPU partly measured", self.spoken("small.json"))
         self.assertIn("CPU partly measured", self.spoken("overview.json"))
         self.assertIn("CPU 3.1 / 18 cores", self.spoken("helpers-only.json"))
+        # Nothing measured: coverage is null and memmon says why.
+        self.assertIn("CPU warming up", self.spoken("warming-up.json"))
+        self.assertIn("CPU not measured", self.spoken("degraded.json"))
 
     def test_unattributed_cpu_needs_every_tree_fully_measured(self):
         found = labels(a11y("unattributed-partial.json"))

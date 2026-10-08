@@ -255,6 +255,8 @@ struct SystemInfo {
     var ramBytes: Double?, usedBytes: Double?
     var pressureLevel: String?, scoreLevel: String?
     var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
+    /// Why nothing was measured; set only when cpu_coverage is null.
+    var cpuReason: String?
     var reason: String?
 }
 
@@ -476,7 +478,8 @@ struct OwnersSnap {
                                   pressureLevel: str(y["pressure_level"]),
                                   scoreLevel: str(y["score_level"]),
                                   ncpu: num(y["ncpu"]), cpuCores: num(y["cpu_cores"]),
-                                  cpuCoverage: num(y["cpu_coverage"]), reason: str(y["reason"]))
+                                  cpuCoverage: num(y["cpu_coverage"]), cpuReason: str(y["cpu_reason"]),
+                                  reason: str(y["reason"]))
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -691,10 +694,6 @@ struct ActOutcome {
     var exited: Int?
     var captured: Int?
     var remaining: Int = 0
-    /// Survivors the force token names; the rest of `remaining` was only
-    /// observed (outside what was stopped) and will never be signalled.
-    var forceable: Int?
-    var observed: Int = 0
     var kept: [String] = []
     var forceToken: String?
     var usedBefore: Double?, usedAfter: Double?
@@ -712,13 +711,19 @@ struct ActOutcome {
     /// a fixed number); assumed still running.
     var observedUnlisted = 0
 
+    /// remaining[] rows the force token names (`forceable`), and on a Force
+    /// result the rows only observed (`role: observed`), counted from the
+    /// rows themselves; the rest of a stop's rows will never be signalled.
+    var forceableRows = 0
+    var observedRows = 0
+
     /// How many listed survivors Force would act on, and how many it would not.
-    var forceSplit: (forceable: Int, outside: Int) { (forceable ?? 0, observed) }
+    var forceSplit: (forceable: Int, outside: Int) { (forceableRows, remaining - forceableRows) }
 
     /// Processes still running outside what was stopped, listed or not.
     var outsideParts: [String] {
         var parts: [String] = []
-        let listed = observed > 0 ? observed : (observedUnlisted > 0 ? 0 : remaining)
+        let listed = observedRows
         if listed > 0 { parts.append("\(listed) still running outside what was stopped") }
         if observedUnlisted > 0 {
             parts.append("\(observedUnlisted) more still running that memmon could not list")
@@ -741,14 +746,16 @@ struct ActOutcome {
         var o = ActOutcome(result: result, reason: str(j["reason"]), exited: int(j["exited"]),
                            captured: int(j["captured"]),
                            remaining: (j["remaining"] as? [Any])?.count ?? 0,
-                           forceable: int(j["forceable"]),
-                           observed: int(j["observed"]) ?? 0,
                            kept: strs(j["kept"]) ?? [], forceToken: str(j["force_token"]),
                            usedBefore: num(j["used_bytes_before"]),
                            usedAfter: num(j["used_bytes_after"]))
         o.watchError = str(j["watch_error"])
         o.token = str(j["token"])
         o.killed = int(j["killed"])
+        if let rows = j["remaining"] as? [[String: Any]] {
+            o.forceableRows = rows.filter { $0["forceable"] as? Bool == true }.count
+            o.observedRows = rows.filter { str($0["role"]) == "observed" }.count
+        }
         o.observedUnlisted = int(j["observed_unlisted"]) ?? 0
         if let list = j["instances"] as? [[String: Any]] {
             var alive: InstanceLiveness = [:]
@@ -1072,7 +1079,7 @@ enum Copy {
     static func banner(_ view: ActView, subject: String, noun: String, forcing: Bool = false) -> Banner {
         var b = outcomeBanner(view, subject: subject, noun: noun, forcing: forcing)
         if case .success(let o) = view, o.watchError != nil {
-            b.note = [b.note, "(memmon could not keep watching for a restart)"].compactMap { $0 }.joined(separator: " ")
+            b.note = [b.note, "(memmon could not keep watching for a restart)"].compactMap { $0 }.joined(separator: " · ")
         }
         return b
     }
@@ -1101,7 +1108,7 @@ enum Copy {
             if o.result == "force_stopped", let k = o.killed {
                 // The title already says force-stopped; the body splits what
                 // Force ended from what had ended by itself.
-                parts.append("\(k) ended by Force")
+                parts.append("\(k) ended by force")
                 if (o.exited ?? 0) > k { parts.append("\((o.exited ?? 0) - k) had already exited") }
             } else if let n = o.exited, o.result != "already_exited" {
                 parts.append("\(n) of \(o.captured ?? n + o.remaining) processes exited")
@@ -1694,7 +1701,10 @@ struct UsageColumn: View {
     private var unmeasured: Bool { owner.footprint == nil && owner.cpu == nil }
 
     var lines: (String, String, String?) {
-        if unmeasured && sort != .growth { return ("—", memReason, nil) }
+        // Same slots as any other row: the missing figures, then one reason.
+        if unmeasured && sort != .growth {
+            return ("—", sort == .cpu ? "— GB" : "— cores", "memory and CPU \(memReason)")
+        }
         switch sort {
         case .memory:
             if owner.footprint == nil { return ("—", owner.cpu.map(coresText) ?? "— cores", memReason) }
@@ -2139,15 +2149,13 @@ struct ConfirmOverlay: View {
             let label: String
             if case .job(let j) = request.kind { label = "\(j.displayName.components(separatedBy: " · ")[0]) in \(owner.title)" } else { label = owner.title }
             let exited = o.exited ?? 0
-            let scope = k > 0
-                ? "Force stop \(n) of \(m) — \(k) \(k == 1 ? "is" : "are") outside what was stopped and won't be signalled. "
-                : ""
+            let them = n == 1 ? "it" : "them"
             return Content(icon: "exclamationmark.triangle", tint: P.amber,
                            title: "\(plural(m, "process", "processes")) still running",
                            target: label,
                            sub: "\(exited) of \(o.captured ?? exited + n) exited · \(m) still running after 10 s",
                            message: (k > 0
-                                     ? scope + "The \(n == 1 ? "one" : "\(n)") it acts on \(n == 1 ? "has" : "have") not answered the polite stop signal; Force stop ends \(n == 1 ? "it" : "them") immediately and any output not yet written is lost."
+                                     ? "\(n) of \(m) can be force-stopped; \(k == 1 ? "the other is" : "the other \(k) are") outside what was stopped and won't be signalled. Force stop ends \(them) immediately, and any output not yet written is lost."
                                      : "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost.")
                                + (owner.agent == "codex" && isEndSession
                                   ? " A Codex terminal stopped this way may need `reset` afterwards." : ""),
@@ -2665,13 +2673,11 @@ struct ContentView: View {
         let tint = P.tint(level)
         let ramGB = sys.ramBytes.map { $0 / GB }
         let usedGB = sys.usedBytes.map { $0 / GB }
-        // A partial sum would understate the machine, so a CPU total is shown
-        // only when every owner was measured.
-        let measuredCPU = s.owners.compactMap { $0.cpu }
-        let coverage = sys.cpuCoverage
-            ?? (s.owners.isEmpty ? 0 : Double(measuredCPU.count) / Double(s.owners.count))
-        let cpuNow = coverage >= 1 ? (sys.cpuCores ?? measuredCPU.reduce(0, +)) : nil
-        let cpuMissing = s.degraded ? "CPU not measured" : (coverage > 0 ? "CPU partly measured" : "CPU warming up")
+        // A partial sum would understate the machine, so memmon sends a CPU
+        // total only when every process was measured (coverage exactly 1).
+        let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
+        let cpuMissing = s.degraded ? "CPU not measured"
+            : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU partly measured"
         let ncpu = sys.ncpu ?? Double(ProcessInfo.processInfo.activeProcessorCount)
         let over = (usedGB ?? 0) > (ramGB ?? .infinity)
         return VStack(alignment: .leading, spacing: 0) {

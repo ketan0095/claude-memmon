@@ -8,8 +8,9 @@
   "pressure_level": "normal",
   "score_level": "HEALTHY",
   "ncpu": 18,
-  "cpu_coverage": 0.0,
-  "cpu_cores": null
+  "cpu_coverage": null,
+  "cpu_cores": null,
+  "cpu_reason": "not measured"
  },
  "owners": [
   {
