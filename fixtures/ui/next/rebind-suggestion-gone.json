@@ -1,0 +1,15 @@
+{
+ "_base": "../under-pressure.json",
+ "ts": 1791449999.0,
+ "under_pressure": false,
+ "pressure_suggestions": [],
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 49499498086,
+  "pressure_level": "warning",
+  "score_level": "WATCH",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.817
+ }
+}

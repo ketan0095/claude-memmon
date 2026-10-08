@@ -673,9 +673,10 @@ class AccessibilityTests(unittest.TestCase):
     def test_managed_jobs_card_lists_running_and_waiting_jobs(self):
         found = [r["label"] or r["value"] for r in a11y("managed-jobs.json")]
         self.assertIn("Managed jobs", found)
-        self.assertIn("Managed job acme-web typecheck · running · 42s, heavy, command running", found)
-        self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, resource held by acme-web typecheck",
-                      found)
+        # A schema 1 row (no reservation, estimate or queue fields) keeps
+        # what S1 said: its reason and age.
+        self.assertIn("Managed job acme-web typecheck, running, command running · 42s", found)
+        self.assertIn("Managed job acme-api tests, waiting, resource held by acme-web typecheck · 12s", found)
 
     def test_cpu_total_only_with_full_coverage(self):
         self.assertIn("CPU still measuring some processes", self.spoken("small.json"))
@@ -1486,7 +1487,7 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertEqual(payload["runner_jobs"], [self.LEASE])
         spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
         self.assertIn("CPU still measuring some processes", spoken)
-        self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, memory pressure: WATCH",
+        self.assertIn("Managed job acme-api tests, waiting, memory pressure: WATCH · 12s",
                       [r["label"] or r["value"] for r in rows])
 
     def test_generated_session_detail_and_stop_confirm(self):
@@ -1503,3 +1504,357 @@ class GeneratorContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- Stage 2
+
+def s2(fixture=None, payload=None, *flags):
+    """The S2 part of --sections-probe, for a fixture or an inline payload."""
+    with tempfile.TemporaryDirectory() as d:
+        if payload is not None:
+            path = Path(d) / "payload.json"
+            path.write_text(json.dumps(payload))
+        else:
+            path = FIXTURES / fixture
+        return run_json("--sections-probe", "--fixture", str(path), *flags)
+
+
+def payload(fixture, **change):
+    """A fixture flattened through its _base chain, with keys replaced."""
+    return dict(effective(FIXTURES / fixture), **change)
+
+
+def said(fixture):
+    """Every label, or the text itself for a plain text element."""
+    return [r["label"] or r["value"] for r in a11y(fixture)]
+
+
+def host(check, fixture, *extra):
+    return run_json("--selftest-host", check, "--fixture", str(fixture), *extra)
+
+
+class ManagedJobsCardTests(StubCase):
+    """M6a / M6b: the managed-jobs card built from jobs --json schema 2."""
+
+    def test_m6a_budget_line_rows_and_strict_queue(self):
+        r = s2("managed-jobs-v2.json")["s2"]
+        self.assertEqual(r["budget"], ["Committed 34.4 of 38.4 GB limit · 4.0 GB free to admit",
+                                       "30.5 GB in use + 3.9 GB reserved but not yet used"])
+        self.assertIsNone(r["hold"])
+        self.assertEqual([(m["state"], m["detail"]) for m in r["managed"]], [
+            ("Running", "3.2 GB now / 4.0 GB reserved · 2 min"),
+            ("Running", "19.4 GB now / 22.5 GB reserved · 6 min"),
+            ("Waiting", "needs 6.0 GB (learned from 5 runs) · waiting for budget · gives up in 8 min"),
+            ("Waiting", "needs 4.0 GB (unknown — default) · queued behind #1")])
+        found = labels(a11y("managed-jobs-v2.json"))
+        self.assertIn("Managed job #1 Billing API tests, waiting, needs 6.0 GB (learned from 5 runs) · "
+                      "waiting for budget · gives up in 8 min", found)
+        self.assertIn("Managed job #2 Checkout typecheck, waiting, needs 4.0 GB (unknown — default) · "
+                      "queued behind #1", found)
+        # A distinct mode control, not a view filter.
+        self.assertIn("Protection mode, protect", found)
+        self.assertIn("Protect, current protection mode", found)
+        self.assertIn("Set protection mode to Paused", found)
+
+    def test_m6b_over_limit_holds_and_puts_the_intervention_first(self):
+        r = s2("managed-jobs-intervention.json")["s2"]
+        head, sub = r["budget"]
+        self.assertEqual(head, "Committed 49.2 GB · over the 38.4 GB limit by 10.8 GB")
+        self.assertIn("20 % of memory (9.6 GB)", sub)
+        self.assertIn("headroom target is not currently met", sub)
+        self.assertEqual(r["hold"], "Holding new heavy work — memory must stay at Watch or better for 30 s")
+        first = r["managed"][0]
+        self.assertEqual(first["state"], "Intervention needed")
+        self.assertEqual(first["detail"], "grew to 7.9 GB, above its 4.0 GB reservation; memory DANGER · "
+                                          "new heavy work is on hold")
+        self.assertTrue(first["stop"])
+        self.assertEqual(r["managed"][2]["detail"],
+                         "needs 6.0 GB (learned from 5 runs) · on hold · gives up in 6 min")
+        found = labels(a11y("managed-jobs-intervention.json"))
+        self.assertIn("Holding new heavy work — memory must stay at Watch or better for 30 s", found)
+        self.assertIn("Stop job Search index rebuild: stops the job and its memmon run wrapper (asks to confirm)",
+                      found)
+
+    def test_intervention_stop_needs_an_s1_token(self):
+        p = payload("managed-jobs-intervention.json")
+        p["owners"] = [o for o in p["owners"] if not o["owner_id"].startswith("job:")]
+        self.assertFalse(s2(payload=p)["s2"]["managed"][0]["stop"])
+        p = payload("managed-jobs-intervention.json", inventory="degraded")
+        self.assertFalse(s2(payload=p)["s2"]["managed"][0]["stop"])
+
+    def test_intervention_stop_finds_a_managed_child_job(self):
+        p = payload("managed-jobs-intervention.json")
+        p["owners"] = [o for o in p["owners"] if not o["owner_id"].startswith("job:")]
+        p["owners"][0]["jobs"].append({"job_id": "48501.1791449958.120044", "kind": "build",
+                                       "label": "index", "action": "stop-managed-job",
+                                       "managed": True, "token": "tok-child-managed"})
+        self.assertTrue(s2(payload=p)["s2"]["managed"][0]["stop"])
+
+    def test_only_protect_mode_holds(self):
+        for mode in ("observe", "paused"):
+            p = payload("managed-jobs-intervention.json")
+            p["runner"] = dict(p["runner"], mode=mode)
+            r = s2(payload=p)["s2"]
+            self.assertIsNone(r["hold"], mode)
+            self.assertEqual(r["mode"], mode)
+
+    def test_telemetry_hold_says_memmon_cannot_read_pressure(self):
+        p = payload("managed-jobs-intervention.json")
+        p["runner"] = dict(p["runner"], admission={"open": False, "reason": "telemetry unavailable",
+                                                   "hysteresis_s": 30})
+        self.assertEqual(s2(payload=p)["s2"]["hold"],
+                         "Holding new heavy work — memmon can’t read memory pressure right now")
+
+    def test_unavailable_budget_says_why(self):
+        p = payload("managed-jobs-v2.json")
+        p["runner"] = dict(p["runner"], committed={"used": None, "slack": None, "limit": None,
+                                                   "free": None, "reason": "system memory unavailable"})
+        self.assertEqual(s2(payload=p)["s2"]["budget"],
+                         ["Committed memory not available · system memory unavailable", None])
+
+    def test_schema_1_payload_keeps_the_s1_card(self):
+        r = s2("managed-jobs.json")["s2"]
+        self.assertIsNone(r["mode"])
+        self.assertIsNone(r["budget"])
+        self.assertEqual(r["managed"][0]["detail"], "command running · 42s")
+
+    def test_mode_control_runs_run_mode_and_nothing_else(self):
+        fixture = FIXTURES / "managed-jobs-v2.json"
+        self.assertEqual(host("run-mode", fixture, "--mode", "paused")["actions"], ["run-mode paused"])
+        self.assertEqual(host("run-mode", fixture, "--mode", "off")["actions"], [])
+        calls = self.dir / "calls.jsonl"
+        script = self.dir / "memmon_calls.py"
+        script.write_text("import json, sys\n"
+                          f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                          "print('{}')\n")
+        host("run-mode", fixture, "--mode", "observe", "--script", str(script))
+        made = [json.loads(l) for l in calls.read_text().splitlines()]
+        self.assertEqual(made[0], ["run-mode", "observe"])
+        self.assertTrue(all(c[0] in ("run-mode", "owners") for c in made), made)
+
+
+class UnknownPressureTests(StubCase):
+    """M7c: UNKNOWN is never Normal and never green."""
+
+    def test_unknown_is_muted_with_a_question_mark(self):
+        r = s2("pressure-unknown.json")
+        self.assertEqual(r["s2"]["pressure"], {"word": "Unknown", "tone": "muted", "glyph": True})
+        self.assertEqual((r["status"]["kind"], r["status"]["text"]), ("plain", "Sampled 6 min ago"))
+        self.assertNotIn("stale", r["status"]["spoken"])
+        found = labels(a11y("pressure-unknown.json"))
+        ring = next(l for l in found if l.startswith("Memory "))
+        self.assertIn("pressure unknown", ring)
+        self.assertNotIn("normal", ring.lower())
+        self.assertIn("Sampled 6 min ago by the background sampler, pressure unknown", found)
+
+    def test_a_fresh_unknown_is_not_live(self):
+        p = payload("pressure-unknown.json", ts=effective(FIXTURES / "pressure-unknown.json")["_now"] - 2)
+        st = s2(payload=p)["status"]
+        self.assertEqual((st["kind"], st["text"]), ("plain", "Sampled 2s ago"))
+
+    def test_only_healthy_is_normal_and_green(self):
+        for level, word, tone in [("HEALTHY", "Normal", "green"), ("WATCH", "Watch", "amber"),
+                                  ("DANGER", "Danger", "red"), ("CRITICAL", "Critical", "red"),
+                                  ("UNKNOWN", "Unknown", "muted"), (None, "Unknown", "muted")]:
+            p = payload("overview.json")
+            p["system"] = dict(p["system"], score_level=level)
+            self.assertEqual(s2(payload=p)["s2"]["pressure"]["word"], word, level)
+            self.assertEqual(s2(payload=p)["s2"]["pressure"]["tone"], tone, level)
+
+    def test_status_item_dot_is_neutral_for_unknown(self):
+        path = self.dir / "latest.json"
+        path.write_text(json.dumps({"ts": 1000, "swap_used": 2 * 1024 ** 3, "pressure": "UNKNOWN",
+                                    "level_reason": "no rate baseline", "rates": "unavailable"}))
+        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 2.0G")
+
+    def test_retry_copy_under_unknown_says_the_gate_lets_it_run(self):
+        found = said("pressure-unknown.json")
+        self.assertTrue(any("a retry runs without a memory check" in l for l in found), found)
+
+
+class GapNoticeTests(unittest.TestCase):
+    """M7b: the sampling-gap notice (S2.10, AD-S2-13)."""
+
+    def expected(self, g):
+        hm = lambda t: time.strftime("%H:%M", time.localtime(t))
+        return (f"memmon couldn’t sample for 21 min while the Mac was awake "
+                f"({hm(g['from_ts'])}–{hm(g['to_ts'])}). Readings around the gap may be incomplete.")
+
+    def gap(self, **change):
+        p = payload("sampler-gap.json")
+        p["sampler"] = dict(p["sampler"], last_gap=dict(p["sampler"]["last_gap"], **change))
+        return p
+
+    def test_a_starved_gap_shows_with_its_times(self):
+        g = effective(FIXTURES / "sampler-gap.json")["sampler"]["last_gap"]
+        self.assertEqual(s2("sampler-gap.json")["s2"]["gap_notice"], self.expected(g))
+        found = labels(a11y("sampler-gap.json"))
+        self.assertIn(self.expected(g), found)
+        self.assertIn("Dismiss the sampling gap notice", found)
+
+    def test_only_a_starved_gap_with_five_awake_minutes_within_a_day(self):
+        now = effective(FIXTURES / "sampler-gap.json")["_now"]
+        self.assertIsNone(s2(payload=self.gap(cause="sleep"))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(cause="reboot", awake_s=None))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(awake_s=299))["s2"]["gap_notice"])
+        self.assertIsNotNone(s2(payload=self.gap(awake_s=300))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(to_ts=now - 86_401, from_ts=now - 90_000))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=payload("sampler-gap.json", sampler=None))["s2"]["gap_notice"])
+
+    def test_dismissal_hides_that_gap_and_not_a_later_one(self):
+        g = effective(FIXTURES / "sampler-gap.json")["sampler"]["last_gap"]
+        r = host("gap-dismiss", FIXTURES / "sampler-gap.json",
+                 "--next", str(FIXTURES / "next" / "sampler-gap-later.json"))
+        self.assertEqual(r["before"], self.expected(g).split(" Readings")[0])
+        self.assertIsNone(r["after"])
+        self.assertEqual(r["stored"], g["to_ts"])
+        self.assertIsNotNone(r["next"])
+        self.assertIsNone(s2("sampler-gap.json", None, "--dismissed-gap", str(g["to_ts"]))["s2"]["gap_notice"])
+
+
+class UnderPressureCardTests(StubCase):
+    """M7a: unmanaged heavy work under pressure (S2.11, I-14)."""
+
+    def test_rows_follow_m7a(self):
+        r = s2("under-pressure.json")["s2"]
+        self.assertTrue(r["under_pressure_card"])
+        self.assertEqual([(x["title"], x["evidence"], x["button"], x["note"]) for x in r["suggestions"]], [
+            ("vitest · acme-web", "8.8 GB · growing 120 MB/min · idle for 31 min", "Stop tests…", None),
+            ("vite dev server · acme-web", "3.3 GB · running 5 h", "Stop server…", None),
+            ("vite dev server · billing-api", "1.2 GB · not enough history", None,
+             "orphaned · stop it where it was started")])
+        self.assertEqual(r["suggestions"][0]["owner_line"], "under Claude session “Checkout refactor”")
+        found = said("under-pressure.json")
+        self.assertIn("Under pressure, DANGER", found)
+        self.assertIn("Stop tests: vitest · acme-web (asks to confirm)", found)
+        self.assertIn("memmon never stops these on its own.", found)
+        self.assertFalse(any(l.startswith("Stop server: vite dev server · billing-api") for l in found))
+
+    def test_at_most_three_rows(self):
+        p = payload("under-pressure.json")
+        extra = dict(p["pressure_suggestions"][1], job_id="9240.1791400000.0", footprint=1024 ** 3)
+        p["pressure_suggestions"] = p["pressure_suggestions"] + [extra]
+        self.assertEqual(len(s2(payload=p)["s2"]["suggestions"]), 3)
+
+    def test_card_only_while_under_pressure(self):
+        self.assertFalse(s2(payload=payload("under-pressure.json", under_pressure=False))["s2"]["under_pressure_card"])
+        # An older payload without the predicate falls back to DANGER/CRITICAL.
+        p = payload("under-pressure.json")
+        del p["under_pressure"]
+        self.assertTrue(s2(payload=p)["s2"]["under_pressure_card"])
+        p["system"] = dict(p["system"], score_level="WATCH")
+        self.assertFalse(s2(payload=p)["s2"]["under_pressure_card"])
+        # UNKNOWN with a kernel warning is under pressure when memmon says so.
+        p = payload("under-pressure.json")
+        p["system"] = dict(p["system"], score_level="UNKNOWN")
+        self.assertTrue(s2(payload=p)["s2"]["under_pressure_card"])
+
+    def test_no_button_without_a_token_or_identity(self):
+        p = payload("under-pressure.json")
+        p["pressure_suggestions"][0] = dict(p["pressure_suggestions"][0], token=None)
+        self.assertFalse(s2(payload=p)["s2"]["suggestions"][0]["can_stop"])
+        rows = s2(payload=payload("under-pressure.json", inventory="degraded"))["s2"]["suggestions"]
+        self.assertFalse(any(x["can_stop"] for x in rows))
+
+    def confirm(self, *extra):
+        return host("suggest", FIXTURES / "under-pressure-confirm.json", *extra)
+
+    def test_confirmed_stop_uses_the_s1_stop_and_token(self):
+        r = self.confirm()
+        self.assertEqual(r["phase_before"], "ask")
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest"])
+
+    def test_token_more_than_120_s_old_is_never_sent(self):
+        self.assertEqual(self.confirm("--age", "119")["actions"],
+                         ["act stop-job --target tok-fixture-s1-vitest"])
+        r = self.confirm("--age", "121")
+        self.assertEqual(r["actions"], [])
+        self.assertEqual(r["phase"], "closed")
+        self.assertTrue(r["banner"].startswith("Nothing done"))
+
+    def test_the_token_comes_from_the_latest_refresh(self):
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-fresh.json"))
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest-fresh"])
+
+    def test_perform_rereads_the_token_even_without_a_rebind(self):
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-fresh.json"), "--no-rebind")
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest-fresh"])
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-gone.json"), "--no-rebind")
+        self.assertEqual(r["actions"], [])
+        self.assertTrue(r["banner"].startswith("Nothing done"))
+
+    def test_a_suggestion_gone_or_changed_closes_the_confirm(self):
+        for name, says in [("rebind-suggestion-gone.json", "no longer listed under pressure"),
+                           ("rebind-suggestion-changed.json", "changed while this was open")]:
+            r = self.confirm("--next", str(FIXTURES / "next" / name))
+            self.assertEqual((r["phase_before"], r["actions"]), ("closed", []), name)
+            self.assertIn(says, r["banner"])
+
+    def test_confirm_says_what_it_stops_and_what_keeps_running(self):
+        found = said("under-pressure-confirm.json")
+        self.assertIn("Stop vitest?", found)
+        self.assertTrue(any("vitest in acme-web · under Claude session “Checkout refactor”" in l for l in found))
+        self.assertIn("Stop tests: send stop signal to Vitest", found)
+        self.assertIn("Cancel, keep the job running", found)
+
+
+class PressureSourceTests(unittest.TestCase):
+    """S2.9: the kernel's pressure events refresh only while the popover is open."""
+
+    def test_source_runs_only_while_open(self):
+        r = host("pressure-watch", FIXTURES / "overview.json")
+        self.assertEqual((r["active_before"], r["active_open"], r["active_closed"]), (False, True, False))
+        self.assertEqual(r["events_open"], 2)
+        self.assertEqual(r["events_closed"], 2)
+        self.assertEqual(r["scans"], 0)      # a fixture model never spawns memmon
+
+
+def job(id_="a" * 32, state="intervention_needed", changed=100.0, **extra):
+    return dict({"id": id_, "label": "Search index rebuild", "state": state, "state_changed_ts": changed,
+                 "intervention": {"cause": "growth", "since_ts": changed}, "footprint_bytes": 8 * 1024 ** 3,
+                 "reservation_bytes": 4 * 1024 ** 3}, **extra)
+
+
+class InterventionNotificationTests(unittest.TestCase):
+    """S2.5 / AD-S2-8: one notification per job per state change, never repeated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def probe(self, rounds, store=True, *extra):
+        seq = self.dir / "seq.json"
+        seq.write_text(json.dumps(rounds))
+        args = ["--notify-probe", "--sequence", str(seq), *extra]
+        if store:
+            args += ["--store", str(self.dir / "store.json")]
+        return run_json(*args)
+
+    def test_one_notification_per_state_change(self):
+        running = job(state="running", intervention=None)
+        r = self.probe([[running], [job()], [job()], [job()], [running], [job(changed=200.0)]])
+        self.assertEqual([len(x) for x in r["rounds"]], [0, 1, 0, 0, 0, 1])
+        self.assertEqual(r["posted"][0]["title"], "Search index rebuild needs attention")
+        self.assertIn("It grew to 8.0 GB, above its 4.0 GB reservation", r["posted"][0]["body"])
+
+    def test_a_relaunch_does_not_repeat(self):
+        self.assertEqual(len(self.probe([[job()]])["posted"]), 1)
+        self.assertEqual(len(self.probe([[job()]])["posted"]), 0)
+
+    def test_only_states_that_need_a_person(self):
+        states = ["waiting", "starting", "running", "cancelling", "detached", "done", "gave_up",
+                  "stopped_by_user"]
+        r = self.probe([[job(id_=f"{k:032x}", state=s) for k, s in enumerate(states)]])
+        self.assertEqual(r["posted"], [])
+        r = self.probe([[job(state="cancelled_by_policy", changed=300.0)]])
+        self.assertEqual(r["posted"][0]["title"], "memmon cancelled Search index rebuild")
+
+    def test_runner_records_are_read_from_disk_by_run_id_only(self):
+        runner = self.dir / "runner"
+        (runner / "coord").mkdir(parents=True)
+        (runner / ("b" * 32 + ".json")).write_text(json.dumps(job(id_="b" * 32)))
+        (runner / "coord" / "admission-state.json").write_text(json.dumps(job(id_="c" * 32)))
+        (runner / "not-a-run.json").write_text(json.dumps(job(id_="d" * 32)))
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertEqual([p["id"].split("|")[0] for p in r["posted"]], ["b" * 32])

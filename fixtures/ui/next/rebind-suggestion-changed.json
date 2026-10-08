@@ -1,0 +1,77 @@
+{
+ "_base": "../under-pressure.json",
+ "ts": 1791449999.0,
+ "pressure_suggestions": [
+  {
+   "job_id": "52010.1791448000.110021",
+   "owner_id": "claude:fixture-a",
+   "kind": "server",
+   "task": "vitest",
+   "place": "acme-web",
+   "label": "vitest in acme-web",
+   "footprint": 9448928051,
+   "growth_mb_min": 120.0,
+   "idle_s": 1860,
+   "history_reason": null,
+   "age_s": 2400,
+   "stop": "stop-server",
+   "stop_note": null,
+   "root": {
+    "pid": 52010,
+    "start": [
+     1791448000,
+     110021
+    ],
+    "pgid": 52010
+   },
+   "token": "tok-fixture-s1-vitest"
+  },
+  {
+   "job_id": "9101.1791400000.0",
+   "owner_id": "unknown:9101.1791400000",
+   "kind": "server",
+   "task": "vite dev server",
+   "place": "acme-web",
+   "label": "vite dev server in acme-web",
+   "footprint": 3543348019,
+   "growth_mb_min": 0.2,
+   "idle_s": 0,
+   "history_reason": null,
+   "age_s": 18000,
+   "stop": "stop-server",
+   "stop_note": null,
+   "root": {
+    "pid": 9101,
+    "start": [
+     1791400000,
+     0
+    ],
+    "pgid": 9101
+   },
+   "token": "tok-fixture-s2-vite"
+  },
+  {
+   "job_id": "9188.1791400000.0",
+   "owner_id": "unknown:9188.1791400000",
+   "kind": "server",
+   "task": "vite dev server",
+   "place": "billing-api",
+   "label": "vite dev server in billing-api",
+   "footprint": 1288490189,
+   "growth_mb_min": null,
+   "idle_s": null,
+   "history_reason": "not enough history",
+   "age_s": 900,
+   "stop": null,
+   "stop_note": "orphaned · stop it where it was started",
+   "root": {
+    "pid": 9188,
+    "start": [
+     1791400000,
+     0
+    ],
+    "pgid": 9188
+   }
+  }
+ ]
+}

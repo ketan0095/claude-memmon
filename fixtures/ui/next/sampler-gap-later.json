@@ -1,0 +1,16 @@
+{
+ "_base": "../sampler-gap.json",
+ "sampler": {
+  "last_ts": 1791449998.0,
+  "age_s": 2,
+  "stale": false,
+  "last_gap": {
+   "cause": "starved",
+   "gap_s": 700.0,
+   "asleep_s": 0.0,
+   "awake_s": 700.0,
+   "from_ts": 1791449000.0,
+   "to_ts": 1791449700.0
+  }
+ }
+}
