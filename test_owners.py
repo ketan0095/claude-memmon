@@ -237,7 +237,7 @@ class PartitionTests(OwnerBase):
         lone = part.owners[part.owner_of[213]]
         self.assertEqual((lone.kind, lone.owner_id), ("codex", "codex-proc:213.1700000213"))
 
-    def test_codex_tui_ownership_r3(self):
+    def test_codex_tui_ownership(self):
         # Probe fixture: A daemon-connected TUI is a pointer; in-process
         # TUIs (holding a writer lock, with or without a rollout) are rule 2;
         # a stale lock file on disk creates nothing.
@@ -357,6 +357,34 @@ class PartitionTests(OwnerBase):
         self.assertEqual(mo.decode_token(row["token"])["instances"][0]["pid"], 600)
         self.assertEqual(row["title"], "Google Chrome")
 
+    def test_child_running_the_main_executable_is_a_member_not_an_instance(self):
+        # Electron apps re-run their own executable as helpers (node mode).
+        chrome, clone, helper, appex = self.clone_chrome()
+        main = f"{clone}/Contents/MacOS/Google Chrome"
+        procs = [P(600, comm="Google Chrome"), P(601, ppid=600, comm="Google Chrome")]
+        _, inv, part = self.build(procs, paths={600: main, 601: main})
+        self.assertEqual(part.owner_of[601], "app:com.google.Chrome")
+        row = next(r for r in self.payload(inv, part)["owners"]
+                   if r["owner_id"] == "app:com.google.Chrome")
+        self.assertEqual([i["pid"] for i in row["instances"]], [600])
+        self.assertFalse(mo.is_app_instance(inv, 601))
+
+    def test_title_comes_from_the_main_executable_bundle(self):
+        # A widget from the installed bundle started first; the row is still
+        # named by the bundle the main executable runs from.
+        chrome, clone, helper, appex = self.clone_chrome()
+        with open(os.path.join(chrome, "Contents", "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.google.Chrome",
+                           "CFBundleDisplayName": "Chrome (installed copy)"}, fh)
+        mo._plist_cache.clear()
+        procs = [P(603, start=(T0, 0), comm="Widget"),
+                 P(600, start=(T0 + 5, 0), comm="Google Chrome")]
+        _, inv, part = self.build(procs, paths={600: f"{clone}/Contents/MacOS/Google Chrome",
+                                                603: appex})
+        row = next(r for r in self.payload(inv, part)["owners"]
+                   if r["owner_id"] == "app:com.google.Chrome")
+        self.assertEqual(row["title"], "Google Chrome")
+
     def test_clone_trusted_only_when_dir_names_its_bundle_id(self):
         chrome, clone, helper, appex = self.clone_chrome()
         fake = clone.replace("com.google.Chrome.code_sign_clone", "com.evil.code_sign_clone")
@@ -384,6 +412,21 @@ class PartitionTests(OwnerBase):
         codex = rows["app:com.example.codex"]
         self.assertEqual((codex["hosts"], codex["actions"], codex["hosts_shells"]),
                          ([], ["quit-app"], False))
+
+    def test_every_app_above_a_session_hosts_it(self):
+        # A launcher app started the terminal that runs the session: both
+        # host it, as verify-app sees it.
+        launcher = make_bundle(self.root, "Launcher", "com.example.launcher")
+        term = make_bundle(self.root, "Terminal", "com.apple.Terminal")
+        procs = [P(890, comm="Launcher"), P(900, ppid=890, comm="Terminal"),
+                 P(901, ppid=900, comm="zsh"), self.claude(902, "0000ee01", ppid=901)]
+        paths = {890: f"{launcher}/Contents/MacOS/Launcher",
+                 900: f"{term}/Contents/MacOS/Terminal"}
+        _, inv, part = self.build(procs, paths=paths)
+        rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
+        for oid in ("app:com.example.launcher", "app:com.apple.Terminal"):
+            self.assertEqual((rows[oid]["hosts"], rows[oid]["actions"]),
+                             (["claude:0000ee01"], []), oid)
 
     def test_widget_only_app_row_cannot_be_quit(self):
         photos = make_bundle(self.root, "Photos", "com.example.photos")
@@ -446,13 +489,17 @@ class PartitionTests(OwnerBase):
         self.assertEqual(part.owners[part.owner_of[202]].kind, "codex-app")
 
     def test_codex_global_flags_before_the_subcommand(self):
-        procs = [P(220, comm="codex"), P(221, comm="codex"), P(222, comm="codex")]
+        procs = [P(220, comm="codex"), P(221, comm="codex"), P(222, comm="codex"),
+                 P(223, comm="codex"), P(224, comm="codex")]
         argv = {220: ["codex", "-c", "x=1", "mcp-server"],
                 221: ["codex", "--profile", "ci", "login"],
-                222: ["codex", "-m", "gpt", "exec", "do it"]}
+                222: ["codex", "-m", "gpt", "exec", "do it"],
+                223: ["codex", "--add-dir", "/w/acme-web", "mcp-server"],
+                224: ["codex", "--remote-auth-token-env", "TOKEN_VAR", "login"]}
         _, inv, part = self.build(procs, argv=argv)
-        kinds = {pid: part.owners[part.owner_of[pid]].kind for pid in (220, 221, 222)}
-        self.assertEqual(kinds, {220: "unknown", 221: "unknown", 222: "codex"})
+        kinds = {pid: part.owners[part.owner_of[pid]].kind for pid in argv}
+        self.assertEqual(kinds, {220: "unknown", 221: "unknown", 222: "codex",
+                                 223: "unknown", 224: "unknown"})
 
     def test_connected_tui_with_children_is_not_a_pointer(self):
         # A pointer runs nothing of its own.
@@ -608,12 +655,12 @@ class PresentationTests(OwnerBase):
                          ("stop-job", 20, 10))
 
     def test_job_kind_comes_from_executables_only(self):
-        commands = lambda c: [memmon._command_tokens(t) for t in memmon.shell_commands(c)]
-        kind = lambda c: mo.classify_job(c, self.ctx.classify, commands)[0]
+        kind = lambda c: mo.classify_job(c, self.ctx.classify, memmon.job_tokens)[0]
         for cmd in ("tail -f /tmp/test.log", "grep -rn test src", 'echo "pnpm dev"',
                     "ls tests/", "git log --grep serve"):
             self.assertEqual(kind(cmd), "other", cmd)
         self.assertEqual(kind("pnpm dev"), "server")
+        self.assertEqual(kind("pnpm --filter web dev"), "server")
         self.assertEqual(kind("next dev -p 3000"), "server")
         self.assertEqual(kind("python3 -m http.server 8000"), "server")
         self.assertEqual(kind("npx vitest run"), "test")
@@ -623,7 +670,7 @@ class PresentationTests(OwnerBase):
     def test_unmanaged_heavy_counts_every_owner_once_per_subtree(self):
         # A vitest started in a terminal app counts; chains count once;
         # look-alike commands and managed jobs do not.
-        self.ctx.commands = lambda c: [memmon._command_tokens(t) for t in memmon.shell_commands(c)]
+        self.ctx.commands = memmon.job_tokens
         term = make_bundle(self.root, "Terminal", "com.apple.Terminal")
         procs = [P(900, comm="Terminal"), P(901, ppid=900, comm="zsh"),
                  P(902, ppid=901, comm="node"), P(903, ppid=902, comm="node"),
@@ -640,6 +687,23 @@ class PresentationTests(OwnerBase):
                                     paths={900: f"{term}/Contents/MacOS/Terminal"})
         n = mo.unmanaged_heavy(mo.Sample(inv, part, {}, None), self.ctx)
         self.assertEqual(n, 1)
+        # A lease whose child_start names another process manages nothing.
+        self.ctx.leases = [{"id": "r1", "child_pid": 907, "child_start": [1_700_000_907, 1]}]
+        self.assertEqual(mo.unmanaged_heavy(mo.Sample(inv, part, {}, None), self.ctx), 2)
+
+    def test_heavy_chain_counts_once_across_light_links(self):
+        # pnpm -> a light wrapper -> node tsc is one job, and runtime flags
+        # before the script do not hide it.
+        self.ctx.commands = memmon.job_tokens
+        procs = [P(910, comm="zsh"), P(911, ppid=910, comm="node"),
+                 P(912, ppid=911, comm="node"), P(913, ppid=912, comm="node")]
+        argv = {910: ["/bin/zsh", "-c", "pnpm typecheck"],
+                911: ["node", "/r/node_modules/.bin/run-p", "--silent", "check"],
+                912: ["node", "--max-old-space-size=4096", "/r/node_modules/.bin/tsc", "-p", "."],
+                913: ["node", "/r/node_modules/typescript/lib/tsserver.js"]}
+        _, inv, part = self.build(procs, argv=argv)
+        self.assertEqual(mo.process_command(inv, 912), "tsc -p .")
+        self.assertEqual(mo.unmanaged_heavy(mo.Sample(inv, part, {}, None), self.ctx), 1)
 
     def test_listening_socket_makes_a_server(self):
         procs = [self.claude(10, "0000a001"), P(20, ppid=10), P(21, ppid=20, pgid=20)]
@@ -876,7 +940,8 @@ class OwnersCliTests(unittest.TestCase):
         self.assertEqual(payload["system"]["score_level"], "WATCH")
         self.assertEqual(payload["system"]["ncpu"], os.cpu_count())
         self.assertIsNone(payload["system"]["cpu_cores"])       # window 0, no baseline
-        self.assertEqual(payload["system"]["cpu_coverage"], 0)
+        self.assertIsNone(payload["system"]["cpu_coverage"])
+        self.assertEqual(payload["system"]["cpu_reason"], "warming up")
         self.assertEqual(payload["runner_jobs"], [])
         self.assertEqual(payload["protection"],
                          {"summary": "on", "gate": "on", "route": "off",
@@ -905,6 +970,25 @@ class OwnersCliTests(unittest.TestCase):
                 system = memmon.owners_json(1.0, ctx=ctx)["system"]
             self.assertEqual(system["cpu_cores"], expect)
             self.assertEqual(system["cpu_coverage"], 0.5 if partial else 1.0)
+
+    def test_system_cpu_counts_whole_members_not_rounded_fractions(self):
+        # One owner of 2001 members, one unmeasured: 2000/2001 rounds to 1.0,
+        # but the total is still partial and must not be summed.
+        state = TempState()
+        self.addCleanup(state.close)
+        src = FakeSource([P(10)] + [P(pid, ppid=10) for pid in range(11, 2012)])
+        ctx = mo.Context(sessions_dir=memmon.CLAUDE_SESSIONS_DIR)
+        inv = mp.snapshot(src)
+        cpu = {pid: 0.001 for pid in range(10, 2011)}
+
+        def sample(window, source=None, ctx=None, sleep=None):
+            return mo.Sample(inv, mo.partition(inv, ctx), cpu, "warming up"), 1.0
+        with mock.patch.object(memmon, "owners_sample", sample), \
+                mock.patch.object(memmon, "gate_stats", return_value={}), \
+                mock.patch.object(memmon, "system_block", return_value={}):
+            system = memmon.owners_json(1.0, ctx=ctx)["system"]
+        self.assertIsNone(system["cpu_cores"])
+        self.assertEqual(system["cpu_coverage"], 0.999)
 
     def test_failed_strict_read_is_null_with_reason(self):
         def boom():
@@ -975,8 +1059,20 @@ def png_text(path: str) -> str:
         if kind == b"zTXt":
             key, _, rest = body.partition(b"\0")
             body = key + b" " + zlib.decompress(rest[1:])
-        if kind in (b"tEXt", b"iTXt", b"zTXt", b"eXIf"):
-            out.append(body.decode("latin-1"))
+        elif kind == b"iTXt":
+            # keyword\0 flag method language\0 translated\0 text (zlib if flag)
+            key, _, rest = body.partition(b"\0")
+            flag, rest = rest[:1], rest[2:]
+            lang, _, rest = rest.partition(b"\0")
+            tkey, _, text = rest.partition(b"\0")
+            body = b" ".join([key, lang, tkey, zlib.decompress(text) if flag == b"\1" else text])
+        if kind in (b"tEXt", b"iTXt", b"zTXt"):
+            out.append(body.decode("utf-8", "replace"))
+        elif kind == b"eXIf":
+            # EXIF strings are ASCII, or UTF-16 for the Windows XP* and
+            # UserComment tags, in either byte order.
+            out += [body.decode("latin-1"), body.decode("utf-16-le", "replace"),
+                    body.decode("utf-16-be", "replace"), body[1:].decode("utf-16-le", "replace")]
         i += 12 + n
     return "\n".join(out)
 
@@ -999,7 +1095,9 @@ class PublicHygieneTests(unittest.TestCase):
                 try:
                     with open(path, encoding="utf-8") as fh:
                         text = fh.read()
-                except (UnicodeDecodeError, OSError):
+                except UnicodeDecodeError:
+                    # A binary type this scan cannot read: add a reader first.
+                    hits.append(f"{path}: unscanned binary")
                     continue
             scanned += 1
             for n, line in enumerate(text.splitlines(), 1):
@@ -1017,14 +1115,18 @@ class PublicHygieneTests(unittest.TestCase):
     def test_png_metadata_is_read(self):
         import struct
         import zlib
+        home = ("/" + "Users/someone/x").encode()
+        chunks = [(b"tEXt", b"Comment\0" + home),
+                  (b"iTXt", b"Comment\0\1\0en\0\0" + zlib.compress(home)),
+                  (b"eXIf", b"MM\0*" + home.decode().encode("utf-16-le"))]
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "x.png")
-            chunk = b"Comment\0" + ("/" + "Users/someone/x").encode()
-            with open(path, "wb") as fh:
-                fh.write(b"\x89PNG\r\n\x1a\n")
-                fh.write(struct.pack(">I4s", len(chunk), b"tEXt") + chunk
-                         + struct.pack(">I", zlib.crc32(b"tEXt" + chunk)))
-            self.assertRegex(png_text(path), self.HOME_RE)
+            for kind, chunk in chunks:
+                path = os.path.join(d, "x.png")
+                with open(path, "wb") as fh:
+                    fh.write(b"\x89PNG\r\n\x1a\n")
+                    fh.write(struct.pack(">I4s", len(chunk), kind) + chunk
+                             + struct.pack(">I", zlib.crc32(kind + chunk)))
+                self.assertRegex(png_text(path), self.HOME_RE, kind)
 
 
 if __name__ == "__main__":

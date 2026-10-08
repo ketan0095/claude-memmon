@@ -1029,7 +1029,6 @@ def read_subagents(transcript_path: str) -> list[dict]:
 
 
 RV_SOCK_RE = re.compile(r"/rv/([0-9a-f]{8})\.sock")
-CLAIM_SOCK_RE = re.compile(r"(\S+\.claim\.sock)")
 
 
 def map_pids_to_jobs() -> dict[int, str]:
@@ -1055,13 +1054,10 @@ def map_pids_to_jobs() -> dict[int, str]:
 
 
 def spare_is_idle(cmd: str) -> bool:
-    """A prewarm process advertises itself on a .claim.sock. Once a session
-    claims it the socket is removed, so a missing socket means this process is
-    doing real work and must never be treated as reclaimable."""
-    m = CLAIM_SOCK_RE.search(cmd)
-    if not m:
-        return False
-    return os.path.exists(m.group(1))
+    """A prewarm process advertises itself on a .claim.sock; a claimed one is
+    doing real work and is never reclaimable. One rule, in memmon_owners."""
+    import memmon_owners
+    return memmon_owners.spare_is_idle(cmd)
 
 
 def find_transcripts(max_age_h: int = 12) -> dict[str, str]:
@@ -2555,6 +2551,20 @@ def wait_safe(timeout: int) -> int:
 
 # ------------------------------------------------------------------- owners
 
+def job_tokens(cmd: str) -> list:
+    """The executables of a command line as token lists, a package
+    launcher's own options skipped the way the gate skips them
+    (`pnpm --filter web dev` runs `dev`)."""
+    import memmon_owners
+    out = []
+    for t in shell_commands(cmd):
+        toks = _command_tokens(t)
+        if toks and os.path.basename(toks[0]) in memmon_owners.LAUNCHERS:
+            toks = toks[:1] + toks[_skip_options(toks, 1):]
+        out.append(toks)
+    return out
+
+
 def _owners_ctx(titles: bool = True):
     import memmon_owners
     from memmon_runner import jobs
@@ -2566,7 +2576,7 @@ def _owners_ctx(titles: bool = True):
     if titles:
         prof = load_profile()
         ctx.classify = lambda cmd: classify_command(cmd, prof)
-        ctx.commands = lambda cmd: [_command_tokens(t) for t in shell_commands(cmd)]
+        ctx.commands = job_tokens
         for sess in read_sessions():
             ctx.titles_by_job[sess["short"]] = sess["name"]
             if sess["session_id"]:
@@ -2682,14 +2692,19 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
         system=system_block(system_reader),
         protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
         gate=gate_stats(), used_by=used_by)
-    # A machine-wide CPU figure is only a sum when every member was measured.
-    total = sum(o["member_count"] for o in payload["owners"])
-    seen = sum((o["cpu_coverage"] or 0) * o["member_count"] for o in payload["owners"])
-    coverage = round(seen / total, 3) if total else None
-    payload["system"]["ncpu"] = os.cpu_count()
-    payload["system"]["cpu_coverage"] = coverage
-    payload["system"]["cpu_cores"] = (round(sum(o["cpu_cores"] for o in payload["owners"]), 3)
-                                      if coverage == 1 else None)
+    # A machine-wide CPU figure is only a sum when every member was measured;
+    # counted in whole members, never from the rounded per-owner fractions.
+    members = [p for o in payload["owners"] if o["owner_id"] in sample.part.owners
+               for p in sample.part.owners[o["owner_id"]].members]
+    seen = [sample.cpu[p] for p in members if p in sample.cpu]
+    system = payload["system"]
+    system["ncpu"] = os.cpu_count()
+    complete = bool(seen) and len(seen) == len(members)
+    system["cpu_coverage"] = (1.0 if complete else min(round(len(seen) / len(members), 3), 0.999)
+                              if seen else None)
+    system["cpu_cores"] = round(sum(seen), 3) if complete else None
+    if not seen:
+        system["cpu_reason"] = sample.cpu_reason or "not measured"
     payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
     return payload
 

@@ -295,7 +295,8 @@ def _codex_role(inv, pid: int) -> str | None:
 
 CODEX_VALUE_FLAGS = {"-c", "--config", "-m", "--model", "-p", "--profile", "-C", "--cd",
                      "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image",
-                     "--enable", "--disable", "--local-provider", "--remote"}
+                     "--enable", "--disable", "--local-provider", "--remote", "--add-dir",
+                     "--remote-auth-token-env"}
 
 
 def _skip_codex_globals(args: list) -> list:
@@ -384,11 +385,17 @@ def app_key(bundle: str) -> str:
 
 def is_app_instance(inv, pid: int) -> bool:
     """An instance is a process running the bundle's main executable, the
-    thing NSRunningApplication can quit. Helpers, app extensions, XPC
-    services and login items are members, never instances."""
+    thing NSRunningApplication can quit, that the same app did not start.
+    Helpers, app extensions, XPC services and login items are members, never
+    instances, and so is a child the app runs from its own executable (an
+    Electron app's node mode)."""
     bundle = _bundle_of(inv, pid)
-    return bool(bundle) and inv.path(pid) == os.path.join(
-        bundle, "Contents", "MacOS", bundle_info(bundle)["executable"])
+    if not bundle or inv.path(pid) != os.path.join(
+            bundle, "Contents", "MacOS", bundle_info(bundle)["executable"]):
+        return False
+    parent = inv.procs[pid].ppid if pid in inv.procs else None
+    pb = _bundle_of(inv, parent) if parent in inv.procs else None
+    return not pb or app_key(pb) != app_key(bundle)
 
 
 def _service_name(inv, pid: int) -> str | None:
@@ -567,27 +574,7 @@ def partition(inv, ctx: Context) -> Partition:
     root_owner: dict = {}
     for root, (kind, key, info) in sorted(rule.items(), key=lambda kv: procs[kv[0]].start):
         p = procs[root]
-        if kind == "claude":
-            oid = f"claude:{key}" if key else f"claude:proc.{p.pid}.{p.start[0]}"
-            conf = "exact"
-        elif kind == "codex":
-            thread = info.get("thread_id")
-            oid = f"codex:{thread}" if thread else f"codex-proc:{p.pid}.{p.start[0]}"
-            conf = "inferred"
-        elif kind == "codex-app":
-            oid, conf = f"codex-app:{p.pid}.{p.start[0]}", "shared"
-        elif kind == "codex-ui":
-            oid, conf = f"codex-ui:{p.pid}.{p.start[0]}", "shared"
-        elif kind == "job":
-            oid, conf = f"job:{key}", "exact"
-        elif kind == "app":
-            bid = bundle_info(info["bundle"])["bundle_id"]
-            oid = "app:" + (bid or _path_hash(key))
-            conf = "exact"
-        elif kind == "service":
-            oid, conf = f"service:vm:{info.get('vm', key)}", "shared"
-        else:
-            oid, conf = f"unknown:{p.pid}.{p.start[0]}", "unknown"
+        oid, conf = _owner_id(kind, key, info, p)
         if oid in owners and kind not in ("app", "service"):
             oid = f"{oid}.{p.pid}"
         owner = owners.get(oid)
@@ -611,8 +598,10 @@ def partition(inv, ctx: Context) -> Partition:
 
 
 def hosted_by(part: Partition, inv) -> dict:
-    """app owner_id -> owner_ids of the agent sessions running under it.
-    Quitting such an app would end those sessions, so it is not offered."""
+    """app or service owner_id -> owner_ids of the agent sessions running
+    under it, at any depth (verify-app refuses on any ancestor, so this
+    matches it). Quitting such an app would end those sessions, so it is not
+    offered."""
     out: dict = {}
     for o in part.owners.values():
         if o.kind not in HOSTED_KINDS:
@@ -621,11 +610,30 @@ def hosted_by(part: Partition, inv) -> dict:
         while a in inv.procs and a not in seen:
             seen.add(a)
             host = part.owners.get(part.owner_of.get(a))
-            if host is not None and host.kind == "app":
-                out.setdefault(host.owner_id, []).append(o.owner_id)
-                break
+            if host is not None and host.kind in ("app", "service"):
+                hosted = out.setdefault(host.owner_id, [])
+                if o.owner_id not in hosted:
+                    hosted.append(o.owner_id)
             a = inv.procs[a].ppid
     return out
+
+
+def _owner_id(kind: str, key, info: dict, p) -> tuple:
+    """(owner_id, confidence) for a root found by `kind`'s rule."""
+    if kind == "claude":
+        return (f"claude:{key}" if key else f"claude:proc.{p.pid}.{p.start[0]}"), "exact"
+    if kind == "codex":
+        thread = info.get("thread_id")
+        return (f"codex:{thread}" if thread else f"codex-proc:{p.pid}.{p.start[0]}"), "inferred"
+    if kind in ("codex-app", "codex-ui"):
+        return f"{kind}:{p.pid}.{p.start[0]}", "shared"
+    if kind == "job":
+        return f"job:{key}", "exact"
+    if kind == "app":
+        return "app:" + (bundle_info(info["bundle"])["bundle_id"] or _path_hash(key)), "exact"
+    if kind == "service":
+        return f"service:vm:{info.get('vm', key)}", "shared"
+    return f"unknown:{p.pid}.{p.start[0]}", "unknown"
 
 
 def fresh_roots(inv, pids, ctx: Context) -> dict:
@@ -640,21 +648,25 @@ def fresh_roots(inv, pids, ctx: Context) -> dict:
         return out
     for pid, info in find_claude_roots(inv, ctx).items():
         if pid in want:
-            out[pid] = f"claude:{info['job_id'] or info['session_id'] or f'proc.{pid}'}"
+            out[pid] = _owner_id("claude", info["job_id"] or info["session_id"], info,
+                                 inv.procs[pid])[0]
     for pid in want - set(out):
         p = inv.procs[pid]
         role = _codex_role(inv, pid)
         bundle = None if role else _bundle_of(inv, pid)
+        rule = None
         if role:
-            kind = "codex-app" if role == "app-server" else "codex-proc"
-            out[pid] = f"{kind}:{pid}.{p.start[0]}"
+            rule = ("codex-app" if role == "app-server" else "codex", None, {})
         elif bundle:
             bid = bundle_info(bundle)["bundle_id"]
-            if bid not in OWN_BUNDLE_IDS:
-                out[pid] = (f"service:vm:{GUI_VM_APPS[bid]}" if bid in GUI_VM_APPS
-                            else "app:" + (bid or _path_hash(bundle)))
+            if bid in GUI_VM_APPS:
+                rule = ("service", GUI_VM_APPS[bid], {})
+            elif bid not in OWN_BUNDLE_IDS:
+                rule = ("app", app_key(bundle), {"bundle": bundle})
         elif _service_name(inv, pid):
-            out[pid] = f"service:vm:{_service_name(inv, pid)}"
+            rule = ("service", _service_name(inv, pid), {})
+        if rule:
+            out[pid] = _owner_id(*rule, p)[0]
     return out
 
 
@@ -740,6 +752,9 @@ DEV_TOOLS = {"next", "vite", "nuxt", "astro", "remix"}
 TEST_WORDS = {"test", "vitest", "jest", "playwright", "pytest"}
 HEAVY_KINDS = ("build", "test", "server")
 RUNTIMES = {"node", "bun", "deno", "python", "python3"}
+RUNTIME_VALUE_FLAGS = {"-r", "--require", "--import", "--loader", "--experimental-loader",
+                       "--env-file", "--conditions", "-C", "--inspect-port", "--title"}
+RUNTIME_CODE_FLAGS = {"-e", "--eval", "-p", "--print", "-c", "-m"}   # no script follows
 
 
 def _is_server(toks: list) -> bool:
@@ -792,8 +807,13 @@ def process_command(inv, pid: int) -> str:
     base = os.path.basename(argv[0]) if argv else ""
     if base in SHELLS:
         return job_command(inv, pid)
-    if base.lower() in RUNTIMES and len(argv) > 1 and not argv[1].startswith("-"):
-        return " ".join([os.path.basename(argv[1])] + argv[2:])
+    if base.lower() in RUNTIMES:
+        # `node --max-old-space-size=4096 …/tsc -p .` runs tsc.
+        i = 1
+        while i < len(argv) and argv[i].startswith("-") and argv[i] not in RUNTIME_CODE_FLAGS:
+            i += 2 if argv[i] in RUNTIME_VALUE_FLAGS else 1
+        if i < len(argv) and not argv[i].startswith("-"):
+            return " ".join([os.path.basename(argv[i])] + argv[i + 1:])
     return " ".join([base] + argv[1:])
 
 
@@ -1304,4 +1324,12 @@ def unmanaged_heavy(sample: Sample, ctx: Context) -> int:
             kinds[cmd] = classify_job(cmd, ctx.classify, ctx.commands)[0]
         if kinds[cmd] in HEAVY_KINDS:
             heavy.add(pid)
-    return sum(1 for pid in heavy if inv.procs[pid].ppid not in heavy)
+    def under_heavy(pid):
+        cur, seen = inv.procs[pid].ppid, set()
+        while cur in inv.procs and cur not in seen:
+            if cur in heavy:
+                return True
+            seen.add(cur)
+            cur = inv.procs[cur].ppid
+        return False
+    return sum(1 for pid in heavy if not under_heavy(pid))

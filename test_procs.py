@@ -3,6 +3,7 @@ and the strict system reader. Only the test's own process is read for real."""
 
 import ctypes
 import errno
+import dataclasses
 import os
 import subprocess
 import sys
@@ -61,12 +62,25 @@ class LibprocTests(unittest.TestCase):
         with mock.patch.object(src, "timebase", return_value=(numer * 50, denom)):
             self.assertIn("cpu ticks disagree", mp.self_check(src))
 
-    def test_self_check_catches_a_too_small_timebase(self):
-        # The arm64 unit error reads ~42x too little CPU at import time.
+    def test_self_check_cpu_tolerance_at_import_scale(self):
+        # At import, about 30 ms of CPU has been used. A timebase unit error
+        # (41.7x too little on arm64, or too much) must show at that scale;
+        # a sub-millisecond read skew must not.
         src = mp.default_source()
-        numer, denom = src.timebase()
-        with mock.patch.object(src, "timebase", return_value=(numer, denom * 125 / 3)):
-            self.assertIn("cpu ticks disagree", mp.self_check(src))
+        real = src.read
+
+        def check(cpu_s):
+            def read(pid):
+                p = real(pid)
+                return dataclasses.replace(p, cpu_ticks=int(cpu_s * 1e9)) if p else p
+            with mock.patch.object(src, "read", read), \
+                    mock.patch.object(src, "timebase", return_value=(1, 1)), \
+                    mock.patch.object(mp.time, "process_time", return_value=0.030):
+                return mp.self_check(src)
+        self.assertIsNone(check(0.0305))
+        self.assertIsNone(check(0.0298))
+        self.assertIn("cpu ticks disagree", check(0.030 / 41.7))
+        self.assertIn("cpu ticks disagree", check(0.030 * 41.7))
 
     def test_self_check_catches_impossible_footprint(self):
         self.assertEqual(mp.self_check(mp.default_source(), memsize=1),
