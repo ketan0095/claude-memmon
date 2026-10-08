@@ -75,8 +75,29 @@ SHELL_HOSTS = {"com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.gho
                "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "org.alacritty",
                "com.github.wez.wezterm", "com.microsoft.VSCode",
                "com.todesktop.230313mzl4w4u92", "dev.zed.Zed"}
+# Display grouping only: a category never decides an action.
+BROWSERS = {"com.apple.Safari", "com.google.Chrome", "com.google.Chrome.canary",
+            "com.brave.Browser", "org.mozilla.firefox", "company.thebrowser.Browser",
+            "com.microsoft.edgemac", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+            "com.kagi.kagimacOS", "app.zen-browser.zen"}
+DEV_APPS = SHELL_HOSTS | {"com.apple.dt.Xcode"}
+KIND_CATEGORY = {"claude": "claude", "codex": "codex", "codex-ui": "codex", "job": "job",
+                 "service": "service", "codex-app": "service", "unknown": "unknown"}
 HOSTED_KINDS = ("claude", "codex", "codex-ui")
 ENDABLE_KINDS = ("claude", "codex")         # owners an end-session can stop
+
+
+def category_of(kind: str, owner_id: str) -> str:
+    """Which popover section an owner belongs in: claude, codex, job,
+    browser, dev, app, service or unknown."""
+    if kind != "app":
+        return KIND_CATEGORY.get(kind, "unknown")
+    bid = owner_id.split(":", 1)[1] if owner_id.startswith("app:") else ""
+    if bid in BROWSERS:
+        return "browser"
+    if bid in DEV_APPS or bid.startswith("com.jetbrains."):
+        return "dev"
+    return "app"
 
 
 # ------------------------------------------------------------------ tokens
@@ -1268,6 +1289,7 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
             "hosts_shells": bool(owner.info.get("bundle")) and bundle_info(
                 owner.info["bundle"])["bundle_id"] in SHELL_HOSTS,
         }
+        row["category"] = category_of(owner.kind, owner.owner_id)
         if owner.kind == "service" and used_by and owner.owner_id in used_by:
             row["used_by"] = used_by[owner.owner_id]
         rows.append(row)

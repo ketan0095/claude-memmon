@@ -416,6 +416,31 @@ class PartitionTests(OwnerBase):
         self.assertEqual((codex["hosts"], codex["actions"], codex["hosts_shells"]),
                          ([], ["quit-app"], False))
 
+    def test_rows_carry_a_display_category(self):
+        term = make_bundle(self.root, "Terminal", "com.apple.Terminal")
+        safari = make_bundle(self.root, "Safari", "com.apple.Safari")
+        notes = make_bundle(self.root, "Notes", "com.example.notes")
+        procs = [P(900, comm="Terminal"), P(901, ppid=900, comm="zsh"),
+                 self.claude(902, "0000ee01", ppid=901),
+                 P(920, comm="Safari"), P(930, comm="Notes"), P(940, comm="node")]
+        paths = {900: f"{term}/Contents/MacOS/Terminal",
+                 920: f"{safari}/Contents/MacOS/Safari", 930: f"{notes}/Contents/MacOS/Notes"}
+        _, inv, part = self.build(procs, paths=paths)
+        rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
+        self.assertEqual({oid: r["category"] for oid, r in rows.items()
+                          if not oid.startswith("unknown:")},
+                         {"app:com.apple.Terminal": "dev", "app:com.apple.Safari": "browser",
+                          "app:com.example.notes": "app", "claude:0000ee01": "claude"})
+        self.assertTrue(all(r["category"] == "unknown" for oid, r in rows.items()
+                            if oid.startswith("unknown:")))
+
+    def test_category_follows_kind_outside_apps(self):
+        cases = {"codex": "codex", "codex-ui": "codex", "job": "job", "service": "service",
+                 "codex-app": "service", "unknown": "unknown"}
+        for kind, want in cases.items():
+            self.assertEqual(mo.category_of(kind, f"{kind}:x"), want, kind)
+        self.assertEqual(mo.category_of("app", "app:com.jetbrains.pycharm"), "dev")
+
     def test_every_app_above_a_session_hosts_it(self):
         # A launcher app started the terminal that runs the session: both
         # host it, as verify-app sees it.
