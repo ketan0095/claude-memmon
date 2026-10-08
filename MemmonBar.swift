@@ -1946,7 +1946,8 @@ struct UsageColumn: View {
     }
 
     var spoken: String {
-        let mem = owner.footprint.map(gb) ?? "memory not available, \(memReason)"
+        let mem = owner.footprint.map { $0 < 0.05 * GB ? "less than 0.1 GB" : gb($0) }
+            ?? "memory not available, \(memReason)"
         let cpu = owner.cpu.map(coresText) ?? "CPU not available, \(cpuReason)"
         let growth = owner.growth.map { "growth \(growthText($0)) per 10 minutes" }
             ?? "growth not available, \(growthReason)"
@@ -2039,7 +2040,9 @@ struct SectionHeader: View {
 
     var body: some View {
         let count = sectionCount(section, rows)
-        let total = sectionTotal(rows).map(gb)
+        // A row with no measured footprint makes the sum a lower bound.
+        let partial = rows.contains { $0.footprint == nil }
+        let total = sectionTotal(rows).map { (partial ? "≥ " : "") + gb($0) }
         Button(action: onTap) {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
@@ -2059,7 +2062,7 @@ struct SectionHeader: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(section.title), \(count.spoken), \(total ?? "memory not measured"), "
+        .accessibilityLabel("\(section.title), \(count.spoken), \((total?.replacingOccurrences(of: "≥ ", with: "at least ")) ?? "memory not measured"), "
             + (open ? "expanded" : "collapsed"))
         .accessibilityAddTraits(.isButton)
     }

@@ -866,6 +866,24 @@ class SectionTests(unittest.TestCase):
             want = sum(unknown if oid == "unknown:*" else (fp[oid] or 0) for oid in s["owners"])
             self.assertAlmostEqual(s["total"], want, delta=1, msg=s["section"])
 
+    def test_header_total_with_an_unmeasured_row_is_a_lower_bound(self):
+        payload = effective(FIXTURES / "sections.json")
+        app = next(o for o in payload["owners"]
+                   if o.get("category") == "app" and o.get("actions"))
+        app["footprint_bytes"], app["footprint_reason"] = None, "not measured"
+        path = Path(self.tmp.name) / "partial.json"
+        path.write_text(json.dumps(payload))
+        header = next(l for l in labels(a11y_path(path)) if l.startswith("Mac apps,"))
+        self.assertIn("at least ", header)
+        claude = next(l for l in labels(a11y_path(path)) if l.startswith("Claude sessions,"))
+        self.assertNotIn("at least", claude)
+
+    def test_a_tiny_footprint_is_spoken_as_under_a_tenth(self):
+        found = labels(a11y("sections-background.json"))
+        row = next(l for l in found if l.startswith("Example Updater,"))
+        self.assertIn("less than 0.1 GB", row)
+        self.assertNotIn("0.0 GB", row)
+
     def test_headers_and_rows_say_everything_the_old_rows_did(self):
         found = labels(a11y("sections-open.json"))
         self.assertIn("Mac apps, 8 owners, 6.4 GB, expanded", found)
