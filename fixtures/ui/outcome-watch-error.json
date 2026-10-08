@@ -1,0 +1,8 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "select": "claude:fixture-a",
+  "confirm": "end-session",
+  "outcome": "outcomes/stopped-watch-error.json"
+ }
+}

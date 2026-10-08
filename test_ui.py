@@ -433,8 +433,9 @@ class AccessibilityTests(unittest.TestCase):
     def test_unavailable_values_are_spoken_as_unavailable_never_zero(self):
         found = labels(a11y("unavailable.json"))
         row = next(l for l in found if l.startswith("Checkout refactor,"))
-        self.assertIn("CPU not available, warming up", row)
-        self.assertIn("memory not available, not readable", row)
+        # Nothing measured is one state, not a memory reason plus a CPU one.
+        self.assertIn("memory and CPU not available, not measured", row)
+        self.assertNotIn("warming up", row)
         self.assertNotIn("0.0 GB", row)
         self.assertIn("Sample time unknown", found)
         meter = next(r for r in a11y("unavailable.json") if r["label"] == "Memory in use")
@@ -496,13 +497,33 @@ class AccessibilityTests(unittest.TestCase):
     def test_quit_app_with_a_helper_instance_is_not_reported_quit(self):
         text = self.spoken("quit-service-not-an-app.json")
         self.assertIn("Not fully quit", text)
-        self.assertIn("instance 2 is not an app memmon can quit, not touched", text)
+        self.assertIn("instance 2 is not an app memmon can quit, so it was left alone.", text)
+        self.assertNotIn("Refresh and try again", text)
         self.assertNotIn("Container VM quit", text)
+
+    def test_hosts_sessions_refusal_is_a_refusal(self):
+        text = self.spoken("quit-refused-hosts.json")
+        self.assertIn("Not quit — this app hosts agent sessions; quit it from the app itself.", text)
+        self.assertNotIn("quit ·", text)
+
+    def test_watch_error_is_a_note_on_a_stop_that_stands(self):
+        text = self.spoken("outcome-watch-error.json")
+        self.assertIn("Checkout refactor stopped · 9 of 9 processes exited", text)
+        self.assertIn("(memmon could not keep watching for a restart)", text)
+        self.assertNotIn("Result unknown", text)
+
+    def test_helpers_only_app_row_offers_nothing_to_quit(self):
+        found = labels(a11y("helpers-only.json"))
+        row = next(l for l in found if l.startswith("Example Widgets,"))
+        self.assertIn("Helpers only — nothing to quit", row)
+        self.assertFalse(any(l.startswith("Quit Example Widgets") for l in found))
 
     def test_wired_outcome_fixtures_render_their_copy(self):
         self.assertIn("Result unknown — memmon did not answer within 25 s.", self.spoken("outcome-timeout.json"))
         self.assertIn("is protected", self.spoken("outcome-refused-protected.json"))
-        self.assertIn("Container VM force-quit · 2 of 2 instances exited", self.spoken("quit-service-forced.json"))
+        forced = self.spoken("quit-service-forced.json")
+        self.assertIn("Container VM force-quit · 2 of 2 instances exited", forced)
+        self.assertIn("force-quit (used memory updates at the next sample)", forced)
 
     def test_hosting_app_offers_no_quit_and_terminal_quit_warns(self):
         hosts = labels(a11y("hosts-detail.json"))
@@ -548,7 +569,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Refresh the process list", labels(a11y("outcome-refused.json")))
         degraded = a11y("degraded.json")
         spoken = [r["label"] or r["value"] for r in degraded]
-        self.assertIn("Limited process details: libproc is unavailable (libproc self-check failed), "
+        self.assertIn("Limited process details: libproc self-check failed, "
                       "so memory comes from top and stop actions are off.", spoken)
 
     def test_respawned_session_says_so_and_offers_no_force(self):

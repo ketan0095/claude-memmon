@@ -1,75 +1,5 @@
 {
  "_base": "overview.json",
- "ts": null,
- "source": "live",
- "system": {
-  "ram_bytes": null,
-  "used_bytes": null,
-  "pressure_level": null,
-  "score_level": null,
-  "reason": "vm_stat did not answer"
- },
- "protection": {
-  "summary": "off",
-  "gate": "off",
-  "route": "off",
-  "unmanaged_heavy": 0
- },
- "gate": {
-  "installed": false,
-  "paused": false,
-  "paused_until": null,
-  "policy": {
-   "mode": "block-critical"
-  },
-  "counts": {
-   "since": 1791190800.0,
-   "complete": false,
-   "evaluated": 212,
-   "warned": 1,
-   "stopped": 0,
-   "errors": 0
-  },
-  "history": {
-   "from": 1791190800.0,
-   "to": 1791449760.0,
-   "truncated": false,
-   "events": [
-    {
-     "ts": 1791444600.0,
-     "action": "warn",
-     "mode": "block-critical",
-     "session": {
-      "id": "fixture-b",
-      "name": "Billing API tests"
-     },
-     "command": {
-      "raw": "npx vitest run",
-      "display": "npx vitest run"
-     },
-     "classification": {
-      "source": "builtin",
-      "rule": "vitest",
-      "shape": "npx vitest",
-      "samples": null,
-      "observed_peak_bytes": null,
-      "block_eligible": true
-     },
-     "legacy": false,
-     "pressure": {
-      "level": "WATCH",
-      "score": 3,
-      "reasons": [
-       "paging 40 MB/s"
-      ]
-     },
-     "retry_status": "not_waiting",
-     "ms": 70
-    }
-   ]
-  },
-  "pending_retry": []
- },
  "owners": [
   {
    "owner_id": "claude:fixture-a",
@@ -80,11 +10,11 @@
    "worktree": "checkout",
    "activity": "Building \u00b7 typecheck",
    "confidence": "exact",
-   "footprint_bytes": null,
-   "cpu_cores": null,
+   "footprint_bytes": 9556302233,
+   "cpu_cores": 3.1,
    "cpu_coverage": 1.0,
-   "growth_bytes_per_10min": null,
-   "growth_reason": "not enough history",
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
    "member_count": 9,
    "root": {
     "pid": 48211,
@@ -130,9 +60,40 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null,
-   "footprint_reason": "not measured",
-   "cpu_reason": "warming up"
+   "shared_with": null
+  },
+  {
+   "owner_id": "app:com.example.shellterm",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Shell Terminal",
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 429496729,
+   "cpu_cores": 0.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 1048576,
+   "member_count": 3,
+   "root": {
+    "pid": 8100,
+    "start": [
+     1791420000,
+     0
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLnNoZWxsdGVybSIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLnNoZWxsdGVybSIsImluc3RhbmNlcyI6W3sicGlkIjo4MTAwLCJzdGFydCI6WzE3OTE0MjAwMDAsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDIwMDAwLjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 8100,
+     "launch_date": 1791420000.0
+    }
+   ],
+   "hosts": [],
+   "hosts_shells": true
   },
   {
    "owner_id": "codex:fixture-b",
@@ -210,78 +171,11 @@
    "actions": [
     "end-session"
    ]
-  },
-  {
-   "owner_id": "unknown:9101.1791400000",
-   "kind": "unknown",
-   "agent": "unknown",
-   "title": "node (9101)",
-   "confidence": "unknown",
-   "footprint_bytes": 966367641,
-   "cpu_cores": null,
-   "cpu_reason": "not measured",
-   "growth_bytes_per_10min": null,
-   "growth_reason": "tracked as Unattributed",
-   "member_count": 3,
-   "root": {
-    "pid": 9101,
-    "start": [
-     1791400000,
-     0
-    ]
-   },
-   "token": null,
-   "jobs": [],
-   "actions": []
-  },
-  {
-   "owner_id": "unknown:9188.1791400000",
-   "kind": "unknown",
-   "agent": "unknown",
-   "title": "node (9188)",
-   "confidence": "unknown",
-   "footprint_bytes": 644245094,
-   "cpu_cores": null,
-   "cpu_reason": "not measured",
-   "growth_bytes_per_10min": null,
-   "growth_reason": "tracked as Unattributed",
-   "member_count": 2,
-   "root": {
-    "pid": 9188,
-    "start": [
-     1791400000,
-     0
-    ]
-   },
-   "token": null,
-   "jobs": [],
-   "actions": []
-  },
-  {
-   "owner_id": "unknown:9240.1791400000",
-   "kind": "unknown",
-   "agent": "unknown",
-   "title": "node (9240)",
-   "confidence": "unknown",
-   "footprint_bytes": 322122547,
-   "cpu_cores": null,
-   "cpu_reason": "not measured",
-   "growth_bytes_per_10min": null,
-   "growth_reason": "tracked as Unattributed",
-   "member_count": 1,
-   "root": {
-    "pid": 9240,
-    "start": [
-     1791400000,
-     0
-    ]
-   },
-   "token": null,
-   "jobs": [],
-   "actions": []
   }
  ],
  "_view": {
-  "sort": "cpu"
+  "select": "app:com.example.shellterm",
+  "confirm": "quit-app",
+  "outcome": "outcomes/app-refused-hosts.json"
  }
 }

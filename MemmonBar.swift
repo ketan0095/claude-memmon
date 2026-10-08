@@ -371,7 +371,8 @@ struct Owner: Identifiable {
         case "claude", "codex": return "No project detected"
         case "app":
             if !hosts.isEmpty { return "Hosts \(plural(hosts.count, "session"))" }
-            return instances.map { plural($0.count, "instance") } ?? "Not assigned to a session"
+            if let n = instances?.count { return n == 0 ? "Helpers only — nothing to quit" : plural(n, "instance") }
+            return "Not assigned to a session"
         default: return agentLabel
         }
     }
@@ -425,6 +426,12 @@ struct Owner: Identifiable {
         o.hostsShells = d["hosts_shells"] as? Bool ?? false
         return o
     }
+}
+
+/// Names in a wrapped list keep their hyphens on one line ("api-gateway"),
+/// and the "… (+N)" tail is glued to the last name with no-break spaces.
+func unbroken<S: Sequence>(_ names: S) -> [String] where S.Element == String {
+    names.map { $0.replacingOccurrences(of: "-", with: "\u{2011}") }
 }
 
 /// launch_date is epoch seconds, the process start as a float.
@@ -687,6 +694,8 @@ struct ActOutcome {
     var kept: [String] = []
     var forceToken: String?
     var usedBefore: Double?, usedAfter: Double?
+    /// The restart watch after an end-session failed; the stop itself stands.
+    var watchError: String?
     /// Per-instance liveness from verify-app's instances[].status.
     var alive: InstanceLiveness?
 
@@ -707,6 +716,7 @@ struct ActOutcome {
                            kept: strs(j["kept"]) ?? [], forceToken: str(j["force_token"]),
                            usedBefore: num(j["used_bytes_before"]),
                            usedAfter: num(j["used_bytes_after"]))
+        o.watchError = str(j["watch_error"])
         if let list = j["instances"] as? [[String: Any]] {
             var alive: InstanceLiveness = [:]
             for i in list {
@@ -833,7 +843,7 @@ enum InstanceState: String {
         case .changed: return "changed since the sample, not touched"
         case .alreadyExited: return "had already quit"
         case .forceStopped: return "force-quit"
-        case .notAnApp: return "is not an app memmon can quit, not touched"
+        case .notAnApp: return "is not an app memmon can quit, so it was left alone"
         case .unverified: return "could not be verified"
         }
     }
@@ -1005,6 +1015,14 @@ enum Copy {
     }
 
     static func banner(_ view: ActView, subject: String, noun: String, forcing: Bool = false) -> Banner {
+        var b = outcomeBanner(view, subject: subject, noun: noun, forcing: forcing)
+        if case .success(let o) = view, o.watchError != nil {
+            b.note = [b.note, "(memmon could not keep watching for a restart)"].compactMap { $0 }.joined(separator: " ")
+        }
+        return b
+    }
+
+    private static func outcomeBanner(_ view: ActView, subject: String, noun: String, forcing: Bool) -> Banner {
         switch view {
         case .success(let o):
             if o.remaining > 0 { return partial(o, subject: subject) }
@@ -1033,7 +1051,8 @@ enum Copy {
             return Banner(tone: .success, title: title, body: "· " + parts.joined(separator: " · "), note: note)
         case .refused(let o):
             let (text, refresh) = refusal(o.reason, noun: noun, forcing: forcing)
-            return Banner(tone: .warning, title: forcing ? "Not force-stopped" : "Not stopped",
+            let verb = noun == "app" ? "quit" : "stopped"
+            return Banner(tone: .warning, title: forcing ? "Not force-\(verb)" : "Not \(verb)",
                           body: "— " + text, offersRefresh: refresh)
         case .partial(let o):
             return partial(o, subject: subject)
@@ -1051,14 +1070,16 @@ enum Copy {
         if done == n {
             return Banner(tone: .success, title: forced ? "\(title) force-quit" : "\(title) quit",
                           body: "· \(done) of \(n) instances exited · " + detail,
-                          note: "Used memory updates at the next sample.")
+                          note: "(used memory updates at the next sample)")
         }
         if results.contains(where: { $0.state == .running }) {
             return Banner(tone: .warning, title: "\(title) still running",
                           body: "— " + detail, offersRefresh: true)
         }
+        // Retrying only helps an instance that changed or could not be checked.
+        let retry = results.contains { $0.state == .changed || $0.state == .unverified }
         return Banner(tone: .warning, title: "Not fully quit",
-                      body: "— " + detail + ". Refresh and try again.", offersRefresh: true)
+                      body: "— " + detail + (retry ? ". Refresh and try again." : "."), offersRefresh: true)
     }
 }
 
@@ -1533,7 +1554,11 @@ struct UsageColumn: View {
     private var cpuReason: String { owner.cpuReason ?? "warming up" }
     private var growthReason: String { owner.growthReason ?? "not enough history" }
 
+    /// Nothing about the owner could be measured: one state, not two reasons.
+    private var unmeasured: Bool { owner.footprint == nil && owner.cpu == nil }
+
     var lines: (String, String, String?) {
+        if unmeasured && sort != .growth { return ("—", memReason, nil) }
         switch sort {
         case .memory:
             if owner.footprint == nil { return ("—", owner.cpu.map(coresText) ?? "— cores", memReason) }
@@ -1553,6 +1578,7 @@ struct UsageColumn: View {
         let cpu = owner.cpu.map(coresText) ?? "CPU not available, \(cpuReason)"
         let growth = owner.growth.map { "growth \(growthText($0)) per 10 minutes" }
             ?? "growth not available, \(growthReason)"
+        if unmeasured && sort != .growth { return "memory and CPU not available, \(memReason)" }
         switch sort {
         case .memory: return "\(mem), \(cpu)"
         case .cpu: return "\(cpu), \(mem)"
@@ -1775,8 +1801,8 @@ struct OwnerDetailCard: View {
     }
 
     private func sharedLine(_ names: [String]) -> String {
-        let head = names.prefix(3).joined(separator: ", ")
-        let more = names.count > 3 ? " … (+\(names.count - 3))" : ""
+        let head = unbroken(names.prefix(3)).joined(separator: ", ")
+        let more = names.count > 3 ? "\u{00A0}…\u{00A0}(+\(names.count - 3))" : ""
         let what = owner.kind == "codex-app" ? "Threads" : "Containers"
         return "\(what): \(head)\(more)"
     }
@@ -1984,7 +2010,9 @@ struct ConfirmOverlay: View {
                            title: "\(plural(m, "process", "processes")) still running",
                            target: label,
                            sub: "\(exited) of \(o.captured ?? exited + n) exited · \(m) still running after 10 s",
-                           message: scope + "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost."
+                           message: (k > 0
+                                     ? scope + "The \(n == 1 ? "one" : "\(n)") it acts on \(n == 1 ? "has" : "have") not answered the polite stop signal; Force stop ends \(n == 1 ? "it" : "them") immediately and any output not yet written is lost."
+                                     : "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost.")
                                + (owner.agent == "codex" && isEndSession
                                   ? " A Codex terminal stopped this way may need `reset` afterwards." : ""),
                            safe: isEndSession ? nil : (keepsConversation ? "The conversation keeps running either way." : nil),
@@ -2015,8 +2043,8 @@ struct ConfirmOverlay: View {
     private var blastList: [String] {
         var list: [String] = []
         if let shared = owner.sharedWith, !shared.isEmpty {
-            let head = shared.prefix(3).joined(separator: ", ")
-            let more = shared.count > 3 ? " … (+\(shared.count - 3))" : ""
+            let head = unbroken(shared.prefix(3)).joined(separator: ", ")
+            let more = shared.count > 3 ? "\u{00A0}…\u{00A0}(+\(shared.count - 3))" : ""
             list.append(owner.kind == "codex-app"
                         ? "\(plural(shared.count, "thread")) end: \(head)\(more)"
                         : "\(plural(shared.count, "container")) stop: \(head)\(more)")
@@ -2059,7 +2087,7 @@ struct ConfirmOverlay: View {
             return Content(icon: "xmark.octagon", tint: P.red, title: "End \(owner.title)?",
                            target: owner.title, sub: sub.isEmpty ? nil : sub,
                            list: work.isEmpty ? [] : ["Includes: " + work.joined(separator: ", ")],
-                           message: "The conversation and every process it started get a polite stop signal. Anything not yet written to disk is lost.",
+                           message: "The conversation and all the processes it started get a polite stop signal. Anything not yet written to disk is lost.",
                            safe: "Other sessions, including any nested inside it, keep running.",
                            safeButton: "Cancel", safeSpoken: "Cancel, keep the session running",
                            actButton: "End session", actSpoken: "End session \(owner.title)")
@@ -2597,8 +2625,10 @@ struct ContentView: View {
     }
 
     private func degradedBanner(_ reason: String?) -> some View {
-        let detail = "libproc is unavailable" + (reason.map { " (\($0))" } ?? "")
-            + ", so memory comes from top and stop actions are off."
+        // The producer's reason may already name libproc; say it only once.
+        let cause = reason.map { $0.localizedCaseInsensitiveContains("libproc") ? $0 : "libproc is unavailable (\($0))" }
+            ?? "libproc is unavailable"
+        let detail = cause + ", so memory comes from top and stop actions are off."
         return HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle").foregroundColor(P.amber).padding(.top, 1)
                 .accessibilityHidden(true)
@@ -3181,7 +3211,12 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
                             state: InstanceState(rawValue: str($0["state"]) ?? "") ?? .running)
         }
         let forced = app["forced"] as? Bool ?? false
-        m.applyApp(.done(states), m.confirm!, t, forced: forced)
+        if let refused = app["refused"], JSONSerialization.isValidJSONObject(refused),
+           let o = ActOutcome.decode((try? JSONSerialization.data(withJSONObject: refused)) ?? Data()) {
+            m.applyApp(.refused(o), m.confirm!, t, forced: forced)
+        } else {
+            m.applyApp(.done(states), m.confirm!, t, forced: forced)
+        }
     } else {
         var r = CLIResult(exit: int(out["exit"]).map { Int32($0) }, stdout: Data())
         r.timedOut = out["timed_out"] as? Bool ?? false

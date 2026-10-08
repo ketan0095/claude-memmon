@@ -1,0 +1,14 @@
+{
+ "app": {
+  "refused": {
+   "result": "refused",
+   "reason": "hosts_sessions",
+   "exited": 0,
+   "remaining": [],
+   "kept": [],
+   "used_bytes_before": null,
+   "used_bytes_after": null,
+   "measured_at": null
+  }
+ }
+}

@@ -1,0 +1,15 @@
+{
+ "exit": 0,
+ "stdout": {
+  "result": "stopped",
+  "reason": null,
+  "exited": 9,
+  "captured": 9,
+  "remaining": [],
+  "kept": [],
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 39835821670,
+  "measured_at": 1791450000.0,
+  "watch_error": "OSError: synthetic read failure"
+ }
+}
