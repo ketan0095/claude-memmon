@@ -382,16 +382,43 @@ def _read_row(path: str) -> dict | None:
 RATE_FIELDS = ("swapin_mbs", "swapout_mbs", "swap_growth_mbmin")
 
 
-def _seed_from_files(now: float, boot: str | None) -> None:
+def _legacy_baseline(row: dict, vm: dict, now: float) -> float | None:
+    """The mono-equivalent time of a v1 latest.json row (no mono, no boot),
+    which is what the installed sampler writes until the first S2 run. It is
+    aged by wall ts as v1 did, 2-300 s. Without a boot id, counters that went
+    backwards against this read mean a reboot came in between: refused."""
+    ts = row.get("ts")
+    if not isinstance(ts, (int, float)) or not _has_counters(row) \
+            or row.get("rates") == "unavailable" or not _has_counters(vm):
+        return None
+    age = time.time() - ts
+    if not RATE_MIN_S <= age <= RATE_MAX_S:
+        return None
+    if any(vm[k] < row[k] for k in ("swapins", "swapouts")):
+        return None
+    return now - age
+
+
+def _seed_from_files(now: float, boot: str | None, vm: dict | None = None) -> None:
     """A one-shot reader has no in-process history, so it seeds from the
     sampler: pressure.json first, then latest.json, each only when it is from
     this boot and 2-300 s old by CLOCK_MONOTONIC_RAW. A file younger than 2 s
-    lends its own in-run rates instead, as the 5 s cache."""
+    lends its own in-run rates instead, as the 5 s cache. A v1 latest.json row
+    seeds by its wall age instead (see _legacy_baseline)."""
     global _prev_vm, _free_base, _last_rates
     if boot is None:
         return
     for path in (PRESSURE_FILE, SNAPSHOT):
         row = _read_row(path)
+        if (row and path == SNAPSHOT and "mono" not in row and "boot" not in row
+                and vm is not None):
+            mono = _legacy_baseline(row, vm, now)
+            if mono is not None:
+                streak = row.get("_lh_streak", 0) or 0
+                _prev_vm = {**row, "_mono": mono, "_boot": boot, "_lh_streak": streak}
+                _free_base = {"free_pct": row.get("free_pct"), "mono": mono, "boot": boot}
+                return
+            continue
         if not row or row.get("boot") != boot or not isinstance(
                 row.get("mono"), (int, float)):
             continue
@@ -421,7 +448,7 @@ def pressure(vm: dict) -> dict:
     now = mono_now()
     boot = vm.get("boot")
     if not _prev_vm:
-        _seed_from_files(now, boot)
+        _seed_from_files(now, boot, vm)
     prev = _prev_vm
     same_boot = bool(prev) and boot is not None and prev.get("_boot") == boot
     carried = (prev.get("_lh_streak", 0) or 0) if same_boot else 0

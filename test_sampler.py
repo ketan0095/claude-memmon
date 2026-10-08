@@ -591,6 +591,35 @@ class UnknownReaderTests(unittest.TestCase):
             p = memmon.pressure(dict(self.vm))
         self.assertEqual((p["level"], p["level_reason"]), ("UNKNOWN", "baseline over 300 s old"))
 
+    def legacy_row(self, age, swapins=1000, swapouts=1000):
+        """What the installed v1 sampler writes: wall ts and counters only."""
+        return {"ts": time.time() - age, "free_pct": 40, "swap_used": GB, "load": 1.0,
+                "swapins": swapins, "swapouts": swapouts, "pressure": "HEALTHY",
+                "_lh_streak": 0}
+
+    def test_legacy_latest_row_seeds_by_wall_age(self):
+        # Right after an upgrade only the v1 sampler has written latest.json.
+        self.reset(None)
+        self.st.write(memmon.SNAPSHOT, self.legacy_row(60))
+        p = memmon.pressure({**self.vm, "swapins": 1000 + 60 * 20000,
+                             "swapouts": 1000 + 60 * 5000})
+        self.assertEqual(p["rates_source"], "baseline")
+        self.assertNotEqual(p["level"], "UNKNOWN")
+        self.assertAlmostEqual(p["swapin_mbs"], 20000 * PAGE / 1e6, delta=1.0)
+
+    def test_legacy_latest_row_too_old_does_not_seed(self):
+        self.reset(None)
+        self.st.write(memmon.SNAPSHOT, self.legacy_row(400))
+        p = memmon.pressure({**self.vm, "swapins": 5000, "swapouts": 5000})
+        self.assertEqual(p["level"], "UNKNOWN")
+
+    def test_legacy_latest_row_with_higher_counters_does_not_seed(self):
+        # Counters above this read: a reboot came in between.
+        self.reset(None)
+        self.st.write(memmon.SNAPSHOT, self.legacy_row(60, swapins=9_000_000))
+        p = memmon.pressure({**self.vm, "swapins": 5000, "swapouts": 5000})
+        self.assertEqual(p["level"], "UNKNOWN")
+
     def test_no_baseline_from_defaulted_counters(self):
         # SAMPLER-4: both sampler vm_stat reads failed, so neither file holds
         # real counters. A reader with real since-boot counters must not
