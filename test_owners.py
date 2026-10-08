@@ -954,7 +954,11 @@ class LegacyCompatTests(unittest.TestCase):
         self.assertEqual(set(row), {"ts", "ram_used", "swap_used", "swap_total",
                                     "free_pct", "load", "orphan", "swapins", "swapouts",
                                     "pressure", "_lh_streak", "sessions", "apps",
-                                    "worktrees", "worktree_tags", "overhead"})
+                                    "worktrees", "worktree_tags", "overhead",
+                                    # S2.8's documented row additions (D10 update)
+                                    "mono", "uptime", "boot", "level_reason", "rates",
+                                    "rates_source", "lh_streak", "kernel_level",
+                                    "under_pressure", "pressure_suggestions"})
 
     def test_runway_copy_is_a_trend_to_the_floor(self):
         # P11: the estimate is to the 20 % floor, never "runs out".

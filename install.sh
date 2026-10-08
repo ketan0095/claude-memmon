@@ -81,7 +81,7 @@ PY
   rm -rf "$PLIST" "$BAR_PLIST" "$BIN" "$DEST" "$APP" \
          "$DEST_DIR/memmon_runner.py" "$DEST_DIR/memmon_procs.py" \
          "$DEST_DIR/memmon_owners.py" "$DEST_DIR/memmon_act.py" \
-         "$DEST_DIR/memmon_common.py" \
+         "$DEST_DIR/memmon_common.py" "$DEST_DIR/memmon_pressure.py" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
   exit 0
@@ -108,7 +108,7 @@ mkdir -p "$DEST_DIR" "$BIN_DIR"
 # deleted, and the monitor has to keep working after that.
 # Publish the dependency before the entrypoint, without exposing partial files
 # to an already-running sampler or another CLI invocation during an upgrade.
-for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act; do
+for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure; do
   cp "$SRC_DIR/$mod.py" "$DEST_DIR/.$mod.py.$$"
   mv -f "$DEST_DIR/.$mod.py.$$" "$DEST_DIR/$mod.py"
 done
@@ -127,6 +127,9 @@ chmod +x "$BIN"
 echo "installed: $BIN -> $DEST"
 
 if [[ $WANT_SAMPLER == 1 ]]; then
+  # Standard, with no Nice and no LowPriorityIO: a Background sampler yields to
+  # exactly the contention it exists to observe. launchd.plist(5) still gives
+  # Standard "light resource limits", so this lessens throttling, not removes it.
   mkdir -p "$AGENTS"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -143,9 +146,7 @@ if [[ $WANT_SAMPLER == 1 ]]; then
   </array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
-  <key>Nice</key><integer>10</integer>
-  <key>LowPriorityIO</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardErrorPath</key><string>$DEST_DIR/sampler.err</string>
 </dict>
 </plist>
