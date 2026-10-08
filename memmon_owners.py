@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 
 import memmon_procs
+from memmon_common import spare_is_idle  # noqa: F401  (also used by callers)
 
 HOME = os.path.expanduser("~")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
@@ -62,7 +63,6 @@ CLAUDE_RUNTIME = ("bg-pty-host", "bg-spare", "daemon run", "--chrome-native-host
 VM_PATH = "com.apple.Virtualization.VirtualMachine"
 ROLLOUT_RE = re.compile(r"rollout-[0-9T:-]+-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$")
 LOCK_RE = re.compile(r"thread-writer-locks/([0-9a-f]{8}-[0-9a-f-]{27})\.lock$")
-CLAIM_SOCK_RE = re.compile(r"(\S+\.claim\.sock)")
 EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)'")
 OWN_BUNDLE_IDS = {"dev.memmon.bar"}
 # Apps whose job is running a container VM are shared services (rule 6) that
@@ -138,13 +138,6 @@ def _same_start(record: dict, proc) -> bool:
     recorded = _utc_ctime(record.get("procStart") or "")
     return (recorded is not None and proc is not None and proc.start is not None
             and abs(recorded - proc.start[0]) <= 2)
-
-
-def spare_is_idle(cmd: str) -> bool:
-    """An unclaimed prewarm advertises itself on a .claim.sock; claiming it
-    removes the socket. A claimed spare is a real session and stays one."""
-    m = CLAIM_SOCK_RE.search(cmd)
-    return bool(m) and os.path.exists(m.group(1))
 
 
 def find_claude_roots(inv, ctx: Context) -> dict:
@@ -857,7 +850,13 @@ def _cpu(members, cpu: dict) -> tuple:
     measured = [cpu[p] for p in members if p in cpu]
     if not measured:
         return None, None
-    return sum(measured), round(len(measured) / max(len(members), 1), 3)
+    return sum(measured), coverage(len(measured), len(members))
+
+
+def coverage(seen: int, total: int) -> float:
+    """The measured share, 1.0 only when complete: rounding never makes a
+    partial figure read as whole."""
+    return 1.0 if seen >= total else min(round(seen / total, 3), 0.999)
 
 
 def _titles(owner: Owner, inv, ctx: Context, codex: dict) -> None:
@@ -1223,8 +1222,8 @@ def owners_payload(sample: Sample, ctx: Context, *, history: dict | None = None,
             actions = ["stop-managed-job"]
             token = mint_token({"v": 1, "action": "stop-managed-job",
                                 "owner_id": owner.owner_id, "owner_root": ident(root),
-                                "target": ident(root), "run_id": lease.get("id"),
-                                "snapshot_ts": round(inv.ts, 3)})
+                                "target": ident(root), "target_pgid": root.pgid,
+                                "run_id": lease.get("id"), "snapshot_ts": round(inv.ts, 3)})
         instances = None
         if owner.info.get("bundle"):
             bundle = owner.info["bundle"]

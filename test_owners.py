@@ -10,6 +10,7 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -19,6 +20,8 @@ import memmon
 import memmon_owners as mo
 import memmon_procs as mp
 from testkit import MB, FakeSource, P, TempState, session_file
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 T0 = 1_791_400_000
 
@@ -590,6 +593,8 @@ class PartitionTests(OwnerBase):
         self.assertEqual(part.owner_of[813], "claude:0000dddd")
         rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
         self.assertEqual(rows["job:run-standalone"]["actions"], ["stop-managed-job"])
+        standalone = mo.decode_token(rows["job:run-standalone"]["token"])
+        self.assertEqual(standalone["target_pgid"], 801)       # so root_exited can sweep
         job = rows["claude:0000dddd"]["jobs"][1]
         self.assertTrue(job["managed"])
         self.assertEqual(job["action"], "stop-managed-job")
@@ -690,6 +695,11 @@ class PresentationTests(OwnerBase):
         # A lease whose child_start names another process manages nothing.
         self.ctx.leases = [{"id": "r1", "child_pid": 907, "child_start": [1_700_000_907, 1]}]
         self.assertEqual(mo.unmanaged_heavy(mo.Sample(inv, part, {}, None), self.ctx), 2)
+
+    def test_owner_cpu_coverage_is_whole_only_when_complete(self):
+        self.assertEqual(mo._cpu(list(range(2001)), {p: 0.01 for p in range(2000)})[1], 0.999)
+        self.assertEqual(mo._cpu([1, 2], {1: 0.1, 2: 0.2})[1], 1.0)
+        self.assertEqual(mo._cpu([1, 2], {1: 0.1})[1], 0.5)
 
     def test_heavy_chain_counts_once_across_light_links(self):
         # pnpm -> a light wrapper -> node tsc is one job, and runtime flags
@@ -863,6 +873,26 @@ class HistoryTests(OwnerBase):
 
 
 class LegacyCompatTests(unittest.TestCase):
+    def test_legacy_spare_rule_loads_no_libproc(self):
+        # collect() asks whether a prewarm is idle; that must not import the
+        # owners modules (a libproc probe and self-check per call).
+        code = ("import sys, memmon; memmon.spare_is_idle('claude --bg-spare /x.claim.sock'); "
+                "print(sorted(m for m in sys.modules if m in ('memmon_owners', 'memmon_procs')))")
+        out = subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), "[]", out.stderr)
+        self.assertIs(memmon.spare_is_idle, mo.spare_is_idle)
+
+    def test_install_ships_and_removes_every_module(self):
+        with open(os.path.join(HERE, "install.sh")) as fh:
+            script = fh.read()
+        mods = sorted(f[:-3] for f in os.listdir(HERE)
+                      if f.startswith("memmon_") and f.endswith(".py"))
+        loop = re.search(r"for mod in ([\w ]+); do", script).group(1).split()
+        self.assertEqual(sorted(loop), mods)
+        for m in mods:
+            self.assertIn(f'"$DEST_DIR/{m}.py"', script, m)
+
     LEGACY_KEYS = {"ts", "vm", "pressure", "blocked", "gate", "jobs", "sessions",
                    "idle_sessions", "orphans", "orphan_total", "overhead",
                    "service_owner", "worktrees", "other_heavy", "apps"}

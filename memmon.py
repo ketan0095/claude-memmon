@@ -30,6 +30,8 @@ import time
 # measured ~6ms of its ~85ms budget, and shutil alone pulls in bz2 and lzma.
 from collections import defaultdict
 
+from memmon_common import spare_is_idle
+
 HOME = os.path.expanduser("~")
 JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
 STATE_DIR = os.path.join(HOME, ".claude", "memmon")
@@ -1051,13 +1053,6 @@ def map_pids_to_jobs() -> dict[int, str]:
             if m:
                 mapping[pid] = m.group(1)
     return mapping
-
-
-def spare_is_idle(cmd: str) -> bool:
-    """A prewarm process advertises itself on a .claim.sock; a claimed one is
-    doing real work and is never reclaimable. One rule, in memmon_owners."""
-    import memmon_owners
-    return memmon_owners.spare_is_idle(cmd)
 
 
 def find_transcripts(max_age_h: int = 12) -> dict[str, str]:
@@ -2716,8 +2711,7 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     system = payload["system"]
     system["ncpu"] = os.cpu_count()
     complete = bool(seen) and len(seen) == len(members)
-    system["cpu_coverage"] = (1.0 if complete else min(round(len(seen) / len(members), 3), 0.999)
-                              if seen else None)
+    system["cpu_coverage"] = memmon_owners.coverage(len(seen), len(members)) if seen else None
     system["cpu_cores"] = round(sum(seen), 3) if complete else None
     if not seen:
         system["cpu_reason"] = sample.cpu_reason or "not measured"
