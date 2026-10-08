@@ -2253,16 +2253,26 @@ struct OwnerDetailCard: View {
         return [mem, cpu, growth].joined(separator: " · ")
     }
 
+    /// What a destructive footer action ends. It is not shown as a caption
+    /// next to the button: it goes into the button's label and tooltip, and
+    /// the confirm states it again.
+    private var footScope: String? {
+        if degraded { return nil }
+        if owner.can("end-session") { return "stops the conversation and all its processes" }
+        if owner.can("quit-app") {
+            if owner.kind == "service" { return "quits the VM and stops all its containers" }
+            return "quits its " + plural(owner.instances?.count ?? 1, "instance")
+        }
+        if owner.can("stop-managed-job") { return "stops the job and its memmon run wrapper" }
+        return nil
+    }
+
+    /// A caption only where the footer offers no destructive action.
     private var footText: String? {
-        if owner.can("end-session") { return "Conversation + all its processes" }
+        if footScope != nil { return nil }
         if !owner.hosts.isEmpty {
             return "Hosts \(plural(owner.hosts.count, "session")) — quit it from the app itself"
         }
-        if owner.can("quit-app") {
-            if owner.kind == "service" { return "The VM and all its containers" }
-            return plural(owner.instances?.count ?? 1, "instance")
-        }
-        if owner.can("stop-managed-job") { return "The job and its runner" }
         if owner.stopCommand != nil { return "No app to quit" }
         if owner.kind == "codex-app" { return "Shared by its threads — stop it from Codex" }
         if owner.kind == "service" { return "Shared — stop it from the app that owns it" }
@@ -2325,10 +2335,12 @@ struct OwnerDetailCard: View {
             }
             .padding(.horizontal, 13).padding(.bottom, 10)
 
-            if let footText {
+            if footText != nil || footScope != nil {
                 HStack(spacing: 10) {
-                    Text(footText).font(ft(12)).foregroundColor(P.muted)
-                        .fixedSize(horizontal: false, vertical: true)
+                    if let footText {
+                        Text(footText).font(ft(12)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Spacer(minLength: 4)
                     footButton
                 }
@@ -2352,18 +2364,21 @@ struct OwnerDetailCard: View {
         if degraded {
             EmptyView()
         } else if owner.can("end-session") {
-            ActionButton(title: "End session…", variant: .link) { onAsk(.endSession) }
-                .accessibilityLabel("End session \(owner.title) (asks to confirm)")
+            ActionButton(title: "End session…", variant: .secondaryDanger) { onAsk(.endSession) }
+                .help("End session: " + (footScope ?? ""))
+                .accessibilityLabel("End session \(owner.title): \(footScope ?? "") (asks to confirm)")
         } else if owner.can("quit-app") {
-            ActionButton(title: "Quit app…", variant: .link) { onAsk(.quitApp) }
-                .accessibilityLabel("Quit \(owner.title) (asks to confirm)")
+            ActionButton(title: "Quit app…", variant: .secondaryDanger) { onAsk(.quitApp) }
+                .help("Quit app: " + (footScope ?? ""))
+                .accessibilityLabel("Quit \(owner.title): \(footScope ?? "") (asks to confirm)")
         } else if owner.can("stop-managed-job") {
-            ActionButton(title: "Stop job…", variant: .link) {
+            ActionButton(title: "Stop job…", variant: .secondaryDanger) {
                 onAsk(.job(OwnerJob(id: owner.id, kind: "managed", label: owner.title,
                                     footprint: owner.footprint, memberCount: owner.memberCount,
                                     token: owner.token, action: "stop-managed-job")))
             }
-            .accessibilityLabel("Stop job \(owner.title) (asks to confirm)")
+            .help("Stop job: " + (footScope ?? ""))
+            .accessibilityLabel("Stop job \(owner.title): \(footScope ?? "") (asks to confirm)")
         } else if owner.stopCommand != nil {
             ActionButton(title: "Stop command…", variant: .link) { onAsk(.stopCommand) }
                 .accessibilityLabel("Show the command that stops \(owner.title)")

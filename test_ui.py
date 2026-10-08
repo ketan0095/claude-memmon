@@ -530,7 +530,22 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Typecheck · build, 6.8 GB · 5 processes", found)
         self.assertIn("kept running", found)
         self.assertIn("ownership confidence: exact", found)
-        self.assertIn("End session Checkout refactor (asks to confirm)", found)
+        self.assertIn("End session Checkout refactor: stops the conversation and all its processes "
+                      "(asks to confirm)", found)
+
+    def test_destructive_footer_actions_carry_their_scope_not_a_caption(self):
+        session = [r["label"] or r["value"] for r in a11y("session-detail.json")]
+        self.assertNotIn("Conversation + all its processes", session)
+        service = a11y("quit-service-forced.json")
+        spoken = [r["label"] or r["value"] for r in service]
+        self.assertNotIn("The VM and all its containers", spoken)
+        self.assertIn("Quit Container VM: quits the VM and stops all its containers (asks to confirm)",
+                      labels(service))
+        app = [r["label"] or r["value"] for r in a11y("helpers-only.json")]
+        self.assertNotIn("1 instance", app)
+        # A footer with no destructive action keeps its caption.
+        hosts = [r["label"] or r["value"] for r in a11y("hosts-detail.json")]
+        self.assertIn("Hosts 2 sessions — quit it from the app itself", hosts)
 
     def test_confirm_overlay_is_modal_and_names_both_choices(self):
         rows = a11y("confirm-stop.json")
