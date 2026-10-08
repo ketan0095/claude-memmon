@@ -1214,9 +1214,8 @@ class SignalSiteTests(unittest.TestCase):
         self.assertLess(ma.ACT_BUDGET_S, num("actTimeout"))
         self.assertEqual(ma.TOKEN_TTL_S, num("forceTTL"))
 
-    # Refusals memmon emits that the menu bar has no copy for yet; the ui
-    # lane adds them. Remove an entry once MemmonBar.swift has its case.
-    PENDING_SWIFT_COPY = {"bad_args"}
+    # Refusals memmon emits that the menu bar has no copy for yet.
+    PENDING_SWIFT_COPY = set()
 
     def test_every_refusal_reason_has_menu_bar_copy(self):
         # Every emitter, not only the engine: memmon.py refuses too.
