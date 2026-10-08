@@ -353,3 +353,137 @@ class GuardedEngine(memmon_act.Engine):
             pid = item[0] if isinstance(item, (tuple, list)) else item
             assert pid in self.registry.ids, f"reap target {pid} is not registered"
         return super().reap(targets, still_selected, selector, dry_run)
+
+
+# ------------------------------------------------------- S2 telemetry fakes
+
+GiB = 1 << 30
+PAGE = 16384
+# Instantaneous signals that score each level with no rates needed:
+# swap at 1x RAM is +4 (DANGER), plus kernel headroom 10 % is +3 (CRITICAL).
+LEVELS = {"HEALTHY": {"free_pct": 80, "swap_ratio": 0.0},
+          "WATCH": {"free_pct": 18, "swap_ratio": 0.0},
+          "DANGER": {"free_pct": 80, "swap_ratio": 1.0},
+          "CRITICAL": {"free_pct": 10, "swap_ratio": 1.0}}
+
+
+class FakeTelemetry:
+    """Scripted kernel inputs for memmon_telemetry. Values come from keyword
+    arguments, or from a JSON file re-read on every call so a test can steer
+    worker processes. Keys: level (HEALTHY/WATCH/DANGER/CRITICAL), kernel
+    (1 normal, 2 warning, 4 critical), memsize, used, swapins, swapouts,
+    swapin_rate (pages/s added on every read, against mono), fail
+    ("sysctl"|"vm_stat"), hang (seconds vm_stat sleeps)."""
+
+    def __init__(self, path=None, clock=None, **values):
+        self.path, self.clock = path, clock
+        self.values = values
+        self.reads = 0
+
+    def v(self):
+        if self.path:
+            with open(self.path) as fh:
+                return json.load(fh)
+        return self.values
+
+    def set(self, **kw):
+        if self.path:
+            cur = self.v()
+            cur.update(kw)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(cur, fh)
+            os.replace(tmp, self.path)
+        else:
+            self.values.update(kw)
+
+    def _lvl(self):
+        return LEVELS[self.v().get("level", "HEALTHY")]
+
+    def pressure_level(self):
+        if self.v().get("fail") == "sysctl":
+            import memmon_telemetry
+            raise memmon_telemetry.TelemetryError("injected sysctl failure")
+        return self.v().get("kernel", 1)
+
+    def free_pct(self):
+        return self.v().get("free_pct", self._lvl()["free_pct"])
+
+    def memsize(self):
+        return int(self.v().get("memsize", 48 * GiB))
+
+    def swapusage(self):
+        used = int(self._lvl()["swap_ratio"] * self.memsize())
+        return 64 * GiB, self.v().get("swap_used", used)
+
+    def loadavg(self):
+        return 1.0
+
+    def ncpu(self):
+        return 8
+
+    def vm_stat(self, timeout):
+        import memmon_telemetry
+        v = self.v()
+        self.reads += 1
+        if v.get("hang"):
+            time.sleep(v["hang"])
+        if v.get("fail") == "vm_stat":
+            raise memmon_telemetry.TelemetryError("injected vm_stat failure")
+        used = int(v.get("used", 8 * GiB)) // PAGE
+        swapins = int(v.get("swapins", 1000))
+        if v.get("swapin_rate"):
+            t = (self.clock or memmon_telemetry.SYSTEM_CLOCK).mono()
+            swapins += int(v["swapin_rate"] * t)
+        lines = [f"Mach Virtual Memory Statistics: (page size of {PAGE} bytes)",
+                 f"Anonymous pages: {used}.", "Pages purgeable: 0.",
+                 "Pages wired down: 0.", "Pages occupied by compressor: 0.",
+                 "Pageins: 10.", "Pageouts: 10.",
+                 f"Swapins: {swapins}.", f"Swapouts: {int(v.get('swapouts', 1000))}."]
+        return "\n".join(lines) + "\n"
+
+
+class FakeTelemetryClock(FakeClock):
+    """FakeClock with the telemetry module's clocks. machine_sleep() moves
+    the sleep-counting clocks without the awake ones, as a wake would."""
+
+    def __init__(self, t=1000.0, boot="boot-a"):
+        super().__init__(t)
+        self.asleep = 0.0
+        self.boot_id = boot
+
+    def awake(self):
+        return self.t - self.asleep
+
+    def raw(self):
+        return self.t
+
+    def uptime(self):
+        return self.t - self.asleep
+
+    def wall(self):
+        return 1_700_000_000.0 + self.t
+
+    def boot(self):
+        return self.boot_id
+
+    def machine_sleep(self, s):
+        self.t += s
+        self.asleep += s
+
+
+def seed_admission(state_dir, source, clock=None, age_s=3.0):
+    """A rate baseline age_s old, so the first strict read already has rates.
+    Without it every protect test would wait out the 2 s baseline."""
+    import memmon_telemetry as tm
+    clock = clock or tm.SYSTEM_CLOCK
+    reading = tm.read_pressure_strict(source=source, clock=clock)
+    reading["mono"] -= age_s
+    st = tm.fresh_state(reading["boot"])
+    st["rate_baseline"] = tm._counters(reading)
+    st["free_baseline"] = tm._counters(reading)
+    path = os.path.join(state_dir, "runner", "coord", "admission-state.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(st, fh)
+    return st
