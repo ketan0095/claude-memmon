@@ -815,9 +815,9 @@ time.sleep(120)
 BUILD_FORKS_ON_TERM = NOTE + """
 import os, signal, subprocess, sys, time
 def on_term(*_):
-    subprocess.Popen([sys.executable, "-c",
-        "import os; exec(os.environ['MEMMON_NOTE']); note('gc'); import time; time.sleep(120)",
-        sys.argv[1]])
+    # The parent records the child: the stop may TERM it before it could.
+    gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    note_child("gc", gc.pid)
     time.sleep(0.8)
     os._exit(0)
 signal.signal(signal.SIGTERM, on_term)

@@ -194,16 +194,19 @@ def fake_engine(source, ctx, lock_path, **kw):
 # ------------------------------------------------------- real processes
 
 SLEEP = "import time; time.sleep(120)"
-# Every synthetic process records its own identity, read by itself, so the
-# registry never adopts whatever process happens to hold a PID later. The
-# helper reaches grandchildren through the environment.
+# Every synthetic process records its own identity, read by itself, or its
+# parent records it for a child it just started (lineage to a registered
+# identity), so the registry never adopts whatever process happens to hold a
+# PID later. The helper reaches grandchildren through the environment.
 NOTE_SRC = ("import os, sys\n"
             "sys.path.insert(0, os.environ['MEMMON_TEST_REPO'])\n"
             "import memmon_procs\n"
-            "def note(tag):\n"
-            "    s = memmon_procs.default_source().read(os.getpid()).start\n"
+            "def note_child(tag, pid):\n"
+            "    s = memmon_procs.default_source().read(pid).start\n"
             "    with open(sys.argv[1], 'a') as fh:\n"
-            "        fh.write(f'{tag} {os.getpid()} {s[0]} {s[1]}\\n')\n")
+            "        fh.write(f'{tag} {pid} {s[0]} {s[1]}\\n')\n"
+            "def note(tag):\n"
+            "    note_child(tag, os.getpid())\n")
 NOTE = "import os\nexec(os.environ['MEMMON_NOTE'])\n"
 
 
