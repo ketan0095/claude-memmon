@@ -707,6 +707,14 @@ silently and injects nothing, `--pressure` prints UNKNOWN and exits 0,
 prints `memmon: pressure unknown`. A `memmon run` in `paused` mode treats it as
 WATCH and admits, as before; `protect` reads the strict path only.
 
+**Changed values for v1 parsers.** `level` stays a string, so it still parses,
+but some numbers can now be `null`. In `--json` and the pressure fields,
+`thrash_mbs`, `swapin_mbs`, `swapout_mbs` and `swap_growth_mbmin` are `null`
+when the rates are unavailable, and `free_delta_min` is `null` whenever there
+is no free-percentage baseline at least 30 s old. v1 always wrote numbers
+there, with 0.0 meaning "no baseline". A `latest.json` row also has
+`swapins`/`swapouts` as `null` when vm_stat could not be read, rather than 0.
+
 ### Sampling gaps
 
 On a starved machine the sampler may not get scheduled at all. Each row records

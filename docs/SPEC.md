@@ -72,6 +72,10 @@ S2 also changes these legacy values (D10): the pressure level may be the string
 inside each run; the low-headroom streak and the runway need a free_pct
 baseline at least 30 s old; one-shot readers seed from `pressure.json`, then
 `latest.json`, each 2–300 s old by CLOCK_MONOTONIC_RAW and from the same boot;
+the rate fields `thrash_mbs`, `swapin_mbs`, `swapout_mbs` and
+`swap_growth_mbmin` are `null` when rates are unavailable, and `free_delta_min`
+is `null` without a 30 s free baseline (v1 always wrote numbers); a row's
+`swapins`/`swapouts` are `null` when vm_stat was not read;
 `--pressure` exits 0 on UNKNOWN; the status line can print `memmon: pressure
 unknown` or `memmon: no sample for N min`; rows gain `mono`, `uptime`, `boot`
 and optional `gap` and `partial`; `latest.json` and `pressure.json` are
