@@ -703,6 +703,13 @@ class RefreshAndTitleTests(StubCase):
         self.assertEqual(count.read_text(), "2")
         self.assertTrue((self.dir / "count.finished").exists())
 
+    def test_memmon_that_cannot_start_never_wedges_refresh(self):
+        r = run_json("--selftest-refresh", "--script", str(self.dir / "absent.py"),
+                     "--python", str(self.dir / "no-such-python"), timeout=30)
+        self.assertIn("could not start memmon", r["first"]["error"])
+        self.assertEqual(r["second"]["scans"], 2)
+        self.assertFalse(r["second"]["refreshing"])
+
     def title(self, payload, now):
         path = self.dir / "latest.json"
         path.write_text(json.dumps(payload))

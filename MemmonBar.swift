@@ -575,12 +575,14 @@ enum CLI {
     ///
     /// A call that outlives its timeout is never signalled: the caller gets a
     /// timeout at once and the child is reaped on a background thread whenever
-    /// it ends. `onExit` runs once the child is reaped, either way, so a
-    /// caller can avoid starting another while one is still running.
+    /// it ends. `onExit` runs exactly once on every path (reaped, timed out
+    /// and later reaped, or never started), so a caller can avoid starting
+    /// another while one is still running without ever wedging.
     static func run(_ args: [String], timeout: Double, inheritFD: Int32? = nil,
                     onExit: (() -> Void)? = nil) -> CLIResult {
         var fds: [Int32] = [0, 0]
         guard pipe(&fds) == 0 else {
+            onExit?()
             return CLIResult(exit: nil, stdout: Data(), launchError: "could not create a pipe")
         }
         var actions: posix_spawn_file_actions_t?
@@ -602,6 +604,7 @@ enum CLI {
         close(fds[1])
         guard rc == 0 else {
             close(fds[0])
+            onExit?()
             return CLIResult(exit: nil, stdout: Data(),
                              launchError: "could not start memmon (\(String(cString: strerror(rc))))")
         }
@@ -3638,6 +3641,21 @@ final class RefreshSelftest: NSObject, NSApplicationDelegate {
         CLI.ownersTimeout = argValue("--timeout").flatMap(Double.init) ?? 0.3
         let m = Model()
         var report: [String: Any] = [:]
+        if let python = argValue("--python") {
+            // memmon cannot be started at all: every refresh must still run.
+            CLI.python = python
+            m.refresh()
+            spin(0.5)
+            report["first"] = ["error": m.loadError ?? NSNull(), "scans": m.scansStarted,
+                               "refreshing": m.refreshing] as [String: Any]
+            m.refresh()
+            spin(0.5)
+            report["second"] = ["error": m.loadError ?? NSNull(), "scans": m.scansStarted,
+                                "refreshing": m.refreshing] as [String: Any]
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
         m.refresh()
         spin(0.8)
         report["after_timeout"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling,
