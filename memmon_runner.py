@@ -50,6 +50,7 @@ PRESSURE_TICKS = 2
 FAILED_TICKS = 3
 AUTO_CANCEL_TICKS = 5        # CRITICAL for 10 s at one tick per 2 s
 POLICY_GRACE_S = 10.0
+PEAK_WAIT_S = 10.0           # finish waits this long for ledger.lock to save a peak
 PEAKS_KEEP = 10
 PEAKS_KEYS = 200
 LOG_TRIM_AT = 1 << 20
@@ -760,11 +761,13 @@ class Runner:
         except LedgerTimeout:
             return self.timed_out(124)
         next_report = 0
+        attempted = False           # --timeout 0 still gets one attempt, as in v1
         while True:
             if self.cancelled[0]:
                 return 128 + self.cancelled[0]
-            if clock.mono() >= self.deadline:
+            if attempted and clock.mono() >= self.deadline:
                 return self.timed_out(125 if self.hold_cause == "telemetry" else 124)
+            attempted = True
             wait = 2 * self.poll
             try:
                 with ledger(self.paths, clock, self.deadline, self.cancelled):
@@ -938,8 +941,15 @@ class Runner:
 
     def policy_cancel(self):
         """I-4 exception (b): S1's engine on our own child, per PID, with a
-        grace period and per-PID SIGKILL of observed survivors only."""
-        out = None
+        grace period and per-PID SIGKILL of observed survivors only.
+
+        The outcome follows the child, which is ours and unreaped, not the
+        engine's result: a child that exits on its own keeps its exit code,
+        and one that dies after our SIGTERM was cancelled by policy even when
+        the engine still reports other members of its group."""
+        if self.child.poll() is not None:
+            return None
+        out, eng = None, None
         try:
             factory = self.engine_factory or _default_engine
             eng, token = factory(self, self.policy_grace_s)
@@ -951,7 +961,16 @@ class Runner:
                     out = eng.run("force", out["force_token"])
         except Exception as exc:
             out = {"result": "error", "reason": f"{type(exc).__name__}: {exc}"}
-        if out.get("result") in ("stopped", "force_stopped", "already_exited"):
+        signalled = any(pid == self.child.pid and sig == signal.SIGTERM
+                        for pid, sig in (getattr(eng, "sent", None) or []))
+        if signalled and self.child.poll() is None:
+            try:
+                self.child.wait(timeout=1.0)        # it may still be exiting
+            except subprocess.TimeoutExpired:
+                pass
+        if self.child.poll() is not None:
+            if not signalled:
+                return None
             self.row["ended_by"] = "policy"
             self.set_state("cancelled_by_policy", "cancelled by policy: CRITICAL for 10 s")
             return "cancelled"
@@ -965,6 +984,20 @@ class Runner:
 
     # ----------------------------------------------------------- finish
 
+    def save_peak(self, wait_s=PEAK_WAIT_S) -> bool:
+        """Record this run's peak, waiting out a slow critical section (about
+        2.1 s worst case) and a few waiters behind it. A sample that still
+        cannot be written is logged, never silently lost."""
+        try:
+            with ledger(self.paths, self.clock, self.clock.mono() + wait_s):
+                record_peak(self.paths, self.key, self.peak, self.clock.wall())
+            return True
+        except Exception as exc:
+            _log(self.paths, {"ts": round(time.time(), 3), "run_id": self.run_id,
+                              "decision": "peak_dropped", "job_key": self.key,
+                              "peak": self.peak, "reason": type(exc).__name__})
+            return False
+
     def finish(self, handlers):
         # An exception in status bookkeeping must not abandon a running job.
         if self.child is not None and self.child.poll() is None:
@@ -975,11 +1008,7 @@ class Runner:
             # if the child still owns it after an uncatchable SIGKILL.
             self.resource_file.close()
         if self.peak and getattr(self, "mode", None) == "protect":
-            try:
-                with ledger(self.paths, self.clock, self.clock.mono() + 2.0):
-                    record_peak(self.paths, self.key, self.peak, self.clock.wall())
-            except Exception:
-                pass
+            self.save_peak()
         self.lease.close()
         # The flock probe is the only release test: a grandchild that inherited
         # the lease keeps the job's reservation alive after the child exits.

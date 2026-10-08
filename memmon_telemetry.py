@@ -10,7 +10,9 @@ Clocks, all injectable through Clock:
   mono    CLOCK_MONOTONIC. On macOS it keeps counting while asleep, so a
           deadline measured on it is wall time. Deadlines, freshness and
           hysteresis use it.
-  awake   time.monotonic (mach_absolute_time), which stops while asleep. A
+  awake   CLOCK_UPTIME_RAW, which stops while asleep and, unlike
+          time.monotonic on this interpreter, counts from boot in every
+          process. A
           wake shows up as mono advancing more than WAKE_S beyond it.
   raw     CLOCK_MONOTONIC_RAW and uptime CLOCK_UPTIME_RAW: the sampler's gap
           record, where raw - uptime is the time asleep.
@@ -95,7 +97,9 @@ class Clock:
         return time.clock_gettime(time.CLOCK_MONOTONIC)
 
     def awake(self) -> float:
-        return time.monotonic()
+        # Not time.monotonic: on /usr/bin/python3 it starts at each process's
+        # own start, so a pair another runner stored would read as a wake.
+        return time.clock_gettime(time.CLOCK_UPTIME_RAW)
 
     def raw(self) -> float:
         return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
@@ -417,8 +421,9 @@ def fresh_state(boot: str | None) -> dict:
 
 
 def note_clocks(state: dict, now_mono: float, now_awake: float) -> dict:
-    """Detect a wake from the shared (mono, awake) pair. Both clocks are
-    system-wide, so a pair one process stored is comparable in another."""
+    """Detect a wake from the shared (mono, awake) pair. Both clocks count
+    from boot for every process (CLOCK_MONOTONIC and CLOCK_UPTIME_RAW), so a
+    pair one runner stored is comparable in another."""
     pair = state.get("clock_pair")
     if pair and (now_mono - pair[0]) - (now_awake - pair[1]) > WAKE_S:
         state["last_wake_mono"] = now_mono

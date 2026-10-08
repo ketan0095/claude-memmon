@@ -909,6 +909,122 @@ class RealAdmissionTests(Base):
         self.finish(proc)
 
 
+class OmegaR1LedgerTests(Base):
+    def test_awake_clock_is_shared_across_processes(self):
+        """LEDGER-1: a (mono, awake) pair stored by one runner must read as
+        no time asleep in another process started much later."""
+        here = tm.SYSTEM_CLOCK.mono() - tm.SYSTEM_CLOCK.awake()
+        time.sleep(1.5)                       # the other process starts later
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import memmon_telemetry as t; "
+                "print(t.SYSTEM_CLOCK.mono() - t.SYSTEM_CLOCK.awake())")
+        out = subprocess.run([sys.executable, "-c", code, HERE], capture_output=True,
+                             text=True, check=True).stdout
+        self.assertLess(abs(float(out) - here), 0.5)
+
+    def test_runners_started_apart_record_no_wake(self):
+        """LEDGER-1, real clocks: B starts 6 s after A; A's ticks must not
+        read as a wake to B, and B is admitted."""
+        self.seed()
+        a = self.launch(SLEEP, [12], resource="a")
+        self.wait_for(self.running, what="A running")
+        time.sleep(6.0)
+        b = self.launch("print('b ran')", resource="b", timeout=4)
+        out, _ = self.finish(b, timeout=20)
+        self.assertEqual(out, "b ran\n")
+        st = json.loads((self.root / "runner/coord/admission-state.json").read_text())
+        self.assertIsNone(st.get("last_wake_mono"))
+        rows = [j for j in runner.jobs(self.root) if j["resource"] == "a"]
+        self.assertEqual(rows[0]["state"], "running", "A must not be flagged")
+        a.terminate()
+        a.communicate(timeout=10)
+
+    def own_child(self, argv):
+        """A Runner whose child is a synthetic process this test spawned."""
+        import memmon_procs
+        r = runner.Runner(["true"], str(self.root), None, err=io.StringIO(),
+                          policy_grace_s=0.5,
+                          engine_factory=_guarded_factory(str(self.root / "sent.jsonl")))
+        r.run_id = uuid.uuid4().hex
+        r.paths.make()
+        r.record = r.paths.root / (r.run_id + ".json")
+        r.child = subprocess.Popen(argv, start_new_session=True)
+        self.reg.register(r.child.pid)
+        start = list(memmon_procs.default_source().read(r.child.pid).start)
+        r.row = {"id": r.run_id, "label": "acme-web tests", "state": "running",
+                 "reason": "command running", "wrapper_pid": os.getpid(),
+                 "child_pid": r.child.pid, "child_start": start,
+                 "child": {"pid": r.child.pid, "start": start}, "ended_by": None}
+        r.monitor = {"bad": 0, "failed": 0, "critical": 5, "clear_since": None}
+        return r
+
+    def test_policy_cancel_follows_child_despite_group_survivor(self):
+        """LEDGER-2 (a): an orphan left in the child's group makes the engine
+        report partial; the child we TERMed is gone, so it is a policy cancel."""
+        import memmon_procs
+        r = self.own_child(["/bin/sh", "-c", "(/bin/sleep 3 &) ; exec /bin/sleep 30"])
+        src = memmon_procs.default_source()
+        time.sleep(0.3)
+        for p in src.scan().values():
+            if p.pgid == r.child.pid and p.pid != r.child.pid and p.start:
+                self.reg.register(p.pid, p.start)
+        self.assertEqual(r.policy_cancel(), "cancelled")
+        self.assertEqual((r.row["ended_by"], r.row["state"]), ("policy", "cancelled_by_policy"))
+        self.assertEqual(r.child.returncode, -signal.SIGTERM)
+        self.assertNotIn("keeps running", r.err.getvalue())
+
+    def test_child_exiting_on_its_own_keeps_its_code(self):
+        """LEDGER-2 (b): the child exits while the engine waits; no signal
+        was ours, so its own exit code passes through."""
+        base = _guarded_factory(str(self.root / "sent.jsonl"))
+
+        def slow_factory(run, grace):
+            eng, token = base(run, grace)
+            time.sleep(0.8)                  # an actions.lock wait, say
+            return eng, token
+        r = self.own_child(["/bin/sleep", "0.3"])
+        r.engine_factory = slow_factory
+        self.assertIsNone(r.policy_cancel())
+        self.assertIsNone(r.row["ended_by"])
+        self.assertEqual(r.child.returncode, 0)
+        r2 = self.own_child(["/bin/sleep", "0.01"])
+        r2.child.wait()
+        calls = []
+        r2.engine_factory = lambda run, grace: calls.append(run) or (None, None)
+        self.assertIsNone(r2.policy_cancel())
+        self.assertEqual(calls, [], "no engine for a child that already exited")
+        self.assertNotIn("keeps running", r2.err.getvalue())
+
+    def test_timeout_zero_still_attempts_once(self):
+        """LEDGER-3."""
+        clock = FakeTelemetryClock(t=23000.0)
+        fake = FakeTelemetry(memsize=48 * GiB, used=8 * GiB)
+        testkit.seed_admission(str(self.root), fake, clock=clock)
+        code = runner.Runner(["/usr/bin/true"], str(self.root), None, timeout=0, clock=clock,
+                             hysteresis_s=0, source=testkit.FakeSource([]), err=io.StringIO(),
+                             telemetry_read=lambda: tm.read_pressure_strict(source=fake, clock=clock)
+                             ).run()
+        self.assertEqual(code, 0)
+
+    def test_peak_waits_out_a_busy_ledger_and_logs_a_drop(self):
+        """LEDGER-4."""
+        import threading
+        r = runner.Runner(["true"], str(self.root), None, err=io.StringIO())
+        r.run_id, r.key, r.peak = uuid.uuid4().hex, "acme-web-key", 3 * GiB
+        r.paths.make()
+        fh = open(r.paths.ledger, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        threading.Timer(2.5, fh.close).start()      # longer than the old 2 s wait
+        self.assertTrue(r.save_peak())
+        self.assertEqual(runner.load_peaks(r.paths)["keys"]["acme-web-key"]["peaks"], [3 * GiB])
+        fh = open(r.paths.ledger, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            self.assertFalse(r.save_peak(wait_s=0.3))
+        finally:
+            fh.close()
+        self.assertEqual(self.log()[-1]["decision"], "peak_dropped")
+
+
 class OverheadTests(Base):
     def test_tick_cost(self):
         """B22: one monitoring tick with real telemetry and a real scan."""
