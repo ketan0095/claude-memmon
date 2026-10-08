@@ -3514,6 +3514,26 @@ final class KeyableWindow: NSWindow {
 /// offscreen window and drives it: sizes, keyboard focus, Esc and Return, and
 /// the freshness ticker. The window is never ordered on screen and the app
 /// never activates, so nothing takes focus from the user.
+/// The end of a self-test window's responder chain. A key nothing handles
+/// (Return in a confirm, which has no default button) reaches here instead of
+/// NSWindow's noResponder(for:), which plays the alert sound on every run.
+/// Self-test windows only: the app itself keeps the standard beep.
+final class QuietKeys: NSResponder {
+    static let shared = QuietKeys()
+    override func keyDown(with event: NSEvent) {}
+    override func noResponder(for eventSelector: Selector) {}
+
+    /// Appends the sink to the end of `w`'s responder chain, once.
+    static func silence(_ w: NSWindow) {
+        var r: NSResponder = w
+        while let n = r.nextResponder {
+            if n === shared { return }
+            r = n
+        }
+        r.nextResponder = shared
+    }
+}
+
 final class HostSelftest: NSObject, NSApplicationDelegate {
     let check: String
     var window: NSWindow?
@@ -3523,6 +3543,7 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
     func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
 
     func key(_ chars: String, _ code: UInt16, in w: NSWindow) {
+        QuietKeys.silence(w)
         guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                                        windowNumber: w.windowNumber, context: nil, characters: chars,
                                        charactersIgnoringModifiers: chars, isARepeat: false,
@@ -3584,6 +3605,7 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 // Tab and shift-Tab must cycle inside the overlay; a nil focus
                 // would mean it went to the dimmed list behind it.
                 var trail: [Any] = []
+                QuietKeys.silence(w)
                 for shift in [false, false, false, true, true] {
                     guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero,
                                                    modifierFlags: shift ? [.shift] : [], timestamp: 0,
