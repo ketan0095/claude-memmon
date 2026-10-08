@@ -69,7 +69,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   },
   {
    "owner_id": "job:run-fixture-1",
@@ -106,7 +107,8 @@
    "stop_command": null,
    "used_by": null,
    "hosts": [],
-   "hosts_shells": false
+   "hosts_shells": false,
+   "category": "job"
   },
   {
    "owner_id": "service:vm:docker-desktop",
@@ -158,7 +160,8 @@
     "Checkout refactor",
     "Billing API tests"
    ],
-   "stop_command": null
+   "stop_command": null,
+   "category": "service"
   },
   {
    "owner_id": "app:com.example.browser",
@@ -193,7 +196,8 @@
      "pid": 6390,
      "launch_date": 1791446000.0
     }
-   ]
+   ],
+   "category": "app"
   },
   {
    "owner_id": "codex-app:7001.1791440000",
@@ -222,7 +226,8 @@
     "Billing API tests",
     "Search tuning",
     "Docs pass"
-   ]
+   ],
+   "category": "service"
   },
   {
    "owner_id": "codex:fixture-b",
@@ -272,7 +277,8 @@
    ],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "codex"
   },
   {
    "owner_id": "unknown:9101.1791400000",
@@ -296,7 +302,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   },
   {
    "owner_id": "unknown:9188.1791400000",
@@ -320,7 +327,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   },
   {
    "owner_id": "unknown:9240.1791400000",
@@ -344,7 +352,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   },
   {
    "owner_id": "claude:fixture-c",
@@ -371,7 +380,8 @@
    "jobs": [],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "claude"
   }
  ],
  "_view": {

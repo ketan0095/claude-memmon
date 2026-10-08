@@ -73,7 +73,8 @@
    ],
    "instances": null,
    "shared_with": null,
-   "cpu_reason": "not measured"
+   "cpu_reason": "not measured",
+   "category": "claude"
   },
   {
    "owner_id": "service:vm:docker-desktop",
@@ -127,7 +128,8 @@
    ],
    "stop_command": null,
    "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   "growth_reason": "not enough history",
+   "category": "service"
   },
   {
    "owner_id": "app:com.example.browser",
@@ -164,7 +166,8 @@
     }
    ],
    "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   "growth_reason": "not enough history",
+   "category": "app"
   },
   {
    "owner_id": "codex:fixture-b",
@@ -214,7 +217,8 @@
    ],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "codex"
   },
   {
    "owner_id": "claude:fixture-c",
@@ -243,7 +247,8 @@
     "end-session"
    ],
    "cpu_reason": "not measured",
-   "growth_reason": "not enough history"
+   "growth_reason": "not enough history",
+   "category": "claude"
   }
  ],
  "_view": {

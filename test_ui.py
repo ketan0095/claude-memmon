@@ -693,14 +693,12 @@ class AccessibilityTests(unittest.TestCase):
         self.assertGreater(r["act_timeout"], memmon_act.ACT_BUDGET_S)
         self.assertLessEqual(r["force_ttl"], memmon_owners.TOKEN_TTL_S)
 
-    def test_line_two_wraps_to_at_most_two_lines(self):
+    def test_rows_stay_one_line_and_the_label_keeps_everything(self):
         rows = a11y("long-activity.json")
         short = next(r for r in rows if r["label"].startswith("Checkout refactor,"))
         long = next(r for r in rows if r["label"].startswith("Long activity,"))
         self.assertIn("very long label " * 6, long["label"])
-        grew = float(long["height"]) - float(short["height"])
-        self.assertGreater(grew, 8)
-        self.assertLess(grew, 24)
+        self.assertLessEqual(abs(float(long["height"]) - float(short["height"])), 1)
 
     def test_pending_retries_listed_in_the_gate_section(self):
         found = labels(a11y("overview.json"))
@@ -757,6 +755,127 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Instance 1 · quit", text)
         self.assertIn("Instance 2 · still running", text)
         self.assertIn("Force quit the 1 remaining instance", labels(rows))
+
+
+def effective(fixture):
+    """A fixture with its _base chain applied, as the binary loads it."""
+    d = json.loads(Path(fixture).read_text())
+    if "_base" in d:
+        base = effective(Path(fixture).parent / d["_base"])
+        base.update({k: v for k, v in d.items() if k not in ("_base", "_view")})
+        return base
+    return {k: v for k, v in d.items() if k != "_view"}
+
+
+class SectionTests(unittest.TestCase):
+    """Owners grouped by memmon's category into collapsible sections."""
+
+    ORDER = ["claude", "codex", "job", "browser", "dev", "app", "service", "background"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def probe(self, fixture="sections.json", payload=None, view=None):
+        if payload is not None:
+            path = Path(self.tmp.name) / "payload.json"
+            path.write_text(json.dumps(dict(payload, _view=view or {})))
+            fixture = path
+        else:
+            fixture = FIXTURES / fixture
+        return run_json("--sections-probe", "--fixture", str(fixture))
+
+    def by_section(self, r):
+        return {s["section"]: s for s in r["sections"]}
+
+    def test_sections_follow_category_in_a_fixed_order(self):
+        r = self.probe()
+        self.assertEqual([s["section"] for s in r["sections"]], self.ORDER)
+        sec = self.by_section(r)
+        self.assertEqual([s["title"] for s in r["sections"]],
+                         ["Claude sessions", "Codex", "Managed jobs", "Browsers", "Terminals & editors",
+                          "Mac apps", "Shared services", "Background"])
+        self.assertIn("app:com.example.browser", sec["browser"]["owners"])
+        self.assertIn("app:com.example.editor", sec["dev"]["owners"])
+        self.assertIn("job:run-fixture-1", sec["job"]["owners"])
+        self.assertIn("codex-app:7001.1791440000", sec["service"]["owners"])
+        self.assertIn("unknown:*", sec["background"]["owners"])
+        # A terminal hosting a session is never background, however small.
+        self.assertIn("app:com.example.terminal", sec["dev"]["owners"])
+
+    def test_kind_decides_the_section_when_category_is_missing(self):
+        payload = effective(FIXTURES / "sections.json")
+        for o in payload["owners"]:
+            o.pop("category", None)
+        sec = self.by_section(self.probe(payload=payload))
+        self.assertIn("claude:fixture-a", sec["claude"]["owners"])
+        self.assertIn("codex:fixture-b", sec["codex"]["owners"])
+        self.assertIn("job:run-fixture-1", sec["job"]["owners"])
+        self.assertIn("app:com.example.browser", sec["app"]["owners"])     # no category: an app
+        self.assertIn("codex-app:7001.1791440000", sec["service"]["owners"])
+        self.assertNotIn("browser", sec)
+        self.assertNotIn("dev", sec)
+
+    def small(self, **change):
+        payload = effective(FIXTURES / "small.json")
+        helper = {"owner_id": "app:com.example.probe", "kind": "app", "agent": "app", "title": "Probe Helper",
+                  "category": "app", "footprint_bytes": 50 * 1024 ** 2, "member_count": 1, "actions": [],
+                  "token": None, "hosts": [], "jobs": [], "confidence": "exact"}
+        helper.update(change)
+        payload["owners"] = payload["owners"] + [helper]
+        return self.probe(payload=payload)["small"]["app:com.example.probe"]
+
+    def test_small_needs_every_condition(self):
+        self.assertTrue(self.small())
+        self.assertTrue(self.small(category="service"))
+        self.assertTrue(self.small(actions=["quit-app"]))                     # offered, but no token
+        self.assertFalse(self.small(category="claude"))
+        self.assertFalse(self.small(actions=["quit-app"], token="tok"))      # an action is available
+        self.assertFalse(self.small(hosts=["claude:fixture-c"]))
+        self.assertFalse(self.small(footprint_bytes=100 * 1024 ** 2))         # not under 100 MiB
+        self.assertFalse(self.small(footprint_bytes=None))                    # unknown is never small
+
+    def test_only_agent_sections_start_open(self):
+        sec = self.by_section(self.probe())
+        self.assertEqual({k for k, v in sec.items() if v["open"]}, {"claude", "codex"})
+
+    def test_an_open_section_shows_six_rows_then_show_more(self):
+        sec = self.by_section(self.probe("sections-open.json"))
+        self.assertEqual((len(sec["app"]["shown"]), sec["app"]["hidden"]), (6, 2))
+        self.assertEqual(sec["app"]["shown"], sec["app"]["owners"][:6])
+        found = labels(a11y("sections-open.json"))
+        self.assertIn("Show 2 more in Mac apps", found)
+        everything = self.by_section(self.probe("sections-background.json"))["background"]
+        self.assertEqual((everything["hidden"], everything["shown"]), (0, everything["owners"]))
+
+    def test_a_held_owner_opens_its_section_and_is_never_hidden(self):
+        payload = effective(FIXTURES / "sections.json")
+        widget = self.by_section(self.probe(payload=payload, view={"select": "app:com.example.widgets"}))
+        self.assertTrue(widget["background"]["open"])
+        self.assertIn("app:com.example.widgets", widget["background"]["shown"])
+        last = self.by_section(self.probe(payload=payload))["app"]["owners"][-1]
+        app = self.by_section(self.probe(payload=payload, view={"select": last}))["app"]
+        self.assertTrue(app["open"])
+        self.assertEqual(app["hidden"], 0)
+
+    def test_header_total_is_the_sum_of_known_footprints(self):
+        payload = effective(FIXTURES / "sections.json")
+        fp = {o["owner_id"]: o.get("footprint_bytes") for o in payload["owners"]}
+        unknown = sum(v or 0 for k, v in fp.items() if k.startswith("unknown:"))
+        for s in self.probe()["sections"]:
+            want = sum(unknown if oid == "unknown:*" else (fp[oid] or 0) for oid in s["owners"])
+            self.assertAlmostEqual(s["total"], want, delta=1, msg=s["section"])
+
+    def test_headers_and_rows_say_everything_the_old_rows_did(self):
+        found = labels(a11y("sections-open.json"))
+        self.assertIn("Mac apps, 8 owners, 6.4 GB, expanded", found)
+        self.assertIn("Browsers, 2 owners, 5.9 GB, collapsed", found)
+        self.assertIn("Background, 9 small owners and 6 unattributed processes, 2.1 GB, expanded", found)
+        row = next(l for l in found if l.startswith("Checkout refactor,"))
+        self.assertEqual(row, "Checkout refactor, Claude · Building · typecheck, acme-web · checkout worktree, "
+                              "ownership confidence: exact, 8.9 GB, 3.1 cores")
+        helper = next(l for l in found if l.startswith("Example Widgets,"))
+        self.assertIn("ownership confidence: exact", helper)
 
 
 class HostedPopoverTests(unittest.TestCase):
@@ -1021,7 +1140,7 @@ class GeneratorContractTests(unittest.TestCase):
         return path, payload, session
 
     def test_generated_payload_decodes_renders_and_reads(self):
-        path, payload, session = self.generated({})
+        path, payload, session = self.generated({"sections": ["background"]})
         self.assertEqual(session["jobs"][0]["kind"], "conversation")
         png = Path(self.out.name) / "generated.png"
         line = run_bin("--render", str(png), "--fixture", str(path), "--dark")

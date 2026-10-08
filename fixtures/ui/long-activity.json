@@ -60,7 +60,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   },
   {
    "owner_id": "claude:fixture-long",
@@ -121,7 +122,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   }
  ],
  "system": {

@@ -27,7 +27,8 @@
    "actions": [
     "end-session"
    ],
-   "cpu_reason": "warming up"
+   "cpu_reason": "warming up",
+   "category": "claude"
   }
  ],
  "protection": {

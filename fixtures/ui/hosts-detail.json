@@ -60,7 +60,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   },
   {
    "owner_id": "app:com.example.terminal",
@@ -94,7 +95,8 @@
     "claude:fixture-a",
     "claude:fixture-c"
    ],
-   "hosts_shells": true
+   "hosts_shells": true,
+   "category": "app"
   },
   {
    "owner_id": "codex:fixture-b",
@@ -144,7 +146,8 @@
    ],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "codex"
   },
   {
    "owner_id": "claude:fixture-c",
@@ -171,7 +174,8 @@
    "jobs": [],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "claude"
   }
  ],
  "_view": {

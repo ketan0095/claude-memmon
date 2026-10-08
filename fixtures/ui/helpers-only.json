@@ -60,7 +60,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   },
   {
    "owner_id": "app:com.example.widgets",
@@ -86,7 +87,8 @@
    "actions": [],
    "instances": [],
    "hosts": [],
-   "hosts_shells": false
+   "hosts_shells": false,
+   "category": "app"
   }
  ],
  "_view": {

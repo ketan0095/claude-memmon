@@ -1,0 +1,1288 @@
+{
+ "_base": "overview.json",
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.917
+ },
+ "owners": [
+  {
+   "owner_id": "claude:fixture-a",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout refactor",
+   "project": "acme-web",
+   "worktree": "checkout",
+   "activity": "Building · typecheck",
+   "confidence": "exact",
+   "footprint_bytes": 9556302233,
+   "cpu_cores": 3.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
+   "member_count": 9,
+   "root": {
+    "pid": 48211,
+    "start": [
+     1791449000,
+     318442
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [
+    {
+     "job_id": "48211.1791449000.318442",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 1288490188,
+     "member_count": 3,
+     "token": null
+    },
+    {
+     "job_id": "48302.1791449100.120044",
+     "kind": "build",
+     "label": "typecheck",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 7301444403,
+     "member_count": 5,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODMwMiwic3RhcnQiOlsxNzkxNDQ5MTAwLDEyMDA0NF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    },
+    {
+     "job_id": "48260.1791449050.500100",
+     "kind": "server",
+     "label": "dev server · port 3000",
+     "action": "stop-server",
+     "managed": false,
+     "footprint_bytes": 966367641,
+     "member_count": 1,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLXNlcnZlciIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODI2MCwic3RhcnQiOlsxNzkxNDQ5MDUwLDUwMDEwMF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "instances": null,
+   "shared_with": null,
+   "category": "claude"
+  },
+  {
+   "owner_id": "claude:fixture-c",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout copy fixes",
+   "project": "acme-web",
+   "worktree": "copy",
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 644245094,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 2097152,
+   "member_count": 2,
+   "root": {
+    "pid": 51002,
+    "start": [
+     1791447000,
+     9
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYyIsIm93bmVyX3Jvb3QiOnsicGlkIjo1MTAwMiwic3RhcnQiOlsxNzkxNDQ3MDAwLDldfSwidGFyZ2V0Ijp7InBpZCI6NTEwMDIsInN0YXJ0IjpbMTc5MTQ0NzAwMCw5XX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "end-session"
+   ],
+   "category": "claude"
+  },
+  {
+   "owner_id": "codex:fixture-b",
+   "kind": "codex",
+   "agent": "codex",
+   "title": "Billing API tests",
+   "project": "acme-api",
+   "worktree": "main",
+   "activity": "Testing · vitest run",
+   "confidence": "inferred",
+   "footprint_bytes": 2254857830,
+   "cpu_cores": null,
+   "cpu_coverage": null,
+   "cpu_reason": "warming up",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "not enough history",
+   "member_count": 5,
+   "root": {
+    "pid": 7310,
+    "start": [
+     1791449800,
+     1200
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY29kZXg6Zml4dHVyZS1iIiwib3duZXJfcm9vdCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInRhcmdldCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [
+    {
+     "job_id": "7310.1791449800.1200",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 536870912,
+     "member_count": 2,
+     "token": null
+    },
+    {
+     "job_id": "7333.1791449820.4000",
+     "kind": "test",
+     "label": "vitest run",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 1717986918,
+     "member_count": 3,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY29kZXg6Zml4dHVyZS1iIiwib3duZXJfcm9vdCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInRhcmdldCI6eyJwaWQiOjczMzMsInN0YXJ0IjpbMTc5MTQ0OTgyMCw0MDAwXX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9"
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "category": "codex"
+  },
+  {
+   "owner_id": "codex-app:7001.1791440000",
+   "kind": "codex-app",
+   "agent": "codex",
+   "title": "Codex app",
+   "activity": "Idle",
+   "confidence": "shared",
+   "footprint_bytes": 3650722201,
+   "cpu_cores": 0.4,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": null,
+   "growth_reason": "not enough history",
+   "member_count": 4,
+   "root": {
+    "pid": 7001,
+    "start": [
+     1791440000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "shared_with": [
+    "Billing API tests",
+    "Search tuning",
+    "Docs pass"
+   ],
+   "category": "service"
+  },
+  {
+   "owner_id": "service:vm:docker-desktop",
+   "kind": "service",
+   "agent": "service",
+   "title": "Container VM",
+   "project": null,
+   "worktree": null,
+   "activity": "Working",
+   "confidence": "shared",
+   "footprint_bytes": 6979321856,
+   "cpu_cores": 0.8,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 41943040,
+   "member_count": 6,
+   "root": {
+    "pid": 5101,
+    "start": [
+     1791442800,
+     0
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoic2VydmljZTp2bTpkb2NrZXItZGVza3RvcCIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLmNvbnRhaW5lcnMiLCJpbnN0YW5jZXMiOlt7InBpZCI6NTEwMSwic3RhcnQiOlsxNzkxNDQyODAwLDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQ0MjgwMC4wfSx7InBpZCI6NTE4OCwic3RhcnQiOlsxNzkxNDQ2NDAwLDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQ0NjQwMC4wfV0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 5101,
+     "launch_date": 1791442800.0
+    },
+    {
+     "pid": 5188,
+     "launch_date": 1791446400.0
+    }
+   ],
+   "shared_with": [
+    "postgres",
+    "redis",
+    "api-gateway",
+    "worker",
+    "scheduler",
+    "mailhog",
+    "minio",
+    "search"
+   ],
+   "used_by": [
+    "Checkout refactor",
+    "Billing API tests"
+   ],
+   "stop_command": null,
+   "category": "service"
+  },
+  {
+   "owner_id": "claude:fixture-d",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Billing docs pass",
+   "project": "acme-api",
+   "worktree": "docs",
+   "activity": "Working",
+   "confidence": "exact",
+   "footprint_bytes": 1395864371,
+   "cpu_cores": 0.9,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 2097152,
+   "member_count": 2,
+   "root": {
+    "pid": 49010,
+    "start": [
+     1791449300,
+     1
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYyIsIm93bmVyX3Jvb3QiOnsicGlkIjo1MTAwMiwic3RhcnQiOlsxNzkxNDQ3MDAwLDldfSwidGFyZ2V0Ijp7InBpZCI6NTEwMDIsInN0YXJ0IjpbMTc5MTQ0NzAwMCw5XX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "end-session"
+   ],
+   "category": "claude"
+  },
+  {
+   "owner_id": "job:run-fixture-1",
+   "kind": "job",
+   "agent": "job",
+   "title": "acme-web typecheck",
+   "project": "acme-web",
+   "worktree": null,
+   "activity": "Building · acme-web typecheck",
+   "confidence": "exact",
+   "footprint_bytes": 2147483648,
+   "footprint_reason": null,
+   "cpu_cores": 1.2,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 10485760,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 48501,
+    "start": [
+     1791449958,
+     120044
+    ],
+    "pgid": 48501
+   },
+   "started_at": 1791449958.12,
+   "token": "fixture-managed-token",
+   "jobs": [],
+   "actions": [
+    "stop-managed-job"
+   ],
+   "instances": null,
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "job"
+  },
+  {
+   "owner_id": "app:com.example.browser",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Browser",
+   "project": null,
+   "worktree": null,
+   "activity": "Working",
+   "confidence": "exact",
+   "footprint_bytes": 5153960755,
+   "footprint_reason": null,
+   "cpu_cores": 0.7,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 28,
+   "root": {
+    "pid": 7017,
+    "start": [
+     1791407017,
+     0
+    ],
+    "pgid": 7017
+   },
+   "started_at": 1791407017.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmJyb3dzZXIiLCJidW5kbGVfaWQiOiJjb20uZXhhbXBsZS5icm93c2VyIiwiaW5zdGFuY2VzIjpbeyJwaWQiOjcwMTcsInN0YXJ0IjpbMTc5MTQwNzAxNywwXSwibGF1bmNoX2RhdGUiOjE3OTE0MDcwMTcuMH1dLCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7017,
+     "start": [
+      1791407017,
+      0
+     ],
+     "launch_date": 1791407017.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "browser"
+  },
+  {
+   "owner_id": "app:com.example.browser.beta",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Browser Beta",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 1181116006,
+   "footprint_reason": null,
+   "cpu_cores": 0.2,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 9,
+   "root": {
+    "pid": 7034,
+    "start": [
+     1791407034,
+     0
+    ],
+    "pgid": 7034
+   },
+   "started_at": 1791407034.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmJyb3dzZXIuYmV0YSIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLmJyb3dzZXIuYmV0YSIsImluc3RhbmNlcyI6W3sicGlkIjo3MDM0LCJzdGFydCI6WzE3OTE0MDcwMzQsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDA3MDM0LjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7034,
+     "start": [
+      1791407034,
+      0
+     ],
+     "launch_date": 1791407034.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "browser"
+  },
+  {
+   "owner_id": "app:com.example.terminal",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Terminal",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 440401920,
+   "footprint_reason": null,
+   "cpu_cores": 0.1,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 3,
+   "root": {
+    "pid": 7051,
+    "start": [
+     1791407051,
+     0
+    ],
+    "pgid": 7051
+   },
+   "started_at": 1791407051.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [
+    {
+     "pid": 7051,
+     "start": [
+      1791407051,
+      0
+     ],
+     "launch_date": 1791407051.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [
+    "claude:fixture-a"
+   ],
+   "hosts_shells": true,
+   "category": "dev"
+  },
+  {
+   "owner_id": "app:com.example.editor",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Editor",
+   "project": null,
+   "worktree": null,
+   "activity": "Working",
+   "confidence": "exact",
+   "footprint_bytes": 2791728742,
+   "footprint_reason": null,
+   "cpu_cores": 0.4,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 14,
+   "root": {
+    "pid": 7068,
+    "start": [
+     1791407068,
+     0
+    ],
+    "pgid": 7068
+   },
+   "started_at": 1791407068.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmVkaXRvciIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLmVkaXRvciIsImluc3RhbmNlcyI6W3sicGlkIjo3MDY4LCJzdGFydCI6WzE3OTE0MDcwNjgsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDA3MDY4LjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7068,
+     "start": [
+      1791407068,
+      0
+     ],
+     "launch_date": 1791407068.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": true,
+   "category": "dev"
+  },
+  {
+   "owner_id": "app:com.example.notes",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Notes",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 671088640,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7085,
+    "start": [
+     1791407085,
+     0
+    ],
+    "pgid": 7085
+   },
+   "started_at": 1791407085.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLm5vdGVzIiwiYnVuZGxlX2lkIjoiY29tLmV4YW1wbGUubm90ZXMiLCJpbnN0YW5jZXMiOlt7InBpZCI6NzA4NSwic3RhcnQiOlsxNzkxNDA3MDg1LDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQwNzA4NS4wfV0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7085,
+     "start": [
+      1791407085,
+      0
+     ],
+     "launch_date": 1791407085.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.mail",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Mail",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 534773760,
+   "footprint_reason": null,
+   "cpu_cores": 0.1,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7102,
+    "start": [
+     1791407102,
+     0
+    ],
+    "pgid": 7102
+   },
+   "started_at": 1791407102.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLm1haWwiLCJidW5kbGVfaWQiOiJjb20uZXhhbXBsZS5tYWlsIiwiaW5zdGFuY2VzIjpbeyJwaWQiOjcxMDIsInN0YXJ0IjpbMTc5MTQwNzEwMiwwXSwibGF1bmNoX2RhdGUiOjE3OTE0MDcxMDIuMH1dLCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7102,
+     "start": [
+      1791407102,
+      0
+     ],
+     "launch_date": 1791407102.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.music",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Music",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 398458880,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7119,
+    "start": [
+     1791407119,
+     0
+    ],
+    "pgid": 7119
+   },
+   "started_at": 1791407119.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLm11c2ljIiwiYnVuZGxlX2lkIjoiY29tLmV4YW1wbGUubXVzaWMiLCJpbnN0YW5jZXMiOlt7InBpZCI6NzExOSwic3RhcnQiOlsxNzkxNDA3MTE5LDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQwNzExOS4wfV0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7119,
+     "start": [
+      1791407119,
+      0
+     ],
+     "launch_date": 1791407119.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.chat",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Chat",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 1503238553,
+   "footprint_reason": null,
+   "cpu_cores": 0.3,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7136,
+    "start": [
+     1791407136,
+     0
+    ],
+    "pgid": 7136
+   },
+   "started_at": 1791407136.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmNoYXQiLCJidW5kbGVfaWQiOiJjb20uZXhhbXBsZS5jaGF0IiwiaW5zdGFuY2VzIjpbeyJwaWQiOjcxMzYsInN0YXJ0IjpbMTc5MTQwNzEzNiwwXSwibGF1bmNoX2RhdGUiOjE3OTE0MDcxMzYuMH1dLCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7136,
+     "start": [
+      1791407136,
+      0
+     ],
+     "launch_date": 1791407136.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.design",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Design",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 2362232012,
+   "footprint_reason": null,
+   "cpu_cores": 0.5,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7153,
+    "start": [
+     1791407153,
+     0
+    ],
+    "pgid": 7153
+   },
+   "started_at": 1791407153.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmRlc2lnbiIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLmRlc2lnbiIsImluc3RhbmNlcyI6W3sicGlkIjo3MTUzLCJzdGFydCI6WzE3OTE0MDcxNTMsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDA3MTUzLjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7153,
+     "start": [
+      1791407153,
+      0
+     ],
+     "launch_date": 1791407153.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.maps",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Maps",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 304087040,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7170,
+    "start": [
+     1791407170,
+     0
+    ],
+    "pgid": 7170
+   },
+   "started_at": 1791407170.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLm1hcHMiLCJidW5kbGVfaWQiOiJjb20uZXhhbXBsZS5tYXBzIiwiaW5zdGFuY2VzIjpbeyJwaWQiOjcxNzAsInN0YXJ0IjpbMTc5MTQwNzE3MCwwXSwibGF1bmNoX2RhdGUiOjE3OTE0MDcxNzAuMH1dLCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7170,
+     "start": [
+      1791407170,
+      0
+     ],
+     "launch_date": 1791407170.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.docs",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Docs",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 912261120,
+   "footprint_reason": null,
+   "cpu_cores": 0.1,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7187,
+    "start": [
+     1791407187,
+     0
+    ],
+    "pgid": 7187
+   },
+   "started_at": 1791407187.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmRvY3MiLCJidW5kbGVfaWQiOiJjb20uZXhhbXBsZS5kb2NzIiwiaW5zdGFuY2VzIjpbeyJwaWQiOjcxODcsInN0YXJ0IjpbMTc5MTQwNzE4NywwXSwibGF1bmNoX2RhdGUiOjE3OTE0MDcxODcuMH1dLCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7187,
+     "start": [
+      1791407187,
+      0
+     ],
+     "launch_date": 1791407187.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.calendar",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Calendar",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 220200960,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 4,
+   "root": {
+    "pid": 7204,
+    "start": [
+     1791407204,
+     0
+    ],
+    "pgid": 7204
+   },
+   "started_at": 1791407204.0,
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLmNhbGVuZGFyIiwiYnVuZGxlX2lkIjoiY29tLmV4YW1wbGUuY2FsZW5kYXIiLCJpbnN0YW5jZXMiOlt7InBpZCI6NzIwNCwic3RhcnQiOlsxNzkxNDA3MjA0LDBdLCJsYXVuY2hfZGF0ZSI6MTc5MTQwNzIwNC4wfV0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 7204,
+     "start": [
+      1791407204,
+      0
+     ],
+     "launch_date": 1791407204.0
+    }
+   ],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.widgets",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Widgets",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 44040192,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7221,
+    "start": [
+     1791407221,
+     0
+    ],
+    "pgid": 7221
+   },
+   "started_at": 1791407221.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.sync",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Sync Helper",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 18874368,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7238,
+    "start": [
+     1791407238,
+     0
+    ],
+    "pgid": 7238
+   },
+   "started_at": 1791407238.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.updater",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Updater",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 9437184,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7255,
+    "start": [
+     1791407255,
+     0
+    ],
+    "pgid": 7255
+   },
+   "started_at": 1791407255.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.menuextra",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Menu Extra",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 28311552,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7272,
+    "start": [
+     1791407272,
+     0
+    ],
+    "pgid": 7272
+   },
+   "started_at": 1791407272.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.clipboard",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Clipboard",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 32505856,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7289,
+    "start": [
+     1791407289,
+     0
+    ],
+    "pgid": 7289
+   },
+   "started_at": 1791407289.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.weather",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Weather Widget",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 57671680,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7306,
+    "start": [
+     1791407306,
+     0
+    ],
+    "pgid": 7306
+   },
+   "started_at": 1791407306.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "app:com.example.editor.helper",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Editor Helper",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 67108864,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7323,
+    "start": [
+     1791407323,
+     0
+    ],
+    "pgid": 7323
+   },
+   "started_at": 1791407323.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": true,
+   "category": "dev"
+  },
+  {
+   "owner_id": "app:com.example.browser.agent",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Browser Agent",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 12582912,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7340,
+    "start": [
+     1791407340,
+     0
+    ],
+    "pgid": 7340
+   },
+   "started_at": 1791407340.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "browser"
+  },
+  {
+   "owner_id": "app:com.example.photos.agent",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Photos Agent",
+   "project": null,
+   "worktree": null,
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 80740352,
+   "footprint_reason": null,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "cpu_reason": null,
+   "growth_bytes_per_10min": 0,
+   "growth_reason": null,
+   "member_count": 1,
+   "root": {
+    "pid": 7357,
+    "start": [
+     1791407357,
+     0
+    ],
+    "pgid": 7357
+   },
+   "started_at": 1791407357.0,
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "instances": [],
+   "shared_with": null,
+   "stop_command": null,
+   "used_by": null,
+   "hosts": [],
+   "hosts_shells": false,
+   "category": "app"
+  },
+  {
+   "owner_id": "unknown:9101.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9101)",
+   "confidence": "unknown",
+   "footprint_bytes": 966367641,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 3,
+   "root": {
+    "pid": 9101,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null,
+   "category": "unknown"
+  },
+  {
+   "owner_id": "unknown:9188.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9188)",
+   "confidence": "unknown",
+   "footprint_bytes": 644245094,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 2,
+   "root": {
+    "pid": 9188,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null,
+   "category": "unknown"
+  },
+  {
+   "owner_id": "unknown:9240.1791400000",
+   "kind": "unknown",
+   "agent": "unknown",
+   "title": "node (9240)",
+   "confidence": "unknown",
+   "footprint_bytes": 322122547,
+   "cpu_cores": null,
+   "cpu_reason": "not measured",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "tracked as Unattributed",
+   "member_count": 1,
+   "root": {
+    "pid": 9240,
+    "start": [
+     1791400000,
+     0
+    ]
+   },
+   "token": null,
+   "jobs": [],
+   "actions": [],
+   "cpu_coverage": null,
+   "category": "unknown"
+  }
+ ]
+}

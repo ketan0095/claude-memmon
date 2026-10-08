@@ -324,6 +324,9 @@ struct Owner: Identifiable {
     var hosts: [String] = []
     /// The app runs plain shells: quitting it ends every one of them.
     var hostsShells = false
+    /// memmon's display grouping (claude, codex, job, browser, dev, app,
+    /// service, unknown). It only places the row; it never decides an action.
+    var category: String?
 
     static let shellWarning = "Quitting a terminal ends every shell and agent session in it."
     /// Set only on the synthetic "Unattributed" row that collapses unknown owners.
@@ -426,6 +429,7 @@ struct Owner: Identifiable {
         o.usedBy = strs(d["used_by"])
         o.hosts = strs(d["hosts"]) ?? []
         o.hostsShells = d["hosts_shells"] as? Bool ?? false
+        o.category = str(d["category"])
         return o
     }
 }
@@ -530,9 +534,9 @@ enum SortKey: String, CaseIterable {
     var label: String { rawValue == "cpu" ? "CPU" : rawValue.capitalized }
     var columnHeader: String {
         switch self {
-        case .memory: return "Memory · CPU cores"
-        case .cpu: return "CPU cores · Memory"
-        case .growth: return "Growth per 10 min · Memory"
+        case .memory: return "Memory"
+        case .cpu: return "CPU cores"
+        case .growth: return "Growth per 10 min"
         }
     }
     func metric(_ o: Owner) -> Double? {
@@ -546,6 +550,98 @@ enum SortKey: String, CaseIterable {
 
 /// Unavailable values sort last whichever metric is chosen; ties fall back to
 /// memory, then title, so the order does not shuffle between refreshes.
+// MARK: - sections
+
+/// The popover's owner sections, in display order.
+enum OwnerSection: String, CaseIterable, Identifiable {
+    case claude, codex, job, browser, dev, app, service, background
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude sessions"
+        case .codex: return "Codex"
+        case .job: return "Managed jobs"
+        case .browser: return "Browsers"
+        case .dev: return "Terminals & editors"
+        case .app: return "Mac apps"
+        case .service: return "Shared services"
+        case .background: return "Background"
+        }
+    }
+
+    /// Open until the user closes it: the sections that hold agent work.
+    var openByDefault: Bool { self == .claude || self == .codex }
+
+    /// At most this many rows show before "Show N more".
+    static let cap = 6
+    /// Below this, an owner with nothing to act on is background noise.
+    static let smallBytes = 100.0 * 1024 * 1024
+}
+
+/// memmon's category, or one derived from the kind for a payload without it.
+func ownerCategory(_ o: Owner) -> String {
+    if let c = o.category { return c }
+    switch o.kind {
+    case "claude": return "claude"
+    case "codex", "codex-ui": return "codex"
+    case "job": return "job"
+    case "app": return "app"
+    case "service", "codex-app": return "service"
+    default: return "unknown"
+    }
+}
+
+/// An app or service with nothing to act on, hosting nothing, and a known
+/// footprint under 100 MiB: a helper or widget, not something to look at first.
+func isSmallOwner(_ o: Owner) -> Bool {
+    guard ["browser", "dev", "app", "service"].contains(ownerCategory(o)) else { return false }
+    guard !o.actions.contains(where: { o.can($0) }), o.hosts.isEmpty else { return false }
+    guard let fp = o.footprint else { return false }
+    return fp < OwnerSection.smallBytes
+}
+
+func ownerSection(_ o: Owner) -> OwnerSection {
+    if !o.group.isEmpty || o.isUnattributed || isSmallOwner(o) { return .background }
+    return OwnerSection(rawValue: ownerCategory(o)).flatMap { $0 == .background ? nil : $0 } ?? .background
+}
+
+/// Rows grouped into their sections, each sorted by `key`; empty sections
+/// are left out.
+func sectionedOwners(_ rows: [Owner], by key: SortKey) -> [(OwnerSection, [Owner])] {
+    let sorted = sortOwners(rows, by: key)
+    return OwnerSection.allCases.compactMap { sec in
+        let mine = sorted.filter { ownerSection($0) == sec }
+        return mine.isEmpty ? nil : (sec, mine)
+    }
+}
+
+/// The header's count, worded for the section.
+func sectionCount(_ sec: OwnerSection, _ rows: [Owner]) -> (shown: String, spoken: String) {
+    guard sec == .background else {
+        return ("\(rows.count)", plural(rows.count, "owner"))
+    }
+    let small = rows.filter { $0.group.isEmpty && !$0.isUnattributed }.count
+    let unattributed = rows.filter { !$0.group.isEmpty || $0.isUnattributed }
+        .reduce(0) { $0 + ($1.memberCount ?? 1) }
+    var shown: [String] = [], spoken: [String] = []
+    if small > 0 {
+        shown.append("\(small) small")
+        spoken.append(plural(small, "small owner"))
+    }
+    if unattributed > 0 {
+        shown.append("\(unattributed) unattributed")
+        spoken.append(plural(unattributed, "unattributed process", "unattributed processes"))
+    }
+    return (shown.joined(separator: " · "), spoken.joined(separator: " and "))
+}
+
+/// The section's memory: owners partition processes, so known footprints add up.
+func sectionTotal(_ rows: [Owner]) -> Double? {
+    let known = rows.compactMap { $0.footprint }
+    return known.isEmpty ? nil : known.reduce(0, +)
+}
+
 func sortOwners(_ owners: [Owner], by key: SortKey) -> [Owner] {
     owners.sorted { a, b in
         switch (key.metric(a), key.metric(b)) {
@@ -1223,6 +1319,10 @@ final class Model: ObservableObject {
     @Published var stillSampling = false
     @Published var sort: SortKey = .memory
     @Published var expanded: String?
+    /// Sections the user opened or closed; the rest use openByDefault.
+    @Published var sectionOpen: [OwnerSection: Bool] = [:]
+    /// Sections showing every row instead of the first six.
+    @Published var showAll: Set<OwnerSection> = []
     @Published var techOpen: Set<String> = []
     @Published var confirm: ConfirmRequest?
     @Published var banner: Banner?
@@ -1235,7 +1335,35 @@ final class Model: ObservableObject {
     var actionLog: [String] = []
     /// Which overlay button holds keyboard focus, as reported by the overlay.
     var overlayFocus: String?
-    /// The clock the app-Force age bound reads; tests move it.
+
+    /// The row the user is looking at, or acting on, is never hidden inside a
+    /// collapsed section or behind "Show N more".
+    func holds(_ o: Owner) -> Bool {
+        o.id == expanded || o.id == confirm?.owner.id
+    }
+
+    func isOpen(_ sec: OwnerSection, _ rows: [Owner]) -> Bool {
+        if rows.contains(where: holds) { return true }
+        return sectionOpen[sec] ?? sec.openByDefault
+    }
+
+    func toggle(_ sec: OwnerSection, _ rows: [Owner]) {
+        if isOpen(sec, rows) {
+            sectionOpen[sec] = false
+            if rows.contains(where: { $0.id == expanded }) { expanded = nil }
+        } else {
+            sectionOpen[sec] = true
+        }
+    }
+
+    /// The rows an open section shows, and how many "Show N more" hides.
+    func visible(_ sec: OwnerSection, _ rows: [Owner]) -> ([Owner], Int) {
+        let cap = OwnerSection.cap
+        guard rows.count > cap, !showAll.contains(sec),
+              !rows.dropFirst(cap).contains(where: holds) else { return (rows, 0) }
+        return (Array(rows.prefix(cap)), rows.count - cap)
+    }
+
     /// The clock the app-Force age bound reads. CLOCK_MONOTONIC keeps
     /// counting while the Mac sleeps, unlike systemUptime; tests move it.
     var clock: () -> Double = { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9 }
@@ -1751,8 +1879,16 @@ struct ActionButton: View {
 struct OwnerIcon: View {
     var owner: Owner
     var selected: Bool
+    /// The tile's side; the compact list row uses a smaller one.
+    var size: CGFloat = 32
     var symbol: String {
         if !owner.group.isEmpty || owner.isUnattributed { return "questionmark" }
+        switch owner.category {
+        case "browser": return "globe"
+        case "dev": return "chevron.left.forwardslash.chevron.right"
+        case "app": return "macwindow"
+        default: break
+        }
         switch owner.agent {
         case "claude", "job": return "terminal"
         case "codex": return "curlybraces"
@@ -1763,11 +1899,11 @@ struct OwnerIcon: View {
     }
     var body: some View {
         Image(systemName: symbol)
-            .font(.system(size: 13, weight: .medium))
+            .font(.system(size: size * 0.41, weight: .medium))
             .foregroundColor(selected ? P.accent : P.muted)
-            .frame(width: 32, height: 32)
-            .background(RoundedRectangle(cornerRadius: 9).fill(P.panel))
-            .overlay(RoundedRectangle(cornerRadius: 9).stroke(P.border, lineWidth: 1))
+            .frame(width: size, height: size)
+            .background(RoundedRectangle(cornerRadius: size * 0.28).fill(P.panel))
+            .overlay(RoundedRectangle(cornerRadius: size * 0.28).stroke(P.border, lineWidth: 1))
             .accessibilityHidden(true)
     }
 }
@@ -1833,51 +1969,94 @@ struct UsageColumn: View {
     }
 }
 
+/// One line per owner: icon, title, a short status and the sort metric.
+/// Everything the old three-line row said stays in the accessibility label;
+/// the rest is in the inline detail the row opens.
 struct OwnerRow: View {
     var owner: Owner
     var sort: SortKey
     var expanded: Bool
     var onTap: () -> Void
 
+    /// What it is doing, or what it is when nothing is known.
+    var status: String {
+        if !owner.group.isEmpty { return plural(owner.memberCount ?? owner.group.count, "process", "processes") }
+        return owner.activity ?? owner.agentLabel
+    }
+
     var body: some View {
+        let usage = UsageColumn(owner: owner, sort: sort)
+        // A measured helper of a few MB is not zero.
+        let tiny = sort == .memory && (owner.footprint ?? 1 * GB) < 0.05 * GB
+        let metric = tiny ? "< 0.1 GB" : usage.lines.0
         Button(action: onTap) {
-            HStack(alignment: .top, spacing: 10) {
-                OwnerIcon(owner: owner, selected: expanded)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(owner.title).font(ft(14, .medium)).foregroundColor(P.text).lineLimit(1)
-                    Text(owner.line2).font(ft(12)).foregroundColor(P.muted)
-                        .lineLimit(2).truncationMode(.tail)
-                        .fixedSize(horizontal: false, vertical: true)
-                    // Like an inline chip in running text: it follows line 3
-                    // when both fit, and drops below it rather than clipping it.
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 4) {
-                            Text(owner.line3 + " ·").lineLimit(1).fixedSize()
-                            ConfidenceChip(confidence: owner.confidence)
-                        }
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(owner.line3).lineLimit(2).truncationMode(.tail)
-                                .fixedSize(horizontal: false, vertical: true)
-                            ConfidenceChip(confidence: owner.confidence)
-                        }
+            HStack(spacing: 8) {
+                OwnerIcon(owner: owner, selected: expanded, size: 22)
+                // The status truncates, but only while some of it still fits:
+                // a lone "…" says nothing, so then the title shows alone.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        Text(owner.title).font(ft(13, .medium)).foregroundColor(P.text)
+                            .lineLimit(1).fixedSize()
+                        Text(status).font(ft(12)).foregroundColor(P.muted)
+                            .lineLimit(1).truncationMode(.tail)
+                            .frame(minWidth: 60, idealWidth: 60, maxWidth: .infinity, alignment: .leading)
                     }
-                    .font(ft(11)).foregroundColor(P.muted)
-                    .padding(.top, 1)
+                    Text(owner.title).font(ft(13, .medium)).foregroundColor(P.text)
+                        .lineLimit(1).truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                UsageColumn(owner: owner, sort: sort).frame(width: 88, alignment: .trailing)
+                Spacer(minLength: 6)
+                Text(metric).font(ft(13, .medium)).monospacedDigit()
+                    .foregroundColor(metric == "—" ? P.muted : P.text)
+                    .lineLimit(1).fixedSize()
             }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 10).fill(expanded ? P.selected : Color.clear))
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(expanded ? P.selected : Color.clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(owner.title), \(owner.line2), \(owner.line3), "
             + "ownership confidence: \(owner.confidence ?? "unknown"), "
-            + UsageColumn(owner: owner, sort: sort).spoken)
+            + usage.spoken)
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityHint(expanded ? "Hides details" : "Shows details")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// A section's one-line header: open state, title, count and total memory.
+struct SectionHeader: View {
+    var section: OwnerSection
+    var rows: [Owner]
+    var open: Bool
+    var onTap: () -> Void
+
+    var body: some View {
+        let count = sectionCount(section, rows)
+        let total = sectionTotal(rows).map(gb)
+        Button(action: onTap) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(P.muted)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+                    .frame(width: 12)
+                Text(section.title).font(ft(12, .semibold)).foregroundColor(P.text).lineLimit(1)
+                Text("· " + count.shown).font(ft(12)).foregroundColor(P.muted)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                if let total {
+                    Text(total).font(ft(12)).foregroundColor(P.muted).monospacedDigit().fixedSize()
+                }
+            }
+            .padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(section.title), \(count.spoken), \(total ?? "memory not measured"), "
+            + (open ? "expanded" : "collapsed"))
         .accessibilityAddTraits(.isButton)
     }
 }
@@ -1956,6 +2135,15 @@ struct OwnerDetailCard: View {
 
     private var jobs: [OwnerJob] { owner.jobs }
 
+    /// Memory, CPU and growth together, with a reason where one is missing.
+    private var usageLine: String {
+        let mem = owner.footprint.map(gb) ?? "memory \(owner.footprintReason ?? "not measured")"
+        let cpu = owner.cpu.map(coresText) ?? "CPU \(owner.cpuReason ?? "warming up")"
+        let growth = owner.growth.map { growthText($0) + " per 10 min" }
+            ?? "growth: \(owner.growthReason ?? "not enough history")"
+        return [mem, cpu, growth].joined(separator: " · ")
+    }
+
     private var footText: String? {
         if owner.can("end-session") { return "Conversation + all its processes" }
         if !owner.hosts.isEmpty {
@@ -1975,10 +2163,22 @@ struct OwnerDetailCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                Text(owner.title).font(ft(14, .medium)).foregroundColor(P.text).lineLimit(1)
-                Spacer(minLength: 4)
-                Text(owner.detailTag).font(ft(11)).foregroundColor(P.accent)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 10) {
+                    Text(owner.title).font(ft(14, .medium)).foregroundColor(P.text).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(owner.detailTag).font(ft(11)).foregroundColor(P.accent)
+                }
+                // What the old three-line row said, now that the row is one line.
+                Text(owner.line2).font(ft(12)).foregroundColor(P.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 4) {
+                    Text(owner.line3 + " ·").lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    ConfidenceChip(confidence: owner.confidence)
+                }
+                .font(ft(11)).foregroundColor(P.muted)
+                Text(usageLine).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 13).padding(.vertical, 11)
             .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .bottom)
@@ -2918,29 +3118,52 @@ struct ContentView: View {
     }
 
     private func ownerList(_ s: OwnersSnap) -> some View {
-        let rows = sortOwners(s.rows, by: model.sort)
-        return VStack(alignment: .leading, spacing: 2) {
-            if rows.isEmpty {
+        let sections = sectionedOwners(s.rows, by: model.sort)
+        return VStack(alignment: .leading, spacing: 0) {
+            if sections.isEmpty {
                 Text("No owners found in this sample.").font(ft(12)).foregroundColor(P.muted)
                     .padding(10)
             }
-            ForEach(rows) { o in
-                let open = model.expanded == o.id
-                OwnerRow(owner: o, sort: model.sort, expanded: open) {
-                    withAnimation(motion(0.16)) { model.expanded = open ? nil : o.id }
+            ForEach(sections, id: \.0) { sec, rows in
+                let open = model.isOpen(sec, rows)
+                SectionHeader(section: sec, rows: rows, open: open) {
+                    withAnimation(motion(0.16)) { model.toggle(sec, rows) }
                 }
                 if open {
-                    OwnerDetailCard(
-                        owner: o, degraded: s.degraded,
-                        techOpen: Binding(get: { model.techOpen.contains(o.id) },
-                                          set: { on in
-                                              if on { model.techOpen.insert(o.id) } else { model.techOpen.remove(o.id) }
-                                          }),
-                        animation: motion(0.16),
-                        onAsk: { kind in withAnimation(motion(0.12)) { model.ask(kind, o) } })
-                        .padding(.bottom, 8)
-                        .transition(.opacity)
+                    let (shown, hidden) = model.visible(sec, rows)
+                    ownerRows(shown, s)
+                    if hidden > 0 {
+                        Button { withAnimation(motion(0.16)) { _ = model.showAll.insert(sec) } } label: {
+                            Text("Show \(hidden) more").font(ft(12)).foregroundColor(P.accent)
+                                .padding(.horizontal, 38).padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show \(hidden) more in \(sec.title)")
+                    }
                 }
+            }
+        }
+    }
+
+    private func ownerRows(_ rows: [Owner], _ s: OwnersSnap) -> some View {
+        ForEach(rows) { o in
+            let open = model.expanded == o.id
+            OwnerRow(owner: o, sort: model.sort, expanded: open) {
+                withAnimation(motion(0.16)) { model.expanded = open ? nil : o.id }
+            }
+            if open {
+                OwnerDetailCard(
+                    owner: o, degraded: s.degraded,
+                    techOpen: Binding(get: { model.techOpen.contains(o.id) },
+                                      set: { on in
+                                          if on { model.techOpen.insert(o.id) } else { model.techOpen.remove(o.id) }
+                                      }),
+                    animation: motion(0.16),
+                    onAsk: { kind in withAnimation(motion(0.12)) { model.ask(kind, o) } })
+                    .padding(.top, 2).padding(.bottom, 8)
+                    .transition(.opacity)
             }
         }
     }
@@ -3383,6 +3606,9 @@ struct RenderOptions {
     var openGate = false
     /// The outcome lands while the popover is closed.
     var popoverClosed = false
+    /// Sections opened (or closed, with a "-" prefix) and sections showing every row.
+    var sections: [String] = []
+    var showAll: [String] = []
 }
 
 /// A fixture may name a `_base` fixture whose keys it overrides, and carries
@@ -3416,6 +3642,8 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.openGate = ARGS.contains("--open-gate") || (view["open_gate"] as? Bool ?? false)
     o.dark = ARGS.contains("--dark")
     o.popoverClosed = view["popover_closed"] as? Bool ?? false
+    o.sections = view["sections"] as? [String] ?? []
+    o.showAll = view["show_all"] as? [String] ?? []
     return o
 }
 
@@ -3430,6 +3658,17 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     m.sort = o.sort
     m.expanded = o.select
     if o.techOpen, let s = o.select { m.techOpen = [s] }
+    for name in o.sections {
+        let closed = name.hasPrefix("-")
+        guard let sec = OwnerSection(rawValue: closed ? String(name.dropFirst()) : name) else {
+            fail("unknown section \(name)")
+        }
+        m.sectionOpen[sec] = !closed
+    }
+    for name in o.showAll {
+        guard let sec = OwnerSection(rawValue: name) else { fail("unknown section \(name)") }
+        m.showAll.insert(sec)
+    }
     guard let action = o.confirm else {
         if o.outcome != nil { fail("--outcome needs --confirm") }
         return m
@@ -4117,6 +4356,23 @@ if ARGS.contains("--selftest-quit-app") {
     exit(0)
 }
 if ARGS.contains("--act-probe") { actProbe(); exit(0) }
+if ARGS.contains("--sections-probe") {
+    // How a fixture's owners fall into sections, as the list would show them.
+    _ = NSApplication.shared
+    let (m, _) = MainActor.assumeIsolated { prepareFixture() }
+    let rows = m.snap?.rows ?? []
+    let out: [[String: Any]] = sectionedOwners(rows, by: m.sort).map { sec, owners in
+        let (shown, hidden) = m.visible(sec, owners)
+        return ["section": sec.rawValue, "title": sec.title, "owners": owners.map { $0.id },
+                "open": m.isOpen(sec, owners), "shown": shown.map { $0.id }, "hidden": hidden,
+                "total": sectionTotal(owners) ?? NSNull(), "count": sectionCount(sec, owners).shown]
+    }
+    let small = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, isSmallOwner($0)) })
+    let data = try! JSONSerialization.data(withJSONObject: ["sections": out, "small": small],
+                                           options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
 if ARGS.contains("--clock-probe") {
     // The default clock the app-Force window reads, against the clocks it
     // could be confused with.

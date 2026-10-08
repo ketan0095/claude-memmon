@@ -60,7 +60,8 @@
     "end-session"
    ],
    "instances": null,
-   "shared_with": null
+   "shared_with": null,
+   "category": "claude"
   },
   {
    "owner_id": "service:vm:colima",
@@ -101,7 +102,8 @@
     "Checkout refactor",
     "Billing API tests"
    ],
-   "stop_command": "colima stop"
+   "stop_command": "colima stop",
+   "category": "service"
   },
   {
    "owner_id": "app:com.example.browser",
@@ -136,7 +138,8 @@
      "pid": 6390,
      "launch_date": 1791446000.0
     }
-   ]
+   ],
+   "category": "app"
   },
   {
    "owner_id": "codex:fixture-b",
@@ -186,7 +189,8 @@
    ],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "codex"
   },
   {
    "owner_id": "claude:fixture-c",
@@ -213,7 +217,8 @@
    "jobs": [],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "claude"
   }
  ],
  "_view": {

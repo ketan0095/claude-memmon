@@ -134,7 +134,8 @@
    "instances": null,
    "shared_with": null,
    "footprint_reason": "not measured",
-   "cpu_reason": "warming up"
+   "cpu_reason": "warming up",
+   "category": "claude"
   },
   {
    "owner_id": "codex:fixture-b",
@@ -184,7 +185,8 @@
    ],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "codex"
   },
   {
    "owner_id": "claude:fixture-c",
@@ -211,7 +213,8 @@
    "jobs": [],
    "actions": [
     "end-session"
-   ]
+   ],
+   "category": "claude"
   },
   {
    "owner_id": "unknown:9101.1791400000",
@@ -235,7 +238,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   },
   {
    "owner_id": "unknown:9188.1791400000",
@@ -259,7 +263,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   },
   {
    "owner_id": "unknown:9240.1791400000",
@@ -283,7 +288,8 @@
    "token": null,
    "jobs": [],
    "actions": [],
-   "cpu_coverage": null
+   "cpu_coverage": null,
+   "category": "unknown"
   }
  ],
  "_view": {
