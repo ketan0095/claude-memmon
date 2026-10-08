@@ -228,6 +228,9 @@ printf 'saved prompt'
             "FOO=1 npx vitest run src/a.test.ts": "npx vitest run src/a.test.ts",
             "nice -n 10 cargo build --release 2>&1 | tail": "cargo build --release",
             "timeout -k 5 600 make -j8": "make -j8",
+            "caffeinate -s pnpm build": "pnpm build",
+            "caffeinate -t 60 pnpm build": "pnpm build",
+            "env -u FOO pnpm build": "pnpm build",
         }
         for cmd, want in cases.items():
             self.assertEqual(memmon.short_command(cmd), want, cmd)

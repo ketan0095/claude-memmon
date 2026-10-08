@@ -691,6 +691,24 @@ struct RingSegment: Identifiable {
     var bytes: Double
     /// What the ring draws; never more in total than memory in use.
     var arc: Double
+    /// A section with an unmeasured row is a lower bound, and then System &
+    /// other, being the remainder, is an upper bound.
+    var bound: Bound = .exact
+    enum Bound { case exact, atLeast, atMost }
+    var shown: String {
+        switch bound {
+        case .exact: return gb(bytes)
+        case .atLeast: return "≥ " + gb(bytes)
+        case .atMost: return "≤ " + gb(bytes)
+        }
+    }
+    var spoken: String {
+        switch bound {
+        case .exact: return gb(bytes)
+        case .atLeast: return "at least " + gb(bytes)
+        case .atMost: return "at most " + gb(bytes)
+        }
+    }
 }
 
 /// The ring's arcs: one per section with memory, in section order, then
@@ -702,7 +720,8 @@ struct RingSegment: Identifiable {
 func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
     var out: [RingSegment] = sectionedOwners(rows, by: .memory).compactMap { sec, owners in
         guard let total = sectionTotal(owners), total > 0 else { return nil }
-        return RingSegment(kind: .section(sec), bytes: total, arc: total)
+        let partial = owners.contains { $0.footprint == nil }
+        return RingSegment(kind: .section(sec), bytes: total, arc: total, bound: partial ? .atLeast : .exact)
     }
     guard let used else { return out }
     let sum = out.reduce(0) { $0 + $1.bytes }
@@ -711,7 +730,8 @@ func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
         for i in out.indices { out[i].arc = out[i].bytes * k }
     }
     let system = max(used - sum, 0)
-    out.append(RingSegment(kind: .system, bytes: system, arc: system))
+    let unmeasured = rows.contains { $0.footprint == nil }
+    out.append(RingSegment(kind: .system, bytes: system, arc: system, bound: unmeasured ? .atMost : .exact))
     return out
 }
 
@@ -2972,8 +2992,11 @@ func statusState(_ s: OwnersSnap?, refreshing: Bool, stillSampling: Bool) -> Sta
             sampled = "Sample time unknown"
         }
     }
-    if refreshing { return StatusState(kind: .syncing, text: "Syncing…", spoken: "Syncing; " + sampled) }
-    if stillSampling {
+    // A stale sample stays visibly stale while a refresh runs: scans that keep
+    // timing out would otherwise show "Syncing…" over old data indefinitely.
+    let staleNow = s.map { $0.stale } ?? false
+    if refreshing && !staleNow { return StatusState(kind: .syncing, text: "Syncing…", spoken: "Syncing; " + sampled) }
+    if stillSampling && !staleNow {
         return StatusState(kind: .sampling, text: "Still sampling…", spoken: "Still sampling; " + sampled)
     }
     guard let s else { return StatusState(kind: .stale, text: "No sample", spoken: sampled) }
@@ -3303,7 +3326,7 @@ struct ContentView: View {
             head += ram.map { String(format: " of %.0f GB in use", $0 / GB) } ?? " GB in use"
             if over { head += ", over the limit" }
             head += ", pressure \(pressureWord(level).lowercased())"
-            let parts = segments.map { "\($0.name) \(gb($0.bytes))" } + (free.map { ["free \(gb($0))"] } ?? [])
+            let parts = segments.map { "\($0.name) \($0.spoken)" } + (free.map { ["free \(gb($0))"] } ?? [])
             return head + "; " + parts.joined(separator: ", ")
         }()
         return VStack(alignment: .leading, spacing: 10) {
@@ -3358,15 +3381,15 @@ struct ContentView: View {
                     model.scrollTarget = sec
                 }
             } label: {
-                LegendRow(color: P.section(sec), name: seg.name, value: gb(seg.bytes))
+                LegendRow(color: P.section(sec), name: seg.name, value: seg.shown)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Show \(seg.name) in the list, \(gb(seg.bytes))")
+            .accessibilityLabel("Show \(seg.name) in the list, \(seg.spoken)")
         case .system:
-            LegendRow(color: P.system, name: seg.name, value: gb(seg.bytes))
+            LegendRow(color: P.system, name: seg.name, value: seg.shown)
                 .help(systemLine(s))
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("System & other, \(gb(seg.bytes)). " + systemLine(s))
+                .accessibilityLabel("System & other, \(seg.spoken). " + systemLine(s))
         }
     }
 

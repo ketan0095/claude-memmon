@@ -2221,7 +2221,11 @@ PENDING = os.path.join(STATE_DIR, "blocked.json")
 # A pressure block is temporary: after this long the session has retried in
 # some form or moved on, so the entry stops asking to be re-run.
 PENDING_TTL_S = 2 * 3600
-WRAPPERS = {"timeout", "gtimeout", "nice", "time", "caffeinate", "env", "command"}
+# Launch wrappers the short form strips, with the options of each that take a value.
+WRAPPERS = {"timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "gtimeout": {"-s", "-k", "--signal", "--kill-after"},
+            "nice": {"-n"}, "time": set(), "caffeinate": {"-t", "-w"},
+            "env": {"-u", "-S", "-P", "--unset"}, "command": set()}
 
 
 def session_name_for(session_id: str) -> str:
@@ -2416,9 +2420,9 @@ def short_command(cmd: str, limit: int = 60) -> str:
         out.append(t)
     while out and (out[0] in WRAPPERS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0])):
         head = out.pop(0)
+        takes = WRAPPERS.get(head, set())
         while out and out[0].startswith("-"):
-            flag = out.pop(0)
-            if flag in ("-n", "-s", "-k") and out:
+            if out.pop(0) in takes and out:
                 out.pop(0)
         if head in ("timeout", "gtimeout") and out and re.match(r"^[\d.]+[smhd]?$", out[0]):
             out.pop(0)

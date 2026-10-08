@@ -1031,6 +1031,26 @@ class HeaderAndRingTests(unittest.TestCase):
         still = self.probe("overview.json", "--reduce-motion")["motion"]
         self.assertEqual(still, {"sweep": False, "sweep_render": False, "pulse": False})
 
+    def test_stale_stays_visible_while_a_refresh_runs(self):
+        for flag in ("--refreshing", "--sampling"):
+            state = self.probe("stale-paused.json", flag)["status"]
+            self.assertEqual((state["kind"], state["text"]), ("stale", "Stale · 3 min"), flag)
+
+    def test_ring_marks_a_partly_measured_section_as_a_lower_bound(self):
+        payload = effective(FIXTURES / "overview.json")
+        row = next(o for o in payload["owners"] if o["title"] == "Checkout refactor")
+        row["footprint_bytes"], row["footprint_reason"] = None, "not measured"
+        path = Path(self.tmp.name) / "unmeasured.json"
+        path.write_text(json.dumps(payload))
+        found = labels(a11y_path(path))
+        ring = next(l for l in found if l.startswith("Memory "))
+        self.assertIn("Claude sessions at least 0.6 GB", ring)
+        self.assertIn("System & other at most ", ring)
+        system = next(l for l in found if l.startswith("System & other,"))
+        self.assertTrue(system.startswith("System & other, at most "), system)
+        exact = labels(a11y("overview.json"))
+        self.assertIn("Show Claude sessions in the list, 9.5 GB", exact)
+
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
         self.assertIn("Show Claude sessions in the list, 9.5 GB", found)
