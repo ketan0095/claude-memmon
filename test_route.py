@@ -282,12 +282,17 @@ class RouteClassifyTests(unittest.TestCase):
                     "docker run --detach=true ubuntu", "docker run --tty=true ubuntu",
                     "docker compose up", "(pnpm test &)", "(pnpm build &) ; echo hi",
                     "echo a#b; pnpm build &", "git log --format=%h#x; pnpm test &",
-                    "pnpm test &; echo x"):
+                    "pnpm test &; echo x", "pytest -f", "pytest --looponfail",
+                    "playwright test --ui", "npx playwright test --ui=true", "gradle bootRun",
+                    "./gradlew :app:bootRun", "bazel run //server", "make run",
+                    "coproc pnpm build", "npx tsc -w", "vite build -w"):
             with self.subTest(cmd):
                 self.assertEqual(self.check(cmd)[0], "pass")
         for cmd in ("pnpm build", "pnpm --filter acme-web build", "pnpm test&&echo x",
                     "pnpm build 2>&1 | tail", "docker build -t acme/web .",
-                    "CI=1 pnpm test", "echo '#' && pnpm typecheck"):
+                    "CI=1 pnpm test", "echo '#' && pnpm typecheck", "pnpm -w run build",
+                    "jest -w 4", "make build", "gradle build", "bazel build //server",
+                    "docker build -f Dockerfile ."):
             with self.subTest(cmd):
                 self.assertEqual(self.check(cmd)[0], "wrap")
 

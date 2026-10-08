@@ -989,7 +989,8 @@ class Runner:
         2.1 s worst case) and a few waiters behind it. A sample that still
         cannot be written is logged, never silently lost."""
         try:
-            with ledger(self.paths, self.clock, self.clock.mono() + wait_s):
+            # A SIGINT/SIGTERM during the wait ends it at once.
+            with ledger(self.paths, self.clock, self.clock.mono() + wait_s, self.cancelled):
                 record_peak(self.paths, self.key, self.peak, self.clock.wall())
             return True
         except Exception as exc:

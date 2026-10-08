@@ -1023,6 +1023,16 @@ class OmegaR1LedgerTests(Base):
         finally:
             fh.close()
         self.assertEqual(self.log()[-1]["decision"], "peak_dropped")
+        # A SIGINT/SIGTERM during the wait returns at once (the handler sets this flag).
+        fh = open(r.paths.ledger, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        threading.Timer(0.3, lambda: r.cancelled.__setitem__(0, signal.SIGTERM)).start()
+        t0 = time.monotonic()
+        try:
+            self.assertFalse(r.save_peak())
+        finally:
+            fh.close()
+        self.assertLess(time.monotonic() - t0, 2.0)
 
 
 class OverheadTests(Base):

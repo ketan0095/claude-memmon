@@ -48,7 +48,14 @@ LINE_OFF = "Route off"
 SERVER_WORDS = {"dev", "start", "serve", "watch"}
 DAEMON_EXES = {("colima", "start"), ("expo", "start")}
 DOCKER_LONG = {"--detach", "--interactive", "--tty"}
-BACKGROUND_EXES = {"nohup", "setsid", "disown"}
+BACKGROUND_EXES = {"nohup", "setsid", "disown", "coproc"}
+# Tools where a bare -w means watch (pnpm's -w is --workspace-root, jest's
+# is the worker count).
+WATCH_W_TOOLS = {"tsc", "vite", "webpack", "nodemon", "rollup", "esbuild", "babel",
+                 "sass", "tailwindcss", "vitest", "tsup", "parcel"}
+# Build tools whose `run` target starts the program rather than building it.
+RUN_TOOLS = {"make", "gradle", "gradlew", "bazel", "bazelisk"}
+INTERACTIVE_FLAGS = {"--ui", "--headed", "--debug", "--looponfail", "--interactive", "--tty"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 SHORT_BUNDLE = re.compile(r"-[a-z]+")
 
@@ -96,10 +103,27 @@ def _backgrounds(tok: str) -> bool:
 
 def _server_word(arg: str) -> bool:
     """dev, start, serve or watch as a word or a script part (dev:web,
-    test:watch), and the watch flags (--watch, --watchAll, -w)."""
-    if arg.startswith("--watch") or arg == "-w":
+    test:watch), and the long watch flags (--watch, --watchAll)."""
+    if arg.startswith("--watch"):
         return True
     return any(part in SERVER_WORDS for part in arg.split(":"))
+
+
+def _long_running(exe: str, args: list) -> str | None:
+    """Why a command would keep running or wait on a person, or None.
+    Anything named here passes through unwrapped, which is always safe."""
+    tools = {exe} | {os.path.basename(a) for a in args}
+    if any(_server_word(a) for a in args):
+        return "server or watcher"
+    if "-w" in args and tools & WATCH_W_TOOLS:
+        return "server or watcher"
+    if exe in RUN_TOOLS and any(a.rsplit(":", 1)[-1].endswith("run") for a in args):
+        return "server or watcher"              # make run, gradle bootRun, bazel run
+    if any(a.split("=", 1)[0] in INTERACTIVE_FLAGS for a in args):
+        return "interactive"
+    if "pytest" in tools and "-f" in args:
+        return "interactive"                    # pytest-xdist looponfail
+    return None
 
 
 def _docker_daemon(args: list) -> bool:
@@ -147,14 +171,13 @@ def route_classify(invocation: str, env=None, classify_fn=None, split_fn=None) -
         if exe in ("memmon", "memmon.py") or (exe.startswith("python") and any(
                 os.path.basename(a) == "memmon.py" for a in args[:2])):
             return "pass", "already wrapped"
-        if any(_server_word(a) for a in args):
-            return "pass", "server or watcher"
+        why = _long_running(exe, args)
+        if why:
+            return "pass", why
         if exe == "docker" and _docker_daemon(args):
             return "pass", "server or daemon"
         if (exe, args[0] if args else "") in DAEMON_EXES:
             return "pass", "server or daemon"
-        if any(a.split("=", 1)[0] in ("--interactive", "--tty") for a in args):
-            return "pass", "interactive"
     hit = classify_fn(cmd)
     if not hit.get("matched"):
         return "pass", "not heavy"
