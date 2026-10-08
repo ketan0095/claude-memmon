@@ -446,13 +446,13 @@ nearest one wins.
 
 | Owner | Found by | Confidence |
 |---|---|---|
-| Claude session | `~/.claude/sessions/<pid>.json`, checked against the process start time | exact |
+| Claude session | `~/.claude/sessions/<pid>.json` or `/tmp/cc-socks/<pid>.sock`, each checked against the process start time (an idle prewarm is not a session) | exact |
 | Codex `exec` | a `codex exec` process; its thread from the rollout file it holds open | inferred |
 | Codex daemon / app-server | the shared server that hosts interactive threads | shared |
-| Codex terminal frontend | an interactive `codex` with no children — a pointer to the daemon | inferred |
+| Codex terminal frontend | an interactive `codex` connected to the Codex daemon (or started with `--remote`) that holds no thread itself and has no children — a pointer to the daemon | shared |
 | Managed job | the child of a live `memmon run` lease | exact |
-| App | an executable in `Contents/MacOS` of an `Applications/<Name>.app` (the outermost bundle, helpers included); one row, every instance | exact |
-| VM / container service | Docker Desktop or OrbStack (quit as an app), or the Virtualization VM process, Lima/Colima, qemu (a copyable stop command) | shared |
+| App | an executable in `Contents/MacOS` of an `Applications/<Name>.app` (the outermost bundle, helpers included, or the code-signing clone an app re-executes from); one row per bundle id. Only processes running the main executable are instances; an app with none (widgets only) has no quit action, and neither has one that hosts a Claude or Codex session | exact |
+| VM / container service | Docker Desktop or OrbStack (quit as an app), or the Virtualization VM process, Lima/Colima, qemu (a copyable stop command). A VM joins Docker Desktop or OrbStack only when macOS names that app responsible for it | shared |
 | Unattributed | any other top-level process tree | unknown |
 
 A language runtime that merely lives inside an app bundle — Python inside
@@ -472,8 +472,10 @@ freshly started owner, or one seen across a sleep, says "not enough history".
 
 ### Stopping something
 
-`memmon act` is the only part of memmon that sends a signal, and the menu bar
-goes through it too. Each action takes a token from `memmon owners --json` that
+`memmon act` is the only part of memmon that signals a process memmon did not
+start (`memmon run` signals only its own child), and the menu bar goes through
+it too. It is the confirmed step: a script or agent shows the row to a person
+first and acts only on their say-so; nothing in memmon stops anything on its own. Each action takes a token from `memmon owners --json` that
 names the exact processes it was shown, and expires after 120 seconds:
 
 | Action | Stops | Keeps running |
@@ -493,9 +495,14 @@ PID reused in the instant between that re-read and the signal would be signalled
 It is graceful first. Everything gets SIGTERM; memmon then watches for up to 10
 seconds, catching any child forked in the meantime, and reports exactly what is
 still alive. Nothing is force-killed automatically. If something survives, the
-result is `partial` with a force token naming only those survivors, and only
-`memmon act force --target <token>` sends SIGKILL to them — after re-reading each
-one again. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial,
+result is `partial` with a force token naming only the survivors it signalled,
+and only `memmon act force --target <token>` sends SIGKILL to them — after
+re-reading each one again, and skipping any that has since become another
+owner's root. Processes the stop only observed (a reparented child found in the
+group, say) are listed as `forceable: false`; force never touches them and its
+result stays `partial` while they run. If a job's process exited before the stop
+but what it started is still running in its group, the result is `partial`
+(`root_exited`) with those processes listed and nothing signalled. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial,
 or respawned), 4 (refused) or 1 (error), and it reports memory in use before and
 after as a measurement: other apps change it too, so it is never a promise of
 what was freed.
@@ -531,8 +538,19 @@ memmon reap --force <token>
 
 That token names only the processes that survived, by identity, and expires
 after 120 seconds. Orphans that appeared after the first run are never touched
-by it. `--reap-spares --apply` goes through the same engine. The menu bar no
-longer has a Reap button; reaping is a command-line action.
+by it. `--reap-spares --apply` goes through the same engine. Without `--apply`
+the same engine decides without signalling: the dry run lists every process
+`--apply` would signal, descendants included, and every one it would refuse.
+With `--apply`, `reap`, `--reap`, `--reap-spares` and `--end-session` exit with
+the outcome's code (0 done, 3 partial, 4 refused). The menu bar no longer has a
+Reap button; reaping is a command-line action.
+
+### Upgrading with the old menu bar still running
+
+Until `./install.sh --menubar` replaces it, an already-running menu bar from
+before this version still calls `--end-session` and `--reap`. Those now take the
+graceful path, which can keep the old app busy for up to about 25 seconds per
+click. Reinstall the menu bar to get the new popover.
 
 ## Crash prediction
 
