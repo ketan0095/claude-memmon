@@ -379,6 +379,24 @@ class SamplerPathTests(unittest.TestCase):
         self.assertEqual((allow, empty), ("allow", ""))
 
 
+class OwnersTextTests(unittest.TestCase):
+    def test_owners_prints_an_under_pressure_section_without_tokens(self):
+        payload = {"owners": [], "inventory": "libproc", "hidden_process_count": 3,
+                   "pressure_suggestions": [
+                       {"label": "vitest in acme-web", "footprint": 9 * GB, "idle_s": 0,
+                        "growth_mb_min": 120.0, "stop": "stop-job", "token": "SECRET"},
+                       {"label": "vitest", "footprint": 2 * GB, "stop": None,
+                        "stop_note": mpx.ORPHAN_NOTE, "token": None}]}
+        text = memmon.owners_text(payload)
+        self.assertIn("Under pressure", text)
+        self.assertIn("vitest in acme-web holds 9.0G and is growing 120 MB/min.", text)
+        self.assertIn("memmon act stop-job --target <token from owners --json>", text)
+        self.assertIn(mpx.ORPHAN_NOTE, text)
+        self.assertNotIn("SECRET", text)
+        quiet = memmon.owners_text({**payload, "pressure_suggestions": []})
+        self.assertNotIn("Under pressure", quiet)
+
+
 class EpisodeTests(unittest.TestCase):
     def step(self, st, minute, pressured=False, unknown=False, gap=False, rows=()):
         return mpx.episode_step(st, now_ts=T0 + 60 * minute, mono=1000 + 60 * minute,
