@@ -682,6 +682,9 @@ struct OwnersSnap {
     /// memmon's under_pressure predicate; nil from an older payload.
     var underPressure: Bool?
     var suggestions: [Suggestion] = []
+    /// What memmon covers, in its own words: the route line first, then the
+    /// work outside memmon run. Older payloads carry only protection.route.
+    var coverage: [String] = []
     var owners: [Owner] = []
 
     var degraded: Bool { inventory == "degraded" }
@@ -718,6 +721,7 @@ struct OwnersSnap {
             s.sampler = info
         }
         s.underPressure = j["under_pressure"] as? Bool
+        s.coverage = strs(j["coverage"]) ?? []
         s.suggestions = (j["pressure_suggestions"] as? [[String: Any]] ?? []).compactMap(Suggestion.decode)
         if let y = j["system"] as? [String: Any] {
             s.system = SystemInfo(ramBytes: num(y["ram_bytes"]), usedBytes: num(y["used_bytes"]),
@@ -3992,10 +3996,12 @@ func statusState(_ s: OwnersSnap?, refreshing: Bool, stillSampling: Bool) -> Sta
     guard let s else { return StatusState(kind: .stale, text: "No sample", spoken: sampled) }
     guard let age = s.age else { return StatusState(kind: .stale, text: "Time unknown", spoken: sampled) }
     // UNKNOWN already says the reading can't be trusted: the age is plain
-    // and muted, with no live dot, no amber clock and no "stale".
+    // and muted, with no live dot, no amber clock and no "stale" on screen.
+    // The spoken label still says stale, so nothing hides it.
     if s.system.scoreLevel == "UNKNOWN" {
         return StatusState(kind: .plain, text: "Sampled \(ageText(age)) ago",
-                           spoken: "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader"), pressure unknown")
+                           spoken: "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader")"
+                               + (s.stale ? ", stale" : "") + ", pressure unknown")
     }
     if s.stale { return StatusState(kind: .stale, text: "Stale · \(ageText(age))", spoken: sampled) }
     return StatusState(kind: .live, text: "Live · \(ageText(age))", spoken: sampled)
@@ -4494,6 +4500,8 @@ struct ContentView: View {
             default: return ("Protection unknown", "Protection status unknown", P.muted)
             }
         }()
+        // The route state is "on"/"off"; its sentence is coverage[0].
+        let lines = !s.coverage.isEmpty ? s.coverage : (p?.route.map { ["Route \($0)"] } ?? [])
         return HStack(spacing: 5) {
             Image(systemName: p?.summary == "on" ? "checkmark.shield" : "shield")
                 .font(.system(size: 11, weight: .semibold))
@@ -4504,9 +4512,10 @@ struct ContentView: View {
         .background(Capsule().fill(tint.opacity(0.13)))
         .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
         .fixedSize()
-        .help(full)
+        .help(([full] + lines).joined(separator: "\n"))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(full)
+        .accessibilityValue(lines.joined(separator: ". "))
     }
 
     private func degradedBanner(_ reason: String?) -> some View {

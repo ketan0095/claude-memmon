@@ -1640,12 +1640,16 @@ class UnknownPressureTests(StubCase):
         r = s2("pressure-unknown.json")
         self.assertEqual(r["s2"]["pressure"], {"word": "Unknown", "tone": "muted", "glyph": True})
         self.assertEqual((r["status"]["kind"], r["status"]["text"]), ("plain", "Sampled 6 min ago"))
-        self.assertNotIn("stale", r["status"]["spoken"])
+        self.assertNotIn("stale", r["status"]["text"])
+        # Busy states never hide staleness, and the spoken label keeps it.
+        busy = s2("pressure-unknown.json", None, "--refreshing")["status"]
+        self.assertEqual((busy["kind"], busy["text"]), ("plain", "Sampled 6 min ago"))
+        self.assertIn(", stale", busy["spoken"])
         found = labels(a11y("pressure-unknown.json"))
         ring = next(l for l in found if l.startswith("Memory "))
         self.assertIn("pressure unknown", ring)
         self.assertNotIn("normal", ring.lower())
-        self.assertIn("Sampled 6 min ago by the background sampler, pressure unknown", found)
+        self.assertIn("Sampled 6 min ago by the background sampler, stale, pressure unknown", found)
 
     def test_a_fresh_unknown_is_not_live(self):
         p = payload("pressure-unknown.json", ts=effective(FIXTURES / "pressure-unknown.json")["_now"] - 2)
@@ -1670,6 +1674,33 @@ class UnknownPressureTests(StubCase):
     def test_retry_copy_under_unknown_says_the_gate_lets_it_run(self):
         found = said("pressure-unknown.json")
         self.assertTrue(any("a retry runs without a memory check" in l for l in found), found)
+
+
+class CoverageTests(unittest.TestCase):
+    """S2.7: the route sentence is coverage[0]; protection.route is the state."""
+
+    def pill(self, p):
+        rows = a11y_path_payload(p)
+        return next(r for r in rows if r["label"].startswith("Protection "))
+
+    def test_coverage_lines_follow_the_protection_pill(self):
+        lines = ["Route on: heavy Bash from Claude sessions started after it was turned on",
+                 "2 heavy processes not started through memmon run",
+                 "Codex, other apps and terminals are covered only when they call memmon run"]
+        row = self.pill(payload("overview.json", coverage=lines))
+        self.assertEqual(row["label"], "Protection partial · 2 heavy processes not started through memmon run")
+        self.assertEqual(row["described"] or row["value"], ". ".join(lines))
+
+    def test_without_coverage_the_route_state_is_named(self):
+        row = self.pill(payload("overview.json"))
+        self.assertEqual(row["described"] or row["value"], "Route off")
+
+
+def a11y_path_payload(p):
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "payload.json"
+        path.write_text(json.dumps(p))
+        return a11y_path(path)
 
 
 class GapNoticeTests(unittest.TestCase):
