@@ -1889,7 +1889,7 @@ def _stop_report(out: dict, what: str) -> str:
         L = [f"{what}: {r} — {gone} of {out['named']} named survivor(s) gone: "
              f"{killed} killed by SIGKILL, {gone - killed - alone} had already exited"]
         if alone:
-            L.append(f"{alone} ended on their own while protected")
+            L.append(f"{alone} ended on {'its' if alone == 1 else 'their'} own while protected")
     elif out.get("reason") == "root_exited":
         L = [f"{what}: the job had already exited, but processes it started are "
              "still running in its group (nothing was signalled)"]

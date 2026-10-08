@@ -580,7 +580,7 @@ class AccessibilityTests(unittest.TestCase):
 
     def test_protected_survivors_that_ended_are_not_already_exited(self):
         text = self.spoken("outcome-force-protected-gone.json")
-        self.assertIn("1 ended by force · 1 had already exited · 1 ended on their own while protected", text)
+        self.assertIn("1 ended by force · 1 had already exited · 1 ended on its own while protected", text)
 
     def test_self_exited_survivors_are_not_counted_as_force_stopped(self):
         text = self.spoken("outcome-force-self-exited.json")
@@ -619,7 +619,7 @@ class AccessibilityTests(unittest.TestCase):
     def test_watch_error_is_a_note_on_a_stop_that_stands(self):
         text = self.spoken("outcome-watch-error.json")
         self.assertIn("Checkout refactor stopped · 9 of 9 processes exited", text)
-        self.assertIn("(measured; other apps also change) · (memmon could not keep watching for a restart)", text)
+        self.assertIn("(measured; other apps also change; memmon could not keep watching for a restart)", text)
         self.assertNotIn("Result unknown", text)
 
     def test_helpers_only_app_row_offers_nothing_to_quit(self):
@@ -665,7 +665,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("CPU not available, partly measured", row)
 
     def test_kept_owners_are_named_by_kind(self):
-        self.assertIn("2 nested sessions kept running · 1 app or service kept running",
+        self.assertIn("2 nested sessions and 1 app or service kept running",
                       self.spoken("outcome-kept.json"))
 
     def test_force_with_named_survivors_stays_partial(self):

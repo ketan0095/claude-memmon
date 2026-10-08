@@ -269,7 +269,7 @@ class FakeActTests(unittest.TestCase):
         self.assertNotIn((22, signal.SIGKILL), self.src.signals)
         text = memmon._stop_report(forced, "force")
         self.assertIn("1 killed by SIGKILL, 0 had already exited", text)
-        self.assertIn("1 ended on their own while protected", text)
+        self.assertIn("1 ended on its own while protected", text)
 
     def test_force_row_says_why_a_survivor_was_not_killed(self):
         self.src.ignore_term = {21, 22}

@@ -848,7 +848,9 @@ struct ActOutcome {
     var goneParts: [String] {
         var parts: [String] = []
         if alreadyGone > 0 { parts.append("\(alreadyGone) had already exited") }
-        if exitedUnsignalled > 0 { parts.append("\(exitedUnsignalled) ended on their own while protected") }
+        if exitedUnsignalled > 0 {
+            parts.append("\(exitedUnsignalled) ended on \(exitedUnsignalled == 1 ? "its" : "their") own while protected")
+        }
         return parts
     }
 
@@ -1175,10 +1177,9 @@ enum Copy {
     static func keptParts(_ kept: [String]) -> [String] {
         let sessions = kept.filter { id in ["claude:", "codex:", "codex-proc:"].contains { id.hasPrefix($0) } }.count
         let others = kept.count - sessions
-        var out: [String] = []
-        if sessions > 0 { out.append("\(plural(sessions, "nested session")) kept running") }
-        if others > 0 { out.append("\(plural(others, "app or service", "apps or services")) kept running") }
-        return out
+        let names = [sessions > 0 ? plural(sessions, "nested session") : nil,
+                     others > 0 ? plural(others, "app or service", "apps or services") : nil].compactMap { $0 }
+        return names.isEmpty ? [] : [names.joined(separator: " and ") + " kept running"]
     }
 
     /// Survivors are never reported as success: whatever the result word, a
@@ -1210,7 +1211,10 @@ enum Copy {
     static func banner(_ view: ActView, subject: String, noun: String, forcing: Bool = false) -> Banner {
         var b = outcomeBanner(view, subject: subject, noun: noun, forcing: forcing)
         if case .success(let o) = view, o.watchError != nil {
-            b.note = [b.note, "(memmon could not keep watching for a restart)"].compactMap { $0 }.joined(separator: " · ")
+            let gap = "memmon could not keep watching for a restart"
+            if let n = b.note, n.hasSuffix(")") { b.note = n.dropLast() + "; \(gap))" } else {
+                b.note = [b.note, "(\(gap))"].compactMap { $0 }.joined(separator: " · ")
+            }
         }
         return b
     }
