@@ -413,6 +413,13 @@ struct SamplingGap {
 struct SamplerInfo {
     var lastTs: Double?, age: Double?, stale: Bool?
     var lastGap: SamplingGap?
+    /// The last starved gap, which a later ordinary sleep gap does not
+    /// overwrite. `nil` inside `.some` means the payload says there is none;
+    /// an outer nil is an older payload that only has last_gap.
+    var lastStarvedGap: SamplingGap??
+
+    /// What the 24 h notice reads.
+    var noticeGap: SamplingGap? { lastStarvedGap ?? lastGap }
 }
 
 /// One unmanaged heavy job worth stopping under pressure (S2.11). Its token
@@ -714,10 +721,13 @@ struct OwnersSnap {
         }
         if let y = j["sampler"] as? [String: Any] {
             var info = SamplerInfo(lastTs: num(y["last_ts"]), age: num(y["age_s"]), stale: y["stale"] as? Bool)
-            if let g = y["last_gap"] as? [String: Any], let cause = str(g["cause"]) {
-                info.lastGap = SamplingGap(cause: cause, awake: num(g["awake_s"]), asleep: num(g["asleep_s"]),
-                                           fromTs: num(g["from_ts"]), toTs: num(g["to_ts"]))
+            func gap(_ v: Any?) -> SamplingGap? {
+                guard let g = v as? [String: Any], let cause = str(g["cause"]) else { return nil }
+                return SamplingGap(cause: cause, awake: num(g["awake_s"]), asleep: num(g["asleep_s"]),
+                                   fromTs: num(g["from_ts"]), toTs: num(g["to_ts"]))
             }
+            info.lastGap = gap(y["last_gap"])
+            if y.keys.contains("last_starved_gap") { info.lastStarvedGap = .some(gap(y["last_starved_gap"])) }
             s.sampler = info
         }
         s.underPressure = j["under_pressure"] as? Bool
@@ -828,7 +838,7 @@ struct GapNotice: Equatable {
 }
 
 func gapNotice(_ s: OwnersSnap, dismissed: Double?, now: Double) -> GapNotice? {
-    guard let g = s.sampler?.lastGap, g.cause == "starved", let awake = g.awake, awake >= 300,
+    guard let g = s.sampler?.noticeGap, g.cause == "starved", let awake = g.awake, awake >= 300,
           let end = g.toTs, now - end <= 86_400, dismissed != end else { return nil }
     let span = g.fromTs.map { " (\(eventClock($0))–\(eventClock(end)))" } ?? ""
     return GapNotice(key: end, text: "memmon couldn’t sample for \(max(1, Int((awake / 60).rounded()))) min "

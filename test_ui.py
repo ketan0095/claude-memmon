@@ -1732,6 +1732,26 @@ class GapNoticeTests(unittest.TestCase):
         self.assertIsNone(s2(payload=self.gap(to_ts=now - 86_401, from_ts=now - 90_000))["s2"]["gap_notice"])
         self.assertIsNone(s2(payload=payload("sampler-gap.json", sampler=None))["s2"]["gap_notice"])
 
+    def test_a_later_sleep_gap_does_not_hide_a_recent_starved_one(self):
+        p = payload("sampler-gap.json")
+        starved = p["sampler"]["last_gap"]
+        sleep = {"cause": "sleep", "gap_s": 540.0, "asleep_s": 490.0, "awake_s": 50.0,
+                 "from_ts": starved["to_ts"] + 30, "to_ts": starved["to_ts"] + 570}
+        p["sampler"] = dict(p["sampler"], last_gap=sleep, last_starved_gap=starved)
+        self.assertEqual(s2(payload=p)["s2"]["gap_notice"], self.expected(starved))
+        # Without last_starved_gap (an older payload), last_gap still drives it.
+        self.assertEqual(s2("sampler-gap.json")["s2"]["gap_notice"], self.expected(starved))
+        # A payload that says there is no starved gap shows nothing, whatever last_gap is.
+        p["sampler"] = dict(p["sampler"], last_gap=starved, last_starved_gap=None)
+        self.assertIsNone(s2(payload=p)["s2"]["gap_notice"])
+
+    def test_dismissal_keys_the_starved_gap(self):
+        r = host("gap-dismiss", FIXTURES / "sampler-gap-after-sleep.json")
+        starved = effective(FIXTURES / "sampler-gap-after-sleep.json")["sampler"]["last_starved_gap"]
+        self.assertIsNotNone(r["before"])
+        self.assertIsNone(r["after"])
+        self.assertEqual(r["stored"], starved["to_ts"])
+
     def test_dismissal_hides_that_gap_and_not_a_later_one(self):
         g = effective(FIXTURES / "sampler-gap.json")["sampler"]["last_gap"]
         r = host("gap-dismiss", FIXTURES / "sampler-gap.json",
