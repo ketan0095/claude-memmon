@@ -22,7 +22,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 PROC_PIDTBSDINFO = 3
 PROC_PIDVNODEPATHINFO = 9
@@ -124,6 +124,11 @@ class ProcSource:
     def cwd(self, pid: int) -> str | None:
         return None
 
+    def responsible(self, pid: int) -> int | None:
+        """The process macOS holds responsible for `pid` (for an XPC service,
+        the app that asked for it), or None."""
+        return None
+
     def timebase(self) -> tuple:
         return (1, 1)
 
@@ -223,6 +228,14 @@ class LibprocSource(ProcSource):
         buf = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
         n = self.lib.proc_pidpath(pid, buf, PROC_PIDPATHINFO_MAXSIZE)
         return buf.value.decode("utf-8", "replace") if n > 0 else None
+
+    def responsible(self, pid: int) -> int | None:
+        fn = getattr(self.libc, "responsibility_get_pid_responsible_for_pid", None)
+        if fn is None:
+            return None
+        fn.argtypes, fn.restype = [ctypes.c_int], ctypes.c_int
+        r = fn(pid)
+        return r if r > 0 else None
 
     def cwd(self, pid: int) -> str | None:
         buf = ctypes.create_string_buffer(VNODEPATHINFO_SIZE)
@@ -385,7 +398,10 @@ def self_check(source: LibprocSource, memsize: int | None = None) -> str | None:
     numer, denom = source.timebase()
     cpu_s = proc.cpu_ticks * numer / denom / 1e9
     expect = time.process_time()
-    if abs(cpu_s - expect) > 0.05 + 0.25 * expect:
+    # Both numbers come from the same kernel task times (measured identical
+    # to the microsecond), so a unit error of any size shows; 41.7x is what
+    # a wrong timebase would be on arm64.
+    if abs(cpu_s - expect) > 0.002 + 0.05 * expect:
         return f"cpu ticks disagree ({cpu_s:.3f}s vs {expect:.3f}s)"
     return None
 
@@ -476,6 +492,10 @@ class Inventory:
             self._path[pid] = (self.source.path(pid)
                                if p is not None and p.visible else None)
         return self._path[pid]
+
+    def responsible(self, pid: int) -> int | None:
+        p = self.procs.get(pid)
+        return self.source.responsible(pid) if p is not None and p.visible else None
 
     def cwd(self, pid: int) -> str | None:
         if pid not in self._cwd:

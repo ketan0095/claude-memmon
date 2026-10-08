@@ -25,7 +25,7 @@ import re
 import subprocess
 import sys
 import time
-# argparse, shutil and signal are imported lazily where used. None is reachable
+# argparse and shutil are imported lazily where used. Neither is reachable
 # from gate(), which runs on every Bash tool call; importing them unconditionally
 # measured ~6ms of its ~85ms budget, and shutil alone pulls in bz2 and lzma.
 from collections import defaultdict
@@ -1339,7 +1339,6 @@ def collect() -> dict:
     overhead = {"mem": 0, "n": 0, "oldest": 0, "spares": 0, "spare_mem": 0,
                 "stale": 0, "stale_mem": 0, "items": [],
                 "claimed": 0, "claimed_mem": 0}
-    STALE_SPARE = 4 * 3600
     apps: dict[str, dict] = defaultdict(lambda: {"mem": 0, "n": 0})
     other_heavy = []
     for pid, info in ps.items():
@@ -2521,17 +2520,18 @@ def wait_safe(timeout: int) -> int:
 
 # ------------------------------------------------------------------- owners
 
-def _owners_ctx(titles: bool = True, listening: set | None = None):
+def _owners_ctx(titles: bool = True):
     import memmon_owners
     from memmon_runner import jobs
     ctx = memmon_owners.Context(
         sessions_dir=CLAUDE_SESSIONS_DIR, socks_dir=CC_SOCKS_DIR,
         codex_home=CODEX_HOME, jobs_dir=JOBS_DIR, roster_path=CLAUDE_ROSTER,
         leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
-        lsof=lambda args: _sh(["lsof", *args], timeout=5), listening=listening)
+        lsof=lambda args: _sh(["lsof", *args], timeout=5))
     if titles:
         prof = load_profile()
         ctx.classify = lambda cmd: classify_command(cmd, prof)
+        ctx.commands = lambda cmd: [_command_tokens(t) for t in shell_commands(cmd)]
         for sess in read_sessions():
             ctx.titles_by_job[sess["short"]] = sess["name"]
             if sess["session_id"]:
@@ -2632,7 +2632,10 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     used_by = None
     if expand:
         owners = sample.part.owners
-        wanted = [p for oid in expand for p in (owners[oid].members if oid in owners else [])]
+        # Only agent jobs have a server kind to settle.
+        wanted = [p for oid in expand if oid in owners
+                  and owners[oid].kind in memmon_owners.ENDABLE_KINDS
+                  for p in owners[oid].members]
         ctx.listening = _listening(wanted)
         used_by = {oid: _service_users(sample, oid) for oid in expand
                    if oid in owners and owners[oid].kind == "service"}
@@ -2642,9 +2645,15 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
         system=system_block(system_reader),
         protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
         gate=gate_stats(), used_by=used_by)
-    measured = [o["cpu_cores"] for o in payload["owners"] if o["cpu_cores"] is not None]
+    # A machine-wide CPU figure is only a sum when every member was measured.
+    total = sum(o["member_count"] for o in payload["owners"])
+    seen = sum((o["cpu_coverage"] or 0) * o["member_count"] for o in payload["owners"])
+    coverage = round(seen / total, 3) if total else None
     payload["system"]["ncpu"] = os.cpu_count()
-    payload["system"]["cpu_cores"] = round(sum(measured), 3) if measured else None
+    payload["system"]["cpu_coverage"] = coverage
+    payload["system"]["cpu_cores"] = (round(sum(o["cpu_cores"] for o in payload["owners"]), 3)
+                                      if coverage == 1 else None)
+    payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
     return payload
 
 
@@ -2652,10 +2661,11 @@ def _service_users(sample, oid: str):
     """Sessions that appear to use a VM: agent processes with a TCP connection
     to a port the VM side listens on (Lima's forwards, Docker Desktop's
     backend). Inferred, computed only on demand; None when it cannot be."""
+    import memmon_owners
     part = sample.part
     host = list(part.owners[oid].members)
     agents = {p: o.owner_id for o in part.owners.values()
-              if o.kind in ("claude", "codex") for p in o.members}
+              if o.kind in memmon_owners.ENDABLE_KINDS for p in o.members}
     if not host or not agents:
         return [] if host else None
     listen = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fn",

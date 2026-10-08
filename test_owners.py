@@ -1,6 +1,6 @@
-"""Owner model tests: the partition (I-5), titles and row disambiguation,
-child jobs, history, growth and CPU baselines (I-7), the schema 2 payload,
-legacy compatibility, and public-data hygiene (I-12). Everything runs on an
+"""Owner model tests: the partition, titles and row disambiguation,
+child jobs, history, growth and CPU baselines, the schema 2 payload,
+legacy compatibility, and public-data hygiene. Everything runs on an
 injected process table except where a row says otherwise."""
 
 import contextlib
@@ -86,7 +86,7 @@ class OwnerBase(unittest.TestCase):
                                  history=history, now=inv.ts)
 
     def assert_partition(self, inv, part):
-        """I-5: every visible, live PID in exactly one owner."""
+        """Every visible, live PID in exactly one owner."""
         live = {pid for pid, p in inv.procs.items() if p.visible and not p.zombie}
         seen = [pid for o in part.owners.values() for pid in o.members]
         self.assertEqual(len(seen), len(set(seen)))
@@ -227,7 +227,7 @@ class PartitionTests(OwnerBase):
         self.assertEqual(len(body["instances"]), 2)
 
     def test_codex_tui_without_daemon_evidence_is_its_own_owner(self):
-        # R3: no lsof evidence of a daemon connection -> the safe default, rule 2.
+        # No lsof evidence of a daemon connection -> the safe default, rule 2.
         procs = [P(210, comm="codex"), P(212, ppid=210, pgid=212),
                  P(213, comm="codex")]                    # childless, no evidence
         _, inv, part = self.build(procs, argv={210: ["codex"], 213: ["codex"]})
@@ -238,7 +238,7 @@ class PartitionTests(OwnerBase):
         self.assertEqual((lone.kind, lone.owner_id), ("codex", "codex-proc:213.1700000213"))
 
     def test_codex_tui_ownership_r3(self):
-        # R3 probe fixture: a daemon-connected TUI is a pointer; in-process
+        # Probe fixture: A daemon-connected TUI is a pointer; in-process
         # TUIs (holding a writer lock, with or without a rollout) are rule 2;
         # a stale lock file on disk creates nothing.
         codex = self.ctx.codex_home
@@ -292,18 +292,19 @@ class PartitionTests(OwnerBase):
         self.assertEqual(app["shared_with"], ["Billing cleanup"])
 
     def test_gui_vm_app_is_a_shared_service_with_quit(self):
-        # AD-S1-8 / S1.6 M5a: Docker Desktop is a rule-6 shared service whose
+        # Docker Desktop is a rule-6 shared service whose
         # row quits the app; its launchd-spawned VM joins it. A Lima VM and a
         # Lima helper keep no action (M5b: a copyable command at most).
         docker = make_bundle(self.root, "Docker", "com.docker.docker")
         vm = "/System/Library/Frameworks/Virtualization.framework/x/com.apple.Virtualization.VirtualMachine"
         procs = [P(700, comm="Docker"), P(701, ppid=700, comm="com.docker.backend"),
-                 P(710, start=(T0, 0)),
+                 P(710, start=(T0, 0)), P(711, start=(T0 + 20000, 0)),
                  P(720, start=(T0 + 5000, 0)), P(721, start=(T0 + 4998, 0), comm="limactl"),
                  P(730, start=(T0 + 9000, 0), comm="limactl")]
         paths = {700: f"{docker}/Contents/MacOS/Docker",
-                 701: f"{docker}/Contents/MacOS/com.docker.backend", 710: vm, 720: vm}
-        _, inv, part = self.build(procs, paths=paths,
+                 701: f"{docker}/Contents/MacOS/com.docker.backend", 710: vm, 711: vm,
+                 720: vm}
+        _, inv, part = self.build(procs, paths=paths, responsible={710: 701, 711: 900},
                                   argv={721: ["limactl", "hostagent", "--pidfile",
                                               "/x/_lima/colima-dev/ha.pid", "colima-dev"]})
         self.assert_partition(inv, part)
@@ -311,6 +312,8 @@ class PartitionTests(OwnerBase):
         svc = part.owners["service:vm:docker-desktop"]
         self.assertEqual((svc.kind, svc.confidence), ("service", "shared"))
         self.assertEqual(sorted(svc.members), [700, 701, 710])
+        # No responsible-process evidence: a VM of its own, not Docker's.
+        self.assertEqual(part.owner_of[711], f"service:vm:virtualization-{T0 + 20000}")
         rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
         row = rows["service:vm:docker-desktop"]
         self.assertEqual((row["title"], row["actions"], row["stop_command"]),
@@ -323,6 +326,73 @@ class PartitionTests(OwnerBase):
         lima = rows["service:vm:colima-dev"]
         self.assertEqual((lima["actions"], lima["token"], lima["stop_command"]),
                          ([], None, "colima stop -p dev"))
+
+    def clone_chrome(self):
+        """A Chrome running from its code-signing clone, helpers in place."""
+        chrome = make_bundle(self.root, "Google Chrome", "com.google.Chrome")
+        clone = os.path.join(self.root, "X", "com.google.Chrome.code_sign_clone",
+                             "code_sign_clone.abc123", "Google Chrome.app.bundle")
+        os.makedirs(os.path.join(clone, "Contents"))
+        with open(os.path.join(clone, "Contents", "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.google.Chrome",
+                           "CFBundleExecutable": "Google Chrome"}, fh)
+        helper = (f"{chrome}/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/"
+                  "Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper")
+        appex = f"{chrome}/Contents/PlugIns/Widget.appex/Contents/MacOS/Widget"
+        return chrome, clone, helper, appex
+
+    def test_code_sign_clone_main_is_the_only_instance(self):
+        chrome, clone, helper, appex = self.clone_chrome()
+        procs = [P(600, comm="Google Chrome"), P(601, ppid=600), P(602, ppid=600),
+                 P(603, comm="Widget")]
+        paths = {600: f"{clone}/Contents/MacOS/Google Chrome", 601: helper, 602: helper,
+                 603: appex}
+        _, inv, part = self.build(procs, paths=paths)
+        owner = part.owners["app:com.google.Chrome"]
+        self.assertEqual(sorted(owner.members), [600, 601, 602, 603])
+        row = next(r for r in self.payload(inv, part)["owners"]
+                   if r["owner_id"] == "app:com.google.Chrome")
+        self.assertEqual([i["pid"] for i in row["instances"]], [600])
+        self.assertEqual(row["actions"], ["quit-app"])
+        self.assertEqual(mo.decode_token(row["token"])["instances"][0]["pid"], 600)
+        self.assertEqual(row["title"], "Google Chrome")
+
+    def test_clone_trusted_only_when_dir_names_its_bundle_id(self):
+        chrome, clone, helper, appex = self.clone_chrome()
+        fake = clone.replace("com.google.Chrome.code_sign_clone", "com.evil.code_sign_clone")
+        os.makedirs(os.path.join(fake, "Contents"))
+        with open(os.path.join(fake, "Contents", "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.google.Chrome"}, fh)
+        self.assertIsNone(mo.app_bundle(f"{fake}/Contents/MacOS/Google Chrome"))
+        self.assertEqual(mo.app_bundle(f"{clone}/Contents/MacOS/Google Chrome"), clone)
+
+    def test_app_hosting_a_session_cannot_be_quit(self):
+        term = make_bundle(self.root, "Terminal", "com.apple.Terminal")
+        codex_app = make_bundle(self.root, "Codex", "com.example.codex")
+        procs = [P(900, comm="Terminal"), P(901, ppid=900, comm="zsh"),
+                 self.claude(902, "0000ee01", ppid=901),
+                 P(910, comm="Codex"), P(911, ppid=910, comm="codex")]
+        paths = {900: f"{term}/Contents/MacOS/Terminal",
+                 910: f"{codex_app}/Contents/MacOS/Codex"}
+        argv = {911: ["codex", "app-server", "--listen", "stdio://"]}
+        _, inv, part = self.build(procs, paths=paths, argv=argv)
+        rows = {r["owner_id"]: r for r in self.payload(inv, part)["owners"]}
+        terminal = rows["app:com.apple.Terminal"]
+        self.assertEqual((terminal["hosts"], terminal["actions"], terminal["token"]),
+                         (["claude:0000ee01"], [], None))
+        self.assertTrue(terminal["hosts_shells"])
+        codex = rows["app:com.example.codex"]
+        self.assertEqual((codex["hosts"], codex["actions"], codex["hosts_shells"]),
+                         ([], ["quit-app"], False))
+
+    def test_widget_only_app_row_cannot_be_quit(self):
+        photos = make_bundle(self.root, "Photos", "com.example.photos")
+        procs = [P(610, comm="PhotosWidget")]
+        paths = {610: f"{photos}/Contents/PlugIns/PhotosWidget.appex/Contents/MacOS/PhotosWidget"}
+        _, inv, part = self.build(procs, paths=paths)
+        row = self.payload(inv, part)["owners"][0]
+        self.assertEqual((row["kind"], row["instances"], row["actions"], row["token"]),
+                         ("app", [], [], None))
 
     def test_app_membership_outermost_bundle_and_helper_layout(self):
         chrome = "/Applications/Google Chrome.app"
@@ -364,6 +434,48 @@ class PartitionTests(OwnerBase):
         part = mo.partition(inv, self.ctx)
         self.assertNotIn(part.owners[part.owner_of[os.getpid()]].kind, ("app", "service"))
 
+    def test_app_server_nested_in_the_daemon_stays_with_it(self):
+        chatgpt = make_bundle(self.root, "ChatGPT", "com.example.chatgpt")
+        nested = f"{chatgpt}/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        procs = [P(200, comm="codex"), P(201, ppid=200, comm="node_repl"),
+                 P(202, ppid=201, comm="codex")]
+        argv = {200: ["codex", "app-server", "--listen", "unix://"],
+                202: ["codex", "app-server", "--listen", "stdio://"]}
+        _, inv, part = self.build(procs, argv=argv, paths={202: nested})
+        self.assertEqual(part.owner_of[202], part.owner_of[200])
+        self.assertEqual(part.owners[part.owner_of[202]].kind, "codex-app")
+
+    def test_codex_global_flags_before_the_subcommand(self):
+        procs = [P(220, comm="codex"), P(221, comm="codex"), P(222, comm="codex")]
+        argv = {220: ["codex", "-c", "x=1", "mcp-server"],
+                221: ["codex", "--profile", "ci", "login"],
+                222: ["codex", "-m", "gpt", "exec", "do it"]}
+        _, inv, part = self.build(procs, argv=argv)
+        kinds = {pid: part.owners[part.owner_of[pid]].kind for pid in (220, 221, 222)}
+        self.assertEqual(kinds, {220: "unknown", 221: "unknown", 222: "codex"})
+
+    def test_connected_tui_with_children_is_not_a_pointer(self):
+        # A pointer runs nothing of its own.
+        self.ctx.lsof = fake_lsof({
+            50001: [("unix", "0xd0d0", "/private/tmp/codex-daemon-501/aaaa")],
+            51000: [("unix", "0xc1c1", "->0xd0d0")]})
+        procs = [P(50000, comm="codex"), P(50001, ppid=50000, comm="codex"),
+                 P(51000, comm="codex"), P(51001, ppid=51000)]
+        argv = {50000: ["codex", "app-server", "daemon", "pid-update-loop"],
+                50001: ["codex", "app-server", "--listen", "unix://"],
+                51000: ["codex", "--model", "m"]}
+        _, inv, part = self.build(procs, argv=argv)
+        self.assertEqual(part.owners[part.owner_of[51000]].kind, "codex")
+
+    def test_lease_with_a_different_child_start_is_not_managed(self):
+        procs = [self.claude(810, "0000dddd"), P(811, ppid=810), P(812, ppid=811, pgid=811),
+                 P(813, ppid=812, pgid=813)]
+        self.ctx.leases = [{"id": "run-x", "child_pid": 813, "child_start": [1, 1]}]
+        _, inv, part = self.build(procs, argv={811: tool_shell("memmon run -- pnpm test")})
+        job = self.payload(inv, part)["owners"][0]["jobs"][1]
+        self.assertFalse(job["managed"])
+        self.assertNotEqual(job["action"], "stop-managed-job")
+
     def test_python_app_bundle_outside_applications_is_not_an_app(self):
         path = ("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
                 "Versions/3.9/Resources/Python.app/Contents/MacOS/Python")
@@ -376,6 +488,38 @@ class PartitionTests(OwnerBase):
         session_file(self.sessions, 601, T0 + 601, job_id="spare001", spare=True)
         _, inv, part = self.build(procs)
         self.assertEqual({o.kind for o in part.owners.values()}, {"unknown"})
+
+    def sock(self, pid):
+        os.makedirs(self.ctx.socks_dir, exist_ok=True)
+        open(os.path.join(self.ctx.socks_dir, f"{pid}.sock"), "w").close()
+
+    def test_stale_cc_sock_on_reused_pid_is_not_a_root(self):
+        # The socket predates the process now holding its PID.
+        now = int(time.time())
+        self.sock(620)
+        p = P(620, start=(now + 100, 0), comm="node")
+        _, inv, part = self.build([p], argv={620: ["node", "~/.claude/hooks/x.mjs"]})
+        self.assertEqual(part.owners[part.owner_of[620]].kind, "unknown")
+
+    def test_claimed_spare_with_fresh_sock_stays_a_session(self):
+        # A claimed prewarm is a real session; an idle one is not.
+        now = int(time.time())
+        claim = os.path.join(self.root, "spare.claim.sock")
+        self.sock(630)
+        argv = {630: ["claude", "bg-spare", "--bg-spare", claim]}
+        _, inv, part = self.build([P(630, start=(now - 100, 0))], argv=argv)
+        self.assertEqual(part.owners[part.owner_of[630]].kind, "claude")
+        open(claim, "w").close()                       # unclaimed again
+        _, inv, part = self.build([P(630, start=(now - 100, 0))], argv=argv)
+        self.assertEqual(part.owners[part.owner_of[630]].kind, "unknown")
+
+    def test_session_record_without_proc_start_is_ignored(self):
+        with open(os.path.join(self.sessions, "640.json"), "w") as fh:
+            json.dump({"pid": 640, "jobId": "job00640"}, fh)
+        _, inv, part = self.build([P(640, start=(T0 + 640, 0))])
+        self.assertNotIn("claude:job00640", part.owners)
+        watch = mo.RespawnWatch(self.ctx)
+        self.assertEqual(watch.status(inv, "job00640", (1, 1, 1), {})[0], "pending")
 
     def test_empty_session_id_uses_job_id(self):
         p = P(700, start=(T0 + 700, 0))
@@ -463,6 +607,40 @@ class PresentationTests(OwnerBase):
         self.assertEqual((body["action"], body["target"]["pid"], body["owner_root"]["pid"]),
                          ("stop-job", 20, 10))
 
+    def test_job_kind_comes_from_executables_only(self):
+        commands = lambda c: [memmon._command_tokens(t) for t in memmon.shell_commands(c)]
+        kind = lambda c: mo.classify_job(c, self.ctx.classify, commands)[0]
+        for cmd in ("tail -f /tmp/test.log", "grep -rn test src", 'echo "pnpm dev"',
+                    "ls tests/", "git log --grep serve"):
+            self.assertEqual(kind(cmd), "other", cmd)
+        self.assertEqual(kind("pnpm dev"), "server")
+        self.assertEqual(kind("next dev -p 3000"), "server")
+        self.assertEqual(kind("python3 -m http.server 8000"), "server")
+        self.assertEqual(kind("npx vitest run"), "test")
+        self.assertEqual(kind("cd web && pnpm --filter web test"), "test")
+        self.assertEqual(kind("pnpm typecheck"), "build")
+
+    def test_unmanaged_heavy_counts_every_owner_once_per_subtree(self):
+        # A vitest started in a terminal app counts; chains count once;
+        # look-alike commands and managed jobs do not.
+        self.ctx.commands = lambda c: [memmon._command_tokens(t) for t in memmon.shell_commands(c)]
+        term = make_bundle(self.root, "Terminal", "com.apple.Terminal")
+        procs = [P(900, comm="Terminal"), P(901, ppid=900, comm="zsh"),
+                 P(902, ppid=901, comm="node"), P(903, ppid=902, comm="node"),
+                 P(904, ppid=901, comm="zsh"), P(905, ppid=901, comm="zsh"),
+                 P(906, ppid=901, comm="python3"), P(907, ppid=906, comm="node")]
+        argv = {902: ["node", "/r/node_modules/.bin/vitest", "run"],
+                903: ["node", "/r/node_modules/vitest/dist/worker.js"],
+                904: ["/bin/zsh", "-c", "tail -f /tmp/test.log"],
+                905: ["/bin/zsh", "-c", 'echo "pnpm dev"'],
+                906: ["python3", "/x/memmon.py", "run", "--", "pnpm", "test"],
+                907: ["node", "/r/node_modules/.bin/vitest", "run"]}
+        self.ctx.leases = [{"id": "r1", "child_pid": 907, "child_start": [1_700_000_907, 907]}]
+        src, inv, part = self.build(procs, argv=argv,
+                                    paths={900: f"{term}/Contents/MacOS/Terminal"})
+        n = mo.unmanaged_heavy(mo.Sample(inv, part, {}, None), self.ctx)
+        self.assertEqual(n, 1)
+
     def test_listening_socket_makes_a_server(self):
         procs = [self.claude(10, "0000a001"), P(20, ppid=10), P(21, ppid=20, pgid=20)]
         self.ctx.listening = {21}
@@ -476,7 +654,7 @@ class PresentationTests(OwnerBase):
         self.assertIsNone(self.payload(inv, part, {})["owners"][0]["activity"])
 
     def test_unavailable_not_zero(self):
-        # I-7: no footprint, no CPU, no history -> null with a reason; sorts last.
+        # No footprint, no CPU, no history -> null with a reason; sorts last.
         procs = [self.claude(10, "0000a001"), P(50)]
         src, inv, part = self.build(procs)
         inv.procs[10].footprint = None
@@ -545,7 +723,6 @@ class HistoryTests(OwnerBase):
         self.assertNotIn("small0", hist["owners"])
 
     def test_unattributed_share_one_history_series(self):
-        # AD-S1-10
         procs = [self.claude(10, "0000a001", fp=100 * MB)] + [P(50 + i, fp=10 * MB)
                                                              for i in range(5)]
         _, inv, part = self.build(procs)
@@ -693,17 +870,41 @@ class OwnersCliTests(unittest.TestCase):
                                                                 "used_bytes": 4,
                                                                 "pressure_level": "normal"})
         self.assertEqual(payload["schema_version"], 2)
-        self.assertEqual(payload["gate"], gate)                  # verbatim (D10)
+        self.assertEqual(payload["gate"], gate)                  # verbatim
         self.assertEqual(payload["source"], "live")
         self.assertEqual(payload["system"]["used_bytes"], 4)
         self.assertEqual(payload["system"]["score_level"], "WATCH")
         self.assertEqual(payload["system"]["ncpu"], os.cpu_count())
         self.assertIsNone(payload["system"]["cpu_cores"])       # window 0, no baseline
+        self.assertEqual(payload["system"]["cpu_coverage"], 0)
+        self.assertEqual(payload["runner_jobs"], [])
         self.assertEqual(payload["protection"],
                          {"summary": "on", "gate": "on", "route": "off",
                           "unmanaged_heavy": 0})
         self.assertIsNone(payload["cpu_window_s"])
         json.dumps(payload)
+
+    def test_system_cpu_is_null_unless_everything_was_measured(self):
+        state = TempState()
+        self.addCleanup(state.close)
+        src = FakeSource([P(10, ticks=0), P(11, ticks=0)])
+        ctx = mo.Context(sessions_dir=memmon.CLAUDE_SESSIONS_DIR)
+        first = mp.snapshot(src)
+
+        def sample(window, source=None, ctx=None, sleep=None):
+            src.table[10].cpu_ticks = 24_000_000
+            inv = mp.snapshot(src, mono=lambda: first.mono_ns + 10**9)
+            cpu = mp.cpu_cores(mp.tick_table(first), inv, first.mono_ns)
+            if partial:
+                cpu.pop(11)
+            return mo.Sample(inv, mo.partition(inv, ctx), cpu, "warming up"), 1.0
+        for partial, expect in ((False, 1.0), (True, None)):
+            with mock.patch.object(memmon, "owners_sample", sample), \
+                    mock.patch.object(memmon, "gate_stats", return_value={}), \
+                    mock.patch.object(memmon, "system_block", return_value={}):
+                system = memmon.owners_json(1.0, ctx=ctx)["system"]
+            self.assertEqual(system["cpu_cores"], expect)
+            self.assertEqual(system["cpu_coverage"], 0.5 if partial else 1.0)
 
     def test_failed_strict_read_is_null_with_reason(self):
         def boom():
@@ -748,44 +949,82 @@ class OwnersCliTests(unittest.TestCase):
                          ("partial", 2, "off"))
 
 
+def tracked_files(testcase):
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"],
+                             cwd=here, capture_output=True, text=True, timeout=10)
+    except Exception:
+        testcase.skipTest("not a git checkout")
+    if out.returncode != 0:
+        testcase.skipTest("not a git checkout")
+    return [os.path.join(here, f) for f in out.stdout.splitlines()
+            if os.path.isfile(os.path.join(here, f))]
+
+
+def png_text(path: str) -> str:
+    """The text a PNG carries besides pixels: tEXt/iTXt/zTXt chunks and EXIF."""
+    import struct
+    import zlib
+    with open(path, "rb") as fh:
+        data = fh.read()
+    out, i = [], 8
+    while i + 8 <= len(data):
+        n, kind = struct.unpack(">I4s", data[i:i + 8])
+        body = data[i + 8:i + 8 + n]
+        if kind == b"zTXt":
+            key, _, rest = body.partition(b"\0")
+            body = key + b" " + zlib.decompress(rest[1:])
+        if kind in (b"tEXt", b"iTXt", b"zTXt", b"eXIf"):
+            out.append(body.decode("latin-1"))
+        i += 12 + n
+    return "\n".join(out)
+
+
 class PublicHygieneTests(unittest.TestCase):
     # Built from fragments so this file does not match its own patterns.
     HOME_RE = re.compile("/" + "Users/[A-Za-z][A-Za-z0-9._-]{2,}/")
     MAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+" + "@" + r"[A-Za-z0-9-]+\.[A-Za-z.]{2,}")
     COMMON = {"runner", "admin", "ubuntu", "travis", "jenkins", "github", "worker"}
-    ALLOWED_MAIL = {"noreply@anthropic.com"}
-
-    def files(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        try:
-            out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"],
-                                 cwd=here, capture_output=True, text=True, timeout=10)
-        except Exception:
-            self.skipTest("not a git checkout")
-        if out.returncode != 0:
-            self.skipTest("not a git checkout")
-        return [os.path.join(here, f) for f in out.stdout.splitlines()]
 
     def test_public_hygiene(self):
-        # I-12
+        # Text files and image metadata alike.
         user = os.environ.get("USER") or ""
         check_user = len(user) >= 6 and user.lower() not in self.COMMON
-        hits = []
-        for path in self.files():
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    text = fh.read()
-            except (UnicodeDecodeError, OSError):
-                continue
+        hits, scanned, images = [], 0, 0
+        for path in tracked_files(self):
+            if path.endswith(".png"):
+                text, images = png_text(path), images + 1
+            else:
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                except (UnicodeDecodeError, OSError):
+                    continue
+            scanned += 1
             for n, line in enumerate(text.splitlines(), 1):
                 if self.HOME_RE.search(line):
                     hits.append(f"{path}:{n}: home path")
                 for m in self.MAIL_RE.findall(line):
-                    if m not in self.ALLOWED_MAIL and not m.endswith(".png"):
+                    if not m.endswith(".png"):
                         hits.append(f"{path}:{n}: email {m}")
                 if check_user and user.lower() in line.lower():
                     hits.append(f"{path}:{n}: local username")
+        self.assertGreater(scanned, 10)
+        self.assertGreater(images, 0)
         self.assertEqual(hits, [])
+
+    def test_png_metadata_is_read(self):
+        import struct
+        import zlib
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.png")
+            chunk = b"Comment\0" + ("/" + "Users/someone/x").encode()
+            with open(path, "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n")
+                fh.write(struct.pack(">I4s", len(chunk), b"tEXt") + chunk
+                         + struct.pack(">I", zlib.crc32(b"tEXt" + chunk)))
+            self.assertRegex(png_text(path), self.HOME_RE)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,13 @@ class LibprocTests(unittest.TestCase):
         with mock.patch.object(src, "timebase", return_value=(numer * 50, denom)):
             self.assertIn("cpu ticks disagree", mp.self_check(src))
 
+    def test_self_check_catches_a_too_small_timebase(self):
+        # The arm64 unit error reads ~42x too little CPU at import time.
+        src = mp.default_source()
+        numer, denom = src.timebase()
+        with mock.patch.object(src, "timebase", return_value=(numer, denom * 125 / 3)):
+            self.assertIn("cpu ticks disagree", mp.self_check(src))
+
     def test_self_check_catches_impossible_footprint(self):
         self.assertEqual(mp.self_check(mp.default_source(), memsize=1),
                          "footprint out of range")

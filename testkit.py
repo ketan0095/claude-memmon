@@ -55,11 +55,22 @@ class TempState:
         }
         for n, v in values.items():
             setattr(memmon, n, v)
+        # memmon_owners has its own defaults for a bare Context().
+        owner_paths = {"CLAUDE_SESSIONS_DIR": values["CLAUDE_SESSIONS_DIR"],
+                       "CC_SOCKS_DIR": values["CC_SOCKS_DIR"],
+                       "CODEX_HOME": values["CODEX_HOME"],
+                       "CLAUDE_JOBS_DIR": values["JOBS_DIR"],
+                       "CLAUDE_ROSTER": values["CLAUDE_ROSTER"]}
+        self.saved_owners = {n: getattr(memmon_owners, n) for n in owner_paths}
+        for n, v in owner_paths.items():
+            setattr(memmon_owners, n, v)
         os.makedirs(values["CLAUDE_SESSIONS_DIR"])
 
     def close(self):
         for n, v in self.saved.items():
             setattr(memmon, n, v)
+        for n, v in self.saved_owners.items():
+            setattr(memmon_owners, n, v)
         self.tmp.cleanup()
 
 
@@ -81,8 +92,10 @@ class FakeSource(memmon_procs.ProcSource):
 
     name = "libproc"
 
-    def __init__(self, procs, argv=None, paths=None, cwds=None, ignore_term=()):
+    def __init__(self, procs, argv=None, paths=None, cwds=None, ignore_term=(),
+                 responsible=None):
         self.table = {p.pid: p for p in procs}
+        self._responsible = dict(responsible or {})
         self._argv = dict(argv or {})
         self._paths = dict(paths or {})
         self._cwds = dict(cwds or {})
@@ -109,6 +122,9 @@ class FakeSource(memmon_procs.ProcSource):
 
     def cwd(self, pid):
         return self._cwds.get(pid)
+
+    def responsible(self, pid):
+        return self._responsible.get(pid)
 
     def timebase(self):
         return (125, 3)
