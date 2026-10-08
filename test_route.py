@@ -25,6 +25,8 @@ sys.path.insert(0, {repo!r})
 import memmon_route
 state = os.path.join(os.environ["HOME"], ".claude", "memmon")
 if sys.argv[1] == "route-classify":
+    if os.path.exists(os.path.join(state, "force-wrap")):
+        print("wrap\tforced"); sys.exit(0)
     if os.path.exists(os.path.join(state, "hang-classifier")):
         import time; time.sleep(5)
     sys.exit(memmon_route.cli(sys.argv[1:], state))
@@ -134,6 +136,18 @@ class RouteScriptTests(unittest.TestCase):
         # No Claude process at all (a terminal using the prefix by hand).
         self.route("pnpm test", origin={})
         self.assertEqual(self.wrapped(), [])
+
+    def test_launcher_checks_origin_before_the_classifier(self):
+        """The launcher's own origin check, with a classifier that would wrap
+        anything: hooks, MCP startup and non-Claude callers still pass."""
+        (self.state / "force-wrap").touch()
+        for origin in (HOOK, {}, {"CLAUDE_PROJECT_DIR": "/tmp/acme-web"}):
+            with self.subTest(origin=origin):
+                (self.state / "wrapped.jsonl").unlink(missing_ok=True)
+                self.route("pnpm test", origin=origin)
+                self.assertEqual(self.wrapped(), [])
+        self.route("pnpm test")
+        self.assertEqual(len(self.wrapped()), 1)
 
     def test_denying_hook_with_route_on_queue_full_and_telemetry_broken(self):
         """B30: the runner would refuse (124/125) if it were reached; the

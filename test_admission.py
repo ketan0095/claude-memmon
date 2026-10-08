@@ -403,6 +403,46 @@ class HysteresisTests(Base):
         self.assertGreaterEqual(clock.mono() - t0, 100)
         self.assertIn("command not started", err.getvalue())
 
+    def test_window_needs_last_bad_before_recovery_start(self):
+        """The admission condition itself, independent of how the state was
+        written: a bad reading at or after recovery_start keeps it shut."""
+        st = dict(tm.fresh_state("b"), recovery_start_mono=10.0, last_bad_mono=20.0)
+        self.assertFalse(tm.recovery(st, 100.0)["open"])
+        st["last_bad_mono"] = 9.0
+        self.assertTrue(tm.recovery(st, 100.0)["open"])
+        self.assertFalse(tm.recovery(st, 39.0)["open"])
+
+    def test_rates_from_before_a_gap_are_never_reused(self):
+        """After a re-seed the cache still holds pre-gap rates; a reader
+        inside the next 2 s must fail, not score with them."""
+        clock = FakeTelemetryClock(t=19000.0)
+        fake = FakeTelemetry(memsize=48 * GiB, used=8 * GiB)
+        r = self.reader(clock, fake, hysteresis_s=0)
+        for _ in range(5):
+            clock.t += 1
+            r.decide(est(GiB))
+        self.assertTrue(r.decide(est(GiB))[0])
+        clock.t += 400                           # baseline too old: re-seed only
+        self.assertFalse(r.decide(est(GiB))[0])
+        clock.t += 1
+        ok, reason, _ = r.decide(est(GiB))
+        self.assertFalse(ok)
+        self.assertIn("rate cache stale", reason)
+
+    def test_short_sleep_reseeds_instead_of_spanning_it(self):
+        """A wake shorter than the 300 s baseline limit still re-seeds: rates
+        must not be averaged across the time asleep."""
+        clock = FakeTelemetryClock(t=21000.0)
+        fake = FakeTelemetry(memsize=48 * GiB, used=8 * GiB)
+        r = self.reader(clock, fake, hysteresis_s=0)
+        for _ in range(5):
+            clock.t += 1
+            r.decide(est(GiB))
+        clock.machine_sleep(10)
+        ok, reason, _ = r.decide(est(GiB))
+        self.assertFalse(ok)
+        self.assertIn("telemetry unavailable", reason)
+
     def test_boot_change_and_corrupt_state_need_a_fresh_window(self):
         clock = FakeTelemetryClock(t=15000.0)
         fake = FakeTelemetry(memsize=48 * GiB, used=8 * GiB)
@@ -775,6 +815,21 @@ class RealAdmissionTests(Base):
         for p in [holder, *order]:
             self.finish(p, timeout=30)
         self.assertEqual(events.read_text().split(), ["holder", "first", "second", "third"])
+
+    def test_no_budget_jumping(self):
+        """A newer ticket that would fit never overtakes an older one that
+        does not, even on a different resource (ticket-first FIFO)."""
+        self.fake.set(memsize=int(12.5 * GiB), used=GiB)
+        self.seed()
+        holder = self.launch(SLEEP, [1.5], reserve=6, resource="h")
+        self.wait_for(self.running, what="holder")
+        big = self.launch("print('big')", reserve=6, resource="a")
+        self.wait_for(lambda: len(runner.tickets(self.root / "runner/queue")) == 1, what="big ticket")
+        small = self.launch("print('small')", reserve=1, resource="b")
+        for p in (holder, big, small):
+            self.finish(p, timeout=30)
+        admits = [r["resource"] for r in self.log() if r["decision"] == "admit"]
+        self.assertEqual(admits, ["h", "a", "b"])
 
     def test_resource_named_ledger_is_just_a_resource(self):
         """B23."""
