@@ -73,6 +73,10 @@ DEFAULT_CONFIG = {
     "project_roots": [],
     "worktree_pattern": r"monorepo(?:-([A-Za-z0-9._-]+))?",
     "ticket_pattern": r"[A-Z]{2,6}-\d+",
+    # memmon run's admission limit is RAM x (1 - headroom_frac).
+    "headroom_frac": 0.20,
+    # false turns S2.11 off: no suggestion scan, card, notification or naming.
+    "pressure_suggestions": True,
 }
 
 
@@ -321,7 +325,6 @@ HEADROOM_FLOOR = 20
 RATE_MIN_S, RATE_MAX_S = 2, 300
 FREE_MIN_S = 30
 RATE_CACHE_S = 5
-RATE_KEYS = ("swapin_mbs", "swapout_mbs", "swap_growth_mbmin", "free_delta_min")
 
 
 def mono_now() -> float:
@@ -338,151 +341,28 @@ def _has_counters(vm: dict) -> bool:
     return all(isinstance(vm.get(k), (int, float)) for k in ("swapins", "swapouts"))
 
 
-def rates_between(prev: dict, cur: dict, dt: float) -> dict:
-    """Paging and swap-growth rates between two readings `dt` seconds apart."""
-    page = cur.get("page_size") or page_size()
-    return {
-        "swapin_mbs": max(0, cur["swapins"] - prev["swapins"]) * page / dt / 1e6,
-        "swapout_mbs": max(0, cur["swapouts"] - prev["swapouts"]) * page / dt / 1e6,
-        "swap_growth_mbmin": (cur.get("swap_used", 0)
-                              - prev.get("swap_used", 0)) / MB * 60.0 / dt,
-        "free_delta_min": None,
-    }
+def score_pressure(vm: dict, rates: dict | None, free_delta_min: float | None = None,
+                   carried_streak: int = 0, rates_source: str | None = None,
+                   reason: str | None = None, advance: bool = True) -> dict:
+    """How close is this machine to the freeze, and how fast is it getting
+    there: memmon_telemetry.score(), the one scorer every reader shares (B26).
 
-
-def score_pressure(vm: dict, rates: dict | None, carried_streak: int = 0,
-                   rates_source: str | None = None,
-                   reason: str | None = None) -> dict:
-    """How close is this machine to the freeze, and how fast is it getting there.
-
-    Pure: the same inputs give the same verdict for every reader. `rates` is
-    None when no valid baseline exists; its free_delta_min is None when the
-    free_pct baseline is younger than 30 s. Without rates, a verdict that the
-    instantaneous signals put at WATCH or worse stands as a lower bound, and
-    anything milder is UNKNOWN: a reading never says HEALTHY without rates.
-
-    Levels are NOT read off swap usage. macOS grows swap on demand, so a full
-    swapfile means nothing; the freeze comes from jetsam deciding pageout cannot
-    keep up with allocation. The signals that actually precede it are the swapin
-    rate (working set no longer fits, pages being read back as fast as they are
-    evicted) and a collapsing free percentage."""
-    r = rates or {}
-    swapin = r.get("swapin_mbs") or 0.0
-    swapout = r.get("swapout_mbs") or 0.0
-    growth = r.get("swap_growth_mbmin") or 0.0
-    free_delta = r.get("free_delta_min")
-    free = vm.get("free_pct", 100)
-    thrash = swapin + swapout
-    ram_total = max(vm.get("ram_total", 1), 1)
-    swap_ratio = vm.get("swap_used", 0) / ram_total
-    reasons, score = [], 0
-
-    # Swap held against RAM SIZE is the strongest discriminator available.
-    # Replaying this morning's near-freeze: swap sat at 1.1-1.4x RAM throughout,
-    # versus 0.15x when idle. Swap as a share of swap_total is useless here
-    # because macOS grows the swapfile to match demand.
-    if swap_ratio >= 1.0:
-        score += 4
-        reasons.append(f"swap {swap_ratio:.1f}x RAM size")
-    elif swap_ratio >= 0.5:
-        score += 2
-        reasons.append(f"swap {swap_ratio:.1f}x RAM size")
-    elif swap_ratio >= 0.25:
-        score += 1
-        reasons.append(f"swap {int(swap_ratio * 100)}% of RAM size")
-
-    # Sustained two-way paging is the thrash signature that precedes a stall.
-    if thrash >= 150:
-        score += 4; reasons.append(f"heavy thrashing {thrash:.0f} MB/s")
-    elif thrash >= 50:
-        score += 2; reasons.append(f"paging {thrash:.0f} MB/s")
-    elif thrash >= 10:
-        score += 1; reasons.append(f"paging {thrash:.0f} MB/s")
-
-    # free_pct is a weak signal on this machine — it sits near 28% both when
-    # healthy and mid-crisis — so only genuinely extreme values count.
-    if free <= 12:
-        score += 3; reasons.append(f"kernel headroom down to {free}%")
-    elif free <= 20:
-        score += 2; reasons.append(f"kernel headroom {free}%")
-
-    if growth >= 500:
-        score += 2; reasons.append(f"swap growing {growth:.0f} MB/min")
-    elif growth >= 150:
-        score += 1; reasons.append(f"swap growing {growth:.0f} MB/min")
-
-    load_ratio = vm.get("load", 0) / max(vm.get("ncpu", 8), 1)
-    if load_ratio >= 3:
-        score += 2; reasons.append(f"load {vm.get('load', 0):.0f} on "
-                                   f"{vm.get('ncpu', 8)} cores")
-    elif load_ratio >= 1.75:
-        score += 1; reasons.append(f"load {vm.get('load', 0):.0f}")
-
-    # Rough runway: free% is falling this fast, so this long until it reaches
-    # the level where the machine is genuinely in trouble.
-    #
-    # The target was 10%, which this machine has never reached — the minimum
-    # across 2,536 samples is 18%, and only 2 samples went below 20%. Projecting
-    # toward a level that never occurs makes the estimate optimistic: it always
-    # reported more runway than the machine actually had. 20% is the region
-    # stress actually reaches here.
-    headroom = None
-    if free_delta is not None and -free_delta > 0.5 and free > HEADROOM_FLOOR:
-        headroom = (free - HEADROOM_FLOOR) / -free_delta
-
-    if score >= 7:
-        level, color = "CRITICAL", "red"
-    elif score >= 4:
-        level, color = "DANGER", "red"
-    elif score >= 2:
-        level, color = "WATCH", "yellow"
-    else:
-        level, color = "HEALTHY", "green"
-    # Escalating on headroom needs care: it is a straight-line projection from
-    # the rate of change of free_pct — the weakest signal here, demoted in the
-    # scoring above because it reads ~28% both mid-crisis and idle. One noisy
-    # derivative should not be able to move the verdict a whole tier on its own,
-    # and when it does, the card has to say so: a DANGER whose listed reasons
-    # only add up to WATCH is worse than no warning. The streak moves only on a
-    # valid 30 s free_delta; otherwise the carried value passes through.
-    low = headroom is not None and headroom < 5
-    if free_delta is None:
-        streak = carried_streak
-    else:
-        streak = carried_streak + 1 if low else 0
-    if low and streak >= 2 and level == "WATCH":
-        level, color = "DANGER", "red"
-        reasons.append(f"headroom falling, ~{headroom:.0f} min to "
-                       f"{HEADROOM_FLOOR}%")
-
-    # Distance to the next tier. A bare score is meaningless to read; "2 more
-    # points and this becomes DANGER" is not.
-    tiers = [("WATCH", 2), ("DANGER", 4), ("CRITICAL", 7)]
-    nxt, to_next = None, None
-    for name, need in tiers:
-        if score < need:
-            nxt, to_next = name, need - score
-            break
-
-    level_reason = None
+    `rates` is None when no valid baseline exists; free_delta_min is None
+    when the free_pct baseline is younger than 30 s. Without rates a verdict
+    of WATCH or worse stands as a lower bound and anything milder is UNKNOWN:
+    a reading never says HEALTHY without rates (I-13)."""
+    import memmon_telemetry
+    why = reason or "no valid rate baseline"
+    out = memmon_telemetry.score(vm, rates, free_delta_min, carried_streak,
+                                 level_reason=why, advance=advance)
+    if rates is None and out["level"] != "UNKNOWN":
+        out["level_reason"] = f"lower bound: {why}"
     if rates is None:
-        why = reason or "no valid rate baseline"
-        if level == "HEALTHY":
-            level, color, level_reason = "UNKNOWN", "grey", why
-        else:
-            level_reason = f"lower bound: {why}"
-    if level in ("HEALTHY", "UNKNOWN"):
-        headroom = None          # see README: "appears only when something is wrong"
-    rate_values = ({k: r.get(k) for k in RATE_KEYS} if rates is not None
-                   else "unavailable")
-    return {"level": level, "color": color, "score": score,
-            "reasons": reasons, "headroom_min": headroom,
-            "next_level": nxt, "to_next": to_next, "lh_streak": streak,
-            "thrash_mbs": thrash if rates is not None else None,
-            **{k: r.get(k) for k in RATE_KEYS},
-            "rates": rate_values, "rates_source": rates_source,
-            "level_reason": level_reason,
-            "kernel_level": vm.get("kernel_level")}
+        out["thrash_mbs"] = out["swapin_mbs"] = out["swapout_mbs"] = None
+        out["swap_growth_mbmin"] = None
+    out["rates_source"] = rates_source if rates is not None else None
+    out["kernel_level"] = vm.get("kernel_level")
+    return out
 
 
 _prev_vm: dict = {}       # rate baseline: counters, _mono, _boot, _lh_streak
@@ -497,6 +377,9 @@ def _read_row(path: str) -> dict | None:
         return row if isinstance(row, dict) else None
     except Exception:
         return None
+
+
+RATE_FIELDS = ("swapin_mbs", "swapout_mbs", "swap_growth_mbmin")
 
 
 def _seed_from_files(now: float, boot: str | None) -> None:
@@ -514,19 +397,16 @@ def _seed_from_files(now: float, boot: str | None) -> None:
             continue
         age = now - row["mono"]
         streak = row.get("lh_streak", row.get("_lh_streak", 0)) or 0
-        if 0 <= age < RATE_MIN_S and isinstance(row.get("rates"), dict):
-            _last_rates = {"rates": dict(row["rates"]), "_mono": row["mono"],
-                           "_boot": boot}
-            _prev_vm = {**row, "_mono": row["mono"], "_boot": boot,
-                        "_lh_streak": streak}
-            _free_base = {"free_pct": row.get("free_pct"), "_mono": row["mono"],
-                          "_boot": boot}
+        base = {**row, "_mono": row["mono"], "_boot": boot, "_lh_streak": streak}
+        free = {"free_pct": row.get("free_pct"), "mono": row["mono"], "boot": boot}
+        if (0 <= age < RATE_MIN_S and row.get("rates") == "ok"
+                and all(isinstance(row.get(k), (int, float)) for k in RATE_FIELDS)):
+            _last_rates = {"rates": {k: row[k] for k in RATE_FIELDS},
+                           "_mono": row["mono"], "_boot": boot}
+            _prev_vm, _free_base = base, free
             return
         if RATE_MIN_S <= age <= RATE_MAX_S and _has_counters(row):
-            _prev_vm = {**row, "_mono": row["mono"], "_boot": boot,
-                        "_lh_streak": streak}
-            _free_base = {"free_pct": row.get("free_pct"), "_mono": row["mono"],
-                          "_boot": boot}
+            _prev_vm, _free_base = base, free
             return
 
 
@@ -535,6 +415,7 @@ def pressure(vm: dict) -> dict:
     taken from an in-process baseline, else one seeded from the sampler's
     files. See score_pressure() for the verdict itself."""
     global _prev_vm, _free_base, _last_rates
+    import memmon_telemetry
     now = mono_now()
     boot = vm.get("boot")
     if not _prev_vm:
@@ -547,12 +428,14 @@ def pressure(vm: dict) -> dict:
     if not _has_counters(vm):
         reason = "vm_stat unavailable"
     elif dt is not None and RATE_MIN_S <= dt <= RATE_MAX_S and _has_counters(prev):
-        rates, source = rates_between(prev, vm, dt), "baseline"
+        rates = memmon_telemetry.rates_between(
+            {**prev, "mono": prev["_mono"], "page_size": page_size()},
+            {**vm, "mono": now, "page_size": page_size()})
+        source = "baseline"
     elif (dt is not None and 0 <= dt < RATE_MIN_S and _last_rates
           and _last_rates.get("_boot") == boot
           and 0 <= now - _last_rates["_mono"] <= RATE_CACHE_S):
         rates, source, advance = dict(_last_rates["rates"]), "cached", False
-        rates["free_delta_min"] = None
     elif dt is not None and 0 <= dt < RATE_MIN_S:
         reason, advance = "baseline under 2 s old", False
     elif dt is not None and dt > RATE_MAX_S:
@@ -560,22 +443,16 @@ def pressure(vm: dict) -> dict:
     elif prev and not same_boot:
         reason = "baseline from another boot"
 
-    if rates is not None and source == "baseline":
-        fb = _free_base
-        fdt = (now - fb["_mono"] if fb and fb.get("_boot") == boot
-               and isinstance(fb.get("free_pct"), (int, float)) else None)
-        if fdt is not None and FREE_MIN_S <= fdt <= RATE_MAX_S:
-            rates["free_delta_min"] = (vm.get("free_pct", 0)
-                                       - fb["free_pct"]) * 60.0 / fdt
-            _free_base = {}
-        elif fdt is not None and 0 <= fdt < FREE_MIN_S:
-            pass                               # keep the older free baseline
-        else:
-            _free_base = {}
-    if not _free_base or _free_base.get("_boot") != boot:
-        _free_base = {"free_pct": vm.get("free_pct"), "_mono": now, "_boot": boot}
+    free_delta = None
+    cur = {"free_pct": vm.get("free_pct"), "mono": now, "boot": boot}
+    if source == "baseline":
+        free_delta = memmon_telemetry.free_delta_between(_free_base, cur)
+    fb = _free_base
+    if (free_delta is not None or not fb or fb.get("boot") != boot
+            or not 0 <= now - fb.get("mono", now) <= RATE_MAX_S):
+        _free_base = cur
 
-    out = score_pressure(vm, rates, carried, source, reason)
+    out = score_pressure(vm, rates, free_delta, carried, source, reason, advance)
     if advance:
         _prev_vm = {**vm, "_mono": now, "_boot": boot, "_lh_streak": out["lh_streak"]}
         if source == "baseline":
@@ -1884,14 +1761,6 @@ GAP_S = 150                 # a sampling gap: more than this since the previous 
 STARVED_NOTICE_S = 300      # awake time a gap needs before it is notified
 
 
-def _telemetry():
-    try:
-        import memmon_telemetry as T
-    except ImportError:
-        import _telemetry_shim as T
-    return T
-
-
 def notify(text: str, title: str = "memmon", subtitle: str = "",
            run=subprocess.run) -> None:
     """Post one notification. The text reaches osascript only as `on run argv`
@@ -1912,23 +1781,15 @@ def gap_record(prev: dict | None, cur: dict) -> dict | None:
     and unsampled awake time, however many sleeps it holds. Both clocks start
     afresh at boot, so a changed kern.bootsessionuuid is a reboot and cannot
     be split. Wall ts is for display only, and nothing is back-filled."""
+    import memmon_telemetry
     if not prev or prev.get("boot") is None or cur.get("boot") is None:
         return None
-    span = {"from_ts": prev.get("ts"), "to_ts": cur.get("ts")}
-    if prev["boot"] != cur["boot"]:
-        return {"cause": "reboot", **span}
     try:
-        dm = cur["mono"] - prev["mono"]
-        du = cur["uptime"] - prev["uptime"]
+        gap = memmon_telemetry.gap_record(prev, cur, GAP_S)
     except (KeyError, TypeError):
         return None
-    if dm <= GAP_S:
-        return None
-    awake = max(0.0, du)
-    gap = {"cause": "sleep" if awake <= GAP_S else "starved", "gap_s": round(dm),
-           "awake_s": round(awake), **span}
-    if gap["cause"] == "starved":
-        gap["asleep_s"] = round(max(0.0, dm - awake))
+    if gap is not None:
+        gap.update(from_ts=prev.get("ts"), to_ts=cur.get("ts"))
     return gap
 
 
@@ -1948,64 +1809,56 @@ READING_KEYS = ("free_pct", "swap_used", "swap_total", "ram_total", "load", "ncp
                 "used_bytes", "kernel_level")
 
 
-def sampler_reading(T=None, sleep=time.sleep, clock=time.time) -> dict:
+def sampler_reading(source=None, clock=None) -> dict:
     """The sampler's pressure phase: two strict reads at least 2 s apart, so
     the paging and swap-growth rates come from inside this run even after a
-    gap. sysctls go through ctypes; vm_stat gets 10 s, and when it fails the
-    instantaneous sysctl signals still score as a lower bound. free_delta_min
+    gap. sysctls go through ctypes; vm_stat gets 10 s, and when a read fails
+    the instantaneous sysctl signals still score as a lower bound. free_delta
     needs the previous pressure file, from this boot and 30-300 s old. The
-    result is written to pressure.json atomically before anything slower runs."""
-    T = T or _telemetry()
-    try:
-        boot = T.boot()
-    except Exception:
-        boot = None
+    result is written to pressure.json atomically before anything slower runs.
+
+    Rates use the reads' own CLOCK_MONOTONIC; the row's mono is
+    CLOCK_MONOTONIC_RAW, the gap clock, as is pressure.json's."""
+    import memmon_owners
+    import memmon_pressure
+    import memmon_telemetry as T
+    clock = clock or T.SYSTEM_CLOCK
+    boot = clock.boot()
     prev_file = _read_row(PRESSURE_FILE)
     prev_row = _previous_row(boot)
     vm, rates, reason = {}, None, None
     try:
-        s1 = T.read_sysctls()
+        r1 = T.read_pressure_strict(source, clock, vm_stat_timeout=SAMPLER_VM_STAT_S,
+                                    budget_s=SAMPLER_VM_STAT_S)
+        clock.sleep(max(0.0, RATE_MIN_S - (clock.mono() - r1["mono"])))
+        vm = T.read_pressure_strict(source, clock, vm_stat_timeout=SAMPLER_VM_STAT_S,
+                                    budget_s=SAMPLER_VM_STAT_S)
+        rates = T.rates_between(r1, vm)
+    except (T.TelemetryError, ValueError) as exc:
+        rates, reason = None, f"strict read failed: {exc}"
         try:
-            v1 = T.read_vm_stat(SAMPLER_VM_STAT_S)
-            m1 = T.mono()
-        except Exception as exc:
-            v1, reason = None, f"vm_stat failed: {type(exc).__name__}: {exc}"
-        if v1 is not None:
-            sleep(max(0.0, RATE_MIN_S - (T.mono() - m1)))
-        vm = dict(T.read_sysctls())
-        if v1 is not None:
-            try:
-                vm.update(T.read_vm_stat(SAMPLER_VM_STAT_S))
-                dt = T.mono() - m1
-                if dt > 0:
-                    rates = rates_between({**s1, **v1}, vm, dt)
-            except Exception as exc:
-                reason = f"vm_stat failed: {type(exc).__name__}: {exc}"
-    except Exception as exc:
-        vm, rates = {}, None
-        reason = f"strict read failed: {type(exc).__name__}: {exc}"
-    mono, up, ts = T.mono(), T.uptime(), clock()
-
-    same = (prev_file and boot and prev_file.get("boot") == boot
-            and isinstance(prev_file.get("mono"), (int, float)))
+            vm = T.read_instant(source, clock)
+        except T.TelemetryError as exc2:
+            vm, reason = {}, f"strict read failed: {exc2}"
+    vm = {**vm, "kernel_level": vm.get("pressure_level")}
+    mono, up, ts = clock.raw(), clock.uptime(), clock.wall()
+    same = bool(prev_file) and boot is not None and prev_file.get("boot") == boot \
+        and isinstance(prev_file.get("mono"), (int, float))
     age = mono - prev_file["mono"] if same else None
     carried = (prev_file.get("lh_streak", 0) or 0) if same and 0 <= age <= RATE_MAX_S else 0
-    if (rates is not None and same and FREE_MIN_S <= age <= RATE_MAX_S
-            and isinstance(prev_file.get("free_pct"), (int, float)) and "free_pct" in vm):
-        rates["free_delta_min"] = (vm["free_pct"] - prev_file["free_pct"]) * 60.0 / age
-    pres = score_pressure(vm, rates, carried, "in_run" if rates is not None else None,
-                          reason)
+    free_delta = (T.free_delta_between(prev_file, {**vm, "mono": mono, "boot": boot})
+                  if rates is not None and same else None)
+    pres = score_pressure(vm, rates, free_delta, carried,
+                          "in_run" if rates is not None else None, reason)
     reading = {"ts": ts, "mono": mono, "uptime": up, "boot": boot,
-               **{k: vm[k] for k in READING_KEYS if k in vm}}
+               **{k: vm[k] for k in READING_KEYS if vm.get(k) is not None}}
     gap = gap_record(prev_row, reading)
-    import memmon_pressure
     record = {**reading, **{k: pres[k] for k in (
         "level", "score", "reasons", "headroom_min", "rates", "rates_source",
-        "level_reason", "lh_streak")},
+        "level_reason", "lh_streak", *RATE_FIELDS, "free_delta_min")},
         "under_pressure": memmon_pressure.under_pressure(
             pres["level"], pres["rates"], vm.get("kernel_level")),
         "gap": gap, "last_gap": gap or (prev_file or {}).get("last_gap")}
-    import memmon_owners
     memmon_owners.write_json_atomic(PRESSURE_FILE, record)
     return {"record": record, "pressure": pres, "vm": vm}
 
@@ -2143,10 +1996,10 @@ def gap_notice(gap: dict) -> str:
             "Readings around the gap may be incomplete.")
 
 
-def write_partial(reading: dict | None, clock=time.time) -> dict:
+def write_partial(reading: dict | None) -> dict:
     """The row a budget-killed run leaves: whatever the pressure phase knew."""
     rec = (reading or {}).get("record") or {}
-    row = {"ts": int(clock()), "partial": True,
+    row = {"ts": int(time.time()), "partial": True,
            "partial_reason": "sampler budget exceeded",
            "mono": rec.get("mono", mono_now()), "uptime": rec.get("uptime", uptime_now()),
            "boot": rec.get("boot")}
@@ -2166,8 +2019,7 @@ def write_partial(reading: dict | None, clock=time.time) -> dict:
     return row
 
 
-def sampler_run(budget_s: float = SAMPLER_BUDGET_S, T=None, sleep=time.sleep,
-                clock=time.time) -> int:
+def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> int:
     """One `memmon --log` run under a 40 s wall budget. launchd never starts a
     second instance while one runs, so without the budget a run whose
     subprocess timeouts add up would hide every interval behind it. On expiry
@@ -2180,7 +2032,7 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, T=None, sleep=time.sleep,
     signal.setitimer(signal.ITIMER_REAL, budget_s)
     reading, done = None, False
     try:
-        reading = sampler_reading(T, sleep, clock)
+        reading = sampler_reading(source, clock)
         snap = collect(pres=reading["pressure"])
         try:
             sampler_owners(snap, reading)
@@ -2191,7 +2043,7 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, T=None, sleep=time.sleep,
     except SamplerBudget:
         signal.setitimer(signal.ITIMER_REAL, 0)
         if not done:
-            write_partial(reading, clock)
+            write_partial(reading)
             print("memmon: sampler budget exceeded; partial row written",
                   file=sys.stderr)
     finally:
@@ -3208,6 +3060,19 @@ def system_block(reader=None) -> dict:
     return out
 
 
+def runner_block(system: dict) -> dict | None:
+    """The runner's mode, committed budget, admission and queue: `memmon jobs
+    --json` without its rows, which are already runner_jobs. Display only."""
+    try:
+        import memmon_runner
+        strict = ({k: system[k] for k in ("ram_bytes", "used_bytes", "pressure_level")}
+                  if system.get("used_bytes") is not None else None)
+        snap = memmon_runner.snapshot(STATE_DIR, system=strict)
+    except Exception as exc:
+        return {"reason": f"{type(exc).__name__}: {exc}"}
+    return {k: v for k, v in snap.items() if k != "jobs"}
+
+
 def sampler_block(now: float | None = None) -> dict:
     """When the sampler last ran and the last sampling gap it recorded. The
     gap shows only once the next run discovers it; until then, age_s grows."""
@@ -3234,6 +3099,16 @@ def pressure_suggestions(sample, ctx, payload: dict, history=None) -> list:
         s1_jobs=s1_jobs, mint=True)
 
 
+def route_status() -> dict:
+    """memmon route's own status; "off" whenever it cannot be read."""
+    try:
+        import memmon_route
+        st = memmon_route.status(STATE_DIR)
+        return {"state": st.get("state", "off"), "line": st.get("line") or "Route off"}
+    except Exception:
+        return {"state": "off", "line": "Route off"}
+
+
 def protection_block(unmanaged: int) -> dict:
     mode = os.environ.get("MEMMON_GATE", "block-critical")
     if not gate_installed() or mode == "off":
@@ -3244,8 +3119,16 @@ def protection_block(unmanaged: int) -> dict:
         gate_state = "on"
     summary = (gate_state if gate_state != "on"
                else "partial" if unmanaged else "on")
-    return {"summary": summary, "gate": gate_state, "route": "off",
+    return {"summary": summary, "gate": gate_state, "route": route_status()["state"],
             "unmanaged_heavy": unmanaged}
+
+
+def coverage_lines(protection: dict) -> list:
+    """Truthful coverage (S2.7). It never says "all apps"."""
+    n = protection.get("unmanaged_heavy") or 0
+    return [route_status()["line"],
+            f"{n} heavy process{'es' if n != 1 else ''} not started through memmon run",
+            "Codex, other apps and terminals are covered only when they call memmon run"]
 
 
 def owners_sample(cpu_window: float, source=None, ctx=None, sleep=time.sleep):
@@ -3311,6 +3194,8 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     if not seen:
         system["cpu_reason"] = sample.cpu_reason or "not measured"
     payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
+    payload["runner"] = runner_block(system)
+    payload["coverage"] = coverage_lines(payload["protection"])
     import memmon_pressure
     payload["under_pressure"] = memmon_pressure.under_pressure(
         system.get("score_level"), system.get("rates"),
@@ -3502,9 +3387,12 @@ def reap_cli(argv: list, engine=None) -> int:
 
 def main() -> int:
     # Dispatch before scanning flags: a wrapped command may itself use --gate.
-    if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs", "run-mode"):
         from memmon_runner import cli
         return cli(sys.argv[1:], STATE_DIR, lambda: pressure(read_vm(fast=True)))
+    if len(sys.argv) > 1 and sys.argv[1] in ("route", "route-classify"):
+        import memmon_route
+        return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command)
     if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap"):
         return {"owners": owners_cli, "act": act_cli,
                 "reap": reap_cli}[sys.argv[1]](sys.argv[2:])

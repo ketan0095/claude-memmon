@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 
 import memmon
+import memmon_telemetry
 from testkit import TempState
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,25 +67,35 @@ class SamplerState:
             return json.load(fh)
 
 
-class FakeTelemetry:
-    """Strict reads from a script. sleep() advances both clocks."""
+class FakeTelemetry(memmon_telemetry.TelemetrySource):
+    """Scripted kernel inputs and clocks for memmon_telemetry: both the
+    source and the clock. sleep() advances every clock."""
 
     def __init__(self, mono=10_000.0, uptime=8_000.0, boot=BOOT, free=(40, 40),
                  swapins=(0, 0), swapouts=(0, 0), swap_used=1 * GB, ram=48 * GB,
-                 load=2.0, ncpu=18, kernel="normal", vm_stat_fails=False,
-                 sysctl_fails=False):
+                 load=2.0, ncpu=18, kernel=1, vm_stat_fails=False, sysctl_fails=False):
         self.m, self.u, self.boot_id = mono, uptime, boot
         self.free, self.swapins, self.swapouts = list(free), list(swapins), list(swapouts)
-        self.swap_used, self.ram, self.load, self.ncpu = swap_used, ram, load, ncpu
+        self.swap_used, self.ram, self.load, self.n = swap_used, ram, load, ncpu
         self.kernel, self.vm_stat_fails, self.sysctl_fails = kernel, vm_stat_fails, sysctl_fails
-        self.sysctl_reads = self.vm_reads = 0
+        self.free_reads = self.vm_reads = 0
         self.vm_stat_timeouts = []
 
+    # clock
     def mono(self):
+        return self.m
+
+    def awake(self):
+        return self.u
+
+    def raw(self):
         return self.m
 
     def uptime(self):
         return self.u
+
+    def wall(self):
+        return time.time()
 
     def boot(self):
         return self.boot_id
@@ -93,23 +104,39 @@ class FakeTelemetry:
         self.m += s
         self.u += s
 
-    def read_sysctls(self):
+    # source
+    def pressure_level(self):
         if self.sysctl_fails:
-            raise OSError("sysctl kern.memorystatus_level failed")
-        i = min(self.sysctl_reads, len(self.free) - 1)
-        self.sysctl_reads += 1
-        return {"kernel_level": self.kernel, "free_pct": self.free[i],
-                "swap_total": 2 * self.swap_used, "swap_used": self.swap_used,
-                "ram_total": self.ram, "load": self.load, "ncpu": self.ncpu}
+            raise memmon_telemetry.TelemetryError("sysctl kern.memorystatus_level failed")
+        return self.kernel
 
-    def read_vm_stat(self, timeout=2.0):
+    def free_pct(self):
+        i = min(self.free_reads, len(self.free) - 1)
+        self.free_reads += 1
+        return self.free[i]
+
+    def memsize(self):
+        return self.ram
+
+    def swapusage(self):
+        return 2 * self.swap_used, self.swap_used
+
+    def loadavg(self):
+        return self.load
+
+    def ncpu(self):
+        return self.n
+
+    def vm_stat(self, timeout):
         self.vm_stat_timeouts.append(timeout)
         if self.vm_stat_fails:
-            raise subprocess.TimeoutExpired(["vm_stat"], timeout)
+            raise memmon_telemetry.TelemetryError(f"vm_stat timed out after {timeout:g}s")
         i = min(self.vm_reads, len(self.swapins) - 1)
         self.vm_reads += 1
-        return {"page_size": PAGE, "swapins": self.swapins[i], "swapouts": self.swapouts[i],
-                "pageins": 0, "pageouts": 0, "used_bytes": 20 * GB}
+        return (f"Mach Virtual Memory Statistics: (page size of {PAGE} bytes)\n"
+                "Anonymous pages: 1000.\nPages purgeable: 0.\nPages wired down: 10.\n"
+                "Pages occupied by compressor: 10.\nPageins: 0.\nPageouts: 0.\n"
+                f"Swapins: {self.swapins[i]}.\nSwapouts: {self.swapouts[i]}.\n")
 
 
 def prev_file(mono, free=40, streak=0, boot=BOOT, uptime=None, ts=None, **extra):
@@ -128,7 +155,7 @@ class InRunRateTests(unittest.TestCase):
         # dropped every rate and said HEALTHY. The run's own pair sees it.
         T = FakeTelemetry(swapins=(0, 20_000), swapouts=(0, 20_000))
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 21 * 60, ts=time.time() - 1260))
-        out = memmon.sampler_reading(T, sleep=T.sleep)
+        out = memmon.sampler_reading(T, T)
         p = out["pressure"]
         self.assertEqual(p["rates_source"], "in_run")
         self.assertIn(p["level"], ("DANGER", "CRITICAL"))
@@ -141,13 +168,13 @@ class InRunRateTests(unittest.TestCase):
         # I-13: with no paging the run is HEALTHY only because its rates are
         # valid; take the second vm_stat away and it cannot be.
         T = FakeTelemetry()
-        healthy = memmon.sampler_reading(T, sleep=T.sleep)["pressure"]
+        healthy = memmon.sampler_reading(T, T)["pressure"]
         self.assertEqual((healthy["level"], healthy["rates_source"]), ("HEALTHY", "in_run"))
         T2 = FakeTelemetry(vm_stat_fails=True)
-        p = memmon.sampler_reading(T2, sleep=T2.sleep)["pressure"]
+        p = memmon.sampler_reading(T2, T2)["pressure"]
         self.assertEqual(p["level"], "UNKNOWN")
         self.assertEqual(p["rates"], "unavailable")
-        self.assertIn("vm_stat failed", p["level_reason"])
+        self.assertIn("vm_stat timed out", p["level_reason"])
 
     def test_one_point_free_change_inside_the_run_has_no_runway(self):
         # B32 (b): over 2 s one free_pct tick would read as 30 %/min. The
@@ -155,7 +182,7 @@ class InRunRateTests(unittest.TestCase):
         # carried streak passes through without escalating WATCH.
         T = FakeTelemetry(free=(20, 19))                   # kernel headroom: WATCH
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 20, free=21, streak=1))
-        p = memmon.sampler_reading(T, sleep=T.sleep)["pressure"]
+        p = memmon.sampler_reading(T, T)["pressure"]
         self.assertIsNone(p["free_delta_min"])
         self.assertIsNone(p["headroom_min"])
         self.assertEqual(p["lh_streak"], 1)
@@ -164,24 +191,24 @@ class InRunRateTests(unittest.TestCase):
     def test_free_delta_uses_the_previous_pressure_file_30_to_300_s_old(self):
         T = FakeTelemetry(free=(30, 30))
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 60, free=33, streak=1))
-        p = memmon.sampler_reading(T, sleep=T.sleep)["pressure"]
+        p = memmon.sampler_reading(T, T)["pressure"]
         self.assertAlmostEqual(p["free_delta_min"], -3.0 * 60 / 62, places=3)
         for age in (12, 400):
             with self.subTest(age=age):
                 T = FakeTelemetry(free=(30, 30))
                 self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - age, free=33))
-                self.assertIsNone(memmon.sampler_reading(T, sleep=T.sleep)
+                self.assertIsNone(memmon.sampler_reading(T, T)
                                   ["pressure"]["free_delta_min"])
         other = FakeTelemetry(free=(30, 30))
         self.st.write(memmon.PRESSURE_FILE, prev_file(other.m - 60, free=33, boot="other"))
-        self.assertIsNone(memmon.sampler_reading(other, sleep=other.sleep)
+        self.assertIsNone(memmon.sampler_reading(other, other)
                           ["pressure"]["free_delta_min"])
 
     def test_streak_advances_only_on_a_valid_free_delta(self):
         # Falling 1 %/min toward the 20 % floor from 24 %: headroom 4 min.
         T = FakeTelemetry(free=(24, 24), load=54.0)        # load 3x cores: WATCH
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 58, free=25, streak=1))
-        p = memmon.sampler_reading(T, sleep=T.sleep)["pressure"]
+        p = memmon.sampler_reading(T, T)["pressure"]
         self.assertEqual(p["lh_streak"], 2)
         self.assertEqual(p["level"], "DANGER")
         self.assertTrue(any("headroom falling" in r for r in p["reasons"]))
@@ -221,7 +248,7 @@ class InRunRateTests(unittest.TestCase):
 
     def test_strict_read_failure_is_unknown_and_written_first(self):
         T = FakeTelemetry(sysctl_fails=True)
-        out = memmon.sampler_reading(T, sleep=T.sleep)
+        out = memmon.sampler_reading(T, T)
         self.assertEqual(out["pressure"]["level"], "UNKNOWN")
         self.assertIn("strict read failed", out["pressure"]["level_reason"])
         rec = self.st.read(memmon.PRESSURE_FILE)
@@ -231,8 +258,8 @@ class InRunRateTests(unittest.TestCase):
     def test_vm_stat_failure_keeps_an_instantaneous_lower_bound(self):
         # The sysctl signals alone say WATCH (kernel headroom 18 %): that
         # stands, with rates unavailable and the kernel level recorded.
-        T = FakeTelemetry(free=(18, 18), vm_stat_fails=True, kernel="warning")
-        rec = memmon.sampler_reading(T, sleep=T.sleep)["record"]
+        T = FakeTelemetry(free=(18, 18), vm_stat_fails=True, kernel=2)
+        rec = memmon.sampler_reading(T, T)["record"]
         self.assertEqual(rec["level"], "WATCH")
         self.assertEqual(rec["rates"], "unavailable")
         self.assertTrue(rec["level_reason"].startswith("lower bound"))
@@ -266,7 +293,7 @@ class GapTests(unittest.TestCase):
         self.assertEqual((a["cause"], a["asleep_s"], a["awake_s"]), ("starved", 0, 1260))
         b = self.gap(21 * 60, 60)
         self.assertEqual((b["cause"], b["awake_s"]), ("sleep", 60))
-        self.assertNotIn("asleep_s", b)
+        self.assertEqual(b["asleep_s"], 1200)
         c = self.gap(21 * 60, 9 * 60)            # two sleeps totalling 12 min
         self.assertEqual((c["cause"], c["asleep_s"], c["awake_s"]), ("starved", 720, 540))
         d = self.gap(30, 30, boot="another-boot")
@@ -279,7 +306,7 @@ class GapTests(unittest.TestCase):
         T = FakeTelemetry()
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 21 * 60, uptime=T.u - 21 * 60,
                                                       ts=time.time() - 1260))
-        reading = memmon.sampler_reading(T, sleep=T.sleep)
+        reading = memmon.sampler_reading(T, T)
         rec = self.st.read(memmon.PRESSURE_FILE)
         # The previous file is 21 min older than the run's second read (2 s on).
         self.assertEqual(rec["gap"]["cause"], "starved")
@@ -305,7 +332,7 @@ class GapTests(unittest.TestCase):
              "from_ts": 1.0, "to_ts": 901.0}
         self.st.write(memmon.PRESSURE_FILE, prev_file(T.m - 60, uptime=T.u - 60,
                                                       last_gap=g))
-        rec = memmon.sampler_reading(T, sleep=T.sleep)["record"]
+        rec = memmon.sampler_reading(T, T)["record"]
         self.assertIsNone(rec["gap"])
         self.assertEqual(rec["last_gap"], g)
         blk = memmon.sampler_block(now=rec["ts"] + 30)
@@ -320,7 +347,7 @@ class GapTests(unittest.TestCase):
                 T = FakeTelemetry()
                 self.st.write(memmon.PRESSURE_FILE,
                               prev_file(T.m - 1200, uptime=T.u - awake))
-                reading = memmon.sampler_reading(T, sleep=T.sleep)
+                reading = memmon.sampler_reading(T, T)
                 snap = {"ts": time.time(), "vm": {}, "pressure": reading["pressure"],
                         "orphan_total": 0, "sessions": [], "apps": {}, "worktrees": []}
                 with mock.patch.object(memmon, "learn"):
@@ -363,7 +390,7 @@ class BudgetTests(unittest.TestCase):
             return real_run(cmd, *a, **kw)
         t0 = time.monotonic()
         with mock.patch.object(memmon.subprocess, "run", stall):
-            rc = memmon.sampler_run(budget_s=1.0, T=T, sleep=T.sleep)
+            rc = memmon.sampler_run(budget_s=1.0, source=T, clock=T)
         elapsed = time.monotonic() - t0
         self.assertEqual(rc, 0)
         self.assertLess(elapsed, 5, "the budget did not fire")
@@ -385,7 +412,7 @@ class BudgetTests(unittest.TestCase):
                 "sessions": [], "apps": {}, "worktrees": []}) as col, \
                 mock.patch.object(memmon, "sampler_owners"), \
                 mock.patch.object(memmon, "learn"):
-            self.assertEqual(memmon.sampler_run(budget_s=5.0, T=T, sleep=T.sleep), 0)
+            self.assertEqual(memmon.sampler_run(budget_s=5.0, source=T, clock=T), 0)
         self.assertEqual(col.call_args.kwargs["pres"]["rates_source"], "in_run")
         self.assertNotIn("partial", self.st.read(memmon.SNAPSHOT))
 
