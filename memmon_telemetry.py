@@ -172,6 +172,80 @@ class TelemetrySource:
 DEFAULT_SOURCE = TelemetrySource()
 
 
+class _VM64(ctypes.Structure):
+    """struct vm_statistics64 (mach/vm_statistics.h), HOST_VM_INFO64."""
+    _u, _q = ctypes.c_uint32, ctypes.c_uint64
+    _fields_ = [("free_count", _u), ("active_count", _u), ("inactive_count", _u),
+                ("wire_count", _u), ("zero_fill_count", _q), ("reactivations", _q),
+                ("pageins", _q), ("pageouts", _q), ("faults", _q), ("cow_faults", _q),
+                ("lookups", _q), ("hits", _q), ("purges", _q), ("purgeable_count", _u),
+                ("speculative_count", _u), ("decompressions", _q), ("compressions", _q),
+                ("swapins", _q), ("swapouts", _q), ("compressor_page_count", _u),
+                ("throttled_count", _u), ("external_page_count", _u),
+                ("internal_page_count", _u), ("total_uncompressed_pages_in_compressor", _q)]
+
+
+assert ctypes.sizeof(_VM64) == 152
+HOST_VM_INFO64 = 4
+
+
+class MachTelemetrySource(TelemetrySource):
+    """vm_stat's counters read the way vm_stat reads them, through
+    host_statistics64, with no subprocess: the runner reads every 2 s, and a
+    vm_stat spawn was most of a tick's CPU. Before first use the counters are
+    cross-checked against one real vm_stat; a disagreement, or any failure of
+    the call, falls back to vm_stat for the life of the process. A failed
+    read still raises, never defaults."""
+
+    def __init__(self):
+        self.verified = None            # None unchecked, True mach, False vm_stat
+
+    def _mach(self) -> dict:
+        lib = libc()
+        lib.mach_host_self.restype = ctypes.c_uint32
+        lib.host_statistics64.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_uint32)]
+        v = _VM64()
+        count = ctypes.c_uint32(ctypes.sizeof(_VM64) // 4)
+        kr = lib.host_statistics64(lib.mach_host_self(), HOST_VM_INFO64, ctypes.byref(v),
+                                   ctypes.byref(count))
+        if kr != 0 or count.value * 4 != ctypes.sizeof(_VM64):
+            raise TelemetryError(f"host_statistics64 failed ({kr})")
+        page = sysctl_int("hw.pagesize")
+        return {"pageins": v.pageins, "pageouts": v.pageouts, "swapins": v.swapins,
+                "swapouts": v.swapouts, "page_size": page,
+                "used_bytes": page * (v.internal_page_count - v.purgeable_count
+                                      + v.wire_count + v.compressor_page_count)}
+
+    def vm_counters(self, timeout: float) -> dict:
+        if self.verified is False:
+            return parse_vm_stat(self.vm_stat(timeout))
+        try:
+            mach = self._mach()
+        except TelemetryError:
+            self.verified = False
+            return parse_vm_stat(self.vm_stat(timeout))
+        if self.verified is None:
+            ref = parse_vm_stat(self.vm_stat(timeout))
+            self.verified = agree(mach, ref)
+            if not self.verified:
+                return ref
+        return mach
+
+
+def agree(mach: dict, ref: dict) -> bool:
+    """The two readings name the same counters a moment apart."""
+    if mach["page_size"] != ref["page_size"]:
+        return False
+    for key in ("swapins", "swapouts", "pageins", "pageouts"):
+        if abs(mach[key] - ref[key]) > max(1000, 0.001 * ref[key]):
+            return False
+    return abs(mach["used_bytes"] - ref["used_bytes"]) <= 0.05 * max(ref["used_bytes"], 1)
+
+
+MACH_SOURCE = MachTelemetrySource()
+
+
 def _bounded(fn, budget_s: float):
     """Run fn with a hard wall budget. A hung read (a stuck sysctl, a fake
     that never returns) leaves a daemon thread behind, never a caller that
@@ -259,7 +333,9 @@ def read_pressure_strict(source=None, clock=None, vm_stat_timeout: float = 2.0,
         left = budget_s - (clock.mono() - start)
         if left <= 0:
             raise TelemetryError(f"telemetry read exceeded {budget_s:g}s")
-        out.update(parse_vm_stat(source.vm_stat(min(vm_stat_timeout, left))))
+        counters = getattr(source, "vm_counters", None)
+        timeout = min(vm_stat_timeout, left)
+        out.update(counters(timeout) if counters else parse_vm_stat(source.vm_stat(timeout)))
         out.update(mono=clock.mono(), awake=clock.awake(), wall=clock.wall())
         return out
     reading = _bounded(go, budget_s + 0.05)

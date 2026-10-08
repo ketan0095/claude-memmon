@@ -77,14 +77,16 @@ class Base(unittest.TestCase):
     def seed(self):
         testkit.seed_admission(str(self.root), self.fake)
 
-    def launch(self, code=SLEEP, args=(), guard=False, env=None, root=None, tele=None, **kw):
+    def launch(self, code=SLEEP, args=(), guard=False, env=None, root=None, tele=None,
+               real=False, cpu_log=None, **kw):
         kw.setdefault("poll_interval", 0.05)
         kw.setdefault("tick_s", 0.2)
         kw.setdefault("hysteresis_s", 0.0)
         kw.setdefault("timeout", 30)
         payload = dict(command=[sys.executable, "-c", code, *map(str, args)],
                        state_dir=str(root or self.root), telemetry=tele or self.tele, guard=guard,
-                       sent_log=str(self.root / "sent.jsonl"), kw=kw)
+                       sent_log=str(self.root / "sent.jsonl"), kw=kw, real=real,
+                       cpu_log=cpu_log)
         proc = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(payload)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 env=dict(os.environ, **(env or {})))
@@ -149,6 +151,44 @@ class StrictTelemetryTests(Base):
         bad = FakeTelemetry(kernel=3)
         with self.assertRaises(tm.TelemetryError):
             tm.read_pressure_strict(source=bad)
+
+    def test_mach_counters_match_vm_stat(self):
+        """The runner's host_statistics64 reader names vm_stat's counters."""
+        src = tm.MachTelemetrySource()
+        mach = src._mach()
+        ref = tm.parse_vm_stat(src.vm_stat(2.0))
+        self.assertTrue(tm.agree(mach, ref), (mach, ref))
+        r = tm.read_pressure_strict(source=src)
+        self.assertTrue(src.verified)
+        for key in ("swapins", "swapouts", "used_bytes", "page_size"):
+            self.assertIsInstance(r[key], int)
+
+    def test_mach_reader_falls_back_to_vm_stat_on_disagreement_or_failure(self):
+        ref = tm.parse_vm_stat(FakeTelemetry().vm_stat(1))
+
+        class Odd(tm.MachTelemetrySource):
+            calls = 0
+
+            def _mach(self):
+                return dict(ref, used_bytes=ref["used_bytes"] * 3)
+
+            def vm_stat(self, timeout):
+                Odd.calls += 1
+                return FakeTelemetry().vm_stat(timeout)
+        src = Odd()
+        self.assertEqual(src.vm_counters(1.0)["used_bytes"], ref["used_bytes"])
+        self.assertIs(src.verified, False)
+        self.assertEqual(src.vm_counters(1.0)["used_bytes"], ref["used_bytes"])
+        self.assertEqual(Odd.calls, 2, "every later read uses vm_stat")
+
+        class Broken(Odd):
+            def _mach(self):
+                raise tm.TelemetryError("host_statistics64 failed (5)")
+
+            def vm_stat(self, timeout):
+                raise tm.TelemetryError("vm_stat exited 1")
+        with self.assertRaises(tm.TelemetryError):
+            Broken().vm_counters(1.0)
 
     def test_hung_reader_is_bounded(self):
         t0 = time.monotonic()
@@ -1035,7 +1075,44 @@ class OmegaR1LedgerTests(Base):
         self.assertLess(time.monotonic() - t0, 2.0)
 
 
+def _healthy_now():
+    """Benches run only while the kernel level is normal and the strict
+    score, with real rates, is HEALTHY or WATCH."""
+    try:
+        a = tm.read_pressure_strict(source=tm.MACH_SOURCE)
+        time.sleep(2.1)
+        b = tm.read_pressure_strict(source=tm.MACH_SOURCE)
+        v = tm.score(b, tm.rates_between(a, b), None, 0)
+        return b["pressure_level"] == "normal" and v["level"] in ("HEALTHY", "WATCH")
+    except tm.TelemetryError:
+        return False
+
+
 class OverheadTests(Base):
+    def test_runner_average_cpu_under_one_percent(self):
+        """B22c: a ~20 s job under the real strict reader and libproc costs
+        the runner at most 1 % of wall time (measured from run() entry, so
+        interpreter start-up is excluded), and its RSS stays under 40 MB."""
+        if not _healthy_now():
+            self.skipTest("benches run only at HEALTHY/WATCH with normal kernel pressure")
+        r = tm.read_pressure_strict(source=tm.MACH_SOURCE)
+        st = tm.fresh_state(r["boot"])
+        base = tm._counters(r)
+        base["mono"] -= 3
+        st.update(rate_baseline=base, free_baseline=base, recovery_start_mono=r["mono"] - 60,
+                  last_good_mono=r["mono"], clock_pair=[tm.SYSTEM_CLOCK.mono(), tm.SYSTEM_CLOCK.awake()])
+        coord = self.root / "runner/coord"
+        coord.mkdir(parents=True, exist_ok=True)
+        (coord / "admission-state.json").write_text(json.dumps(st))
+        cpu_log = str(self.root / "cpu.json")
+        proc = self.launch("import time; time.sleep(20)", real=True, cpu_log=cpu_log,
+                           tick_s=2.0, poll_interval=1.0, hysteresis_s=30.0)
+        self.finish(proc, timeout=60)
+        m = json.loads(Path(cpu_log).read_text())
+        self.assertGreater(m["wall"], 19.5)
+        self.assertLessEqual(m["cpu"] / m["wall"], 0.01, m)
+        self.assertLess(m["maxrss"], 40e6, m)
+
     def test_tick_cost(self):
         """B22: one monitoring tick with real telemetry and a real scan."""
         import resource
@@ -1100,7 +1177,25 @@ if __name__ == "__main__":
         sent_log = payload.pop("sent_log")
         if payload.pop("guard"):
             kw["engine_factory"] = _guarded_factory(sent_log)
-        raise SystemExit(runner.run(
-            payload["command"], payload["state_dir"], lambda: {"level": "HEALTHY"},
-            telemetry_read=lambda: tm.read_pressure_strict(source=fake), **kw))
+        if not payload.pop("real"):
+            kw["telemetry_read"] = lambda: tm.read_pressure_strict(source=fake)
+        cpu_log = payload.pop("cpu_log")
+        if cpu_log:
+            import resource
+
+            def usage():
+                s = resource.getrusage(resource.RUSAGE_SELF)
+                c = resource.getrusage(resource.RUSAGE_CHILDREN)
+                return s, c.ru_utime + c.ru_stime
+            (s0, c0), t0 = usage(), time.monotonic()
+        code = runner.run(payload["command"], payload["state_dir"], lambda: {"level": "HEALTHY"},
+                          **kw)
+        if cpu_log:
+            (s1, c1), wall = usage(), time.monotonic() - t0
+            # The child's own CPU (it only sleeps) is part of RUSAGE_CHILDREN;
+            # it is negligible and counted against the runner, never for it.
+            cpu = (s1.ru_utime + s1.ru_stime - s0.ru_utime - s0.ru_stime) + (c1 - c0)
+            with open(cpu_log, "w") as fh:
+                json.dump({"cpu": cpu, "wall": wall, "maxrss": s1.ru_maxrss}, fh)
+        raise SystemExit(code)
     unittest.main()

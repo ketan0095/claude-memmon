@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import select
 from contextlib import contextmanager
 from pathlib import Path
 import re
@@ -436,6 +437,50 @@ def committed(rows, used, ram, frac, before=None, after=None, degraded=False, ex
             "degraded": bool(degraded), "reason": None}
 
 
+def committed_recorded(rows, used, ram, frac, now, own=None):
+    """committed from the footprints the wrappers publish each tick, for
+    display and the monitoring tick. A footprint older than 10 s counts the
+    whole reservation. `own` is (run_id, footprint) measured just now.
+    Admission never uses this: it scans the job trees itself."""
+    c = committed([], used, ram, frac)
+    slack = 0
+    for r in rows:
+        if r.get("state") == "waiting":
+            continue
+        if own and r.get("id") == own[0] and own[1] is not None:
+            fp = own[1]
+        else:
+            fresh = r.get("footprint_ts") and now - r["footprint_ts"] <= FOOTPRINT_STALE_S
+            fp = (r.get("footprint_bytes") or 0) if fresh else 0
+        slack += max(0, reservation_of(r) - fp)
+    c.update(slack=slack, free=c["limit"] - c["used"] - slack, over=c["used"] + slack > c["limit"])
+    return c
+
+
+PROC_PPID_ONLY = 6
+
+
+def _child_lister(src):
+    """proc_listpids(PROC_PPID_ONLY) for a libproc source, so a tick reads
+    only its own job tree; None for any other source."""
+    lib = getattr(src, "lib", None)
+    if lib is None or src.name != "libproc":
+        return None
+    import ctypes
+    fn = lib.proc_listpids
+    fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    cap = 1024
+
+    def children(pid):
+        buf = (ctypes.c_int * cap)()
+        n = fn(PROC_PPID_ONLY, pid, buf, ctypes.sizeof(buf))
+        if n < 0 or n >= ctypes.sizeof(buf):
+            raise OSError("proc_listpids failed or truncated")
+        return [p for p in buf[:n // ctypes.sizeof(ctypes.c_int)] if p > 0]
+    return children
+
+
 def committed_total(c) -> int:
     return c["used"] + c["slack"]
 
@@ -485,7 +530,8 @@ class Runner:
         self.poll = poll_interval
         self.reserve = None if reserve is None else int(reserve * GiB)
         self.interruptible, self.via = bool(interruptible), via
-        self.read = telemetry_read or (lambda: telemetry.read_pressure_strict())
+        self.read = telemetry_read or (
+            lambda: telemetry.read_pressure_strict(source=telemetry.MACH_SOURCE))
         self.clock = clock or telemetry.SYSTEM_CLOCK
         self._source = source
         self.tick_s, self.hysteresis_s = tick_s, hysteresis_s
@@ -520,11 +566,59 @@ class Runner:
         except Exception:
             return None
 
+    def job_tree(self):
+        """The child's own process tree, {pid: Proc}, read through libproc's
+        per-parent listing; the full table only when that is unavailable."""
+        if getattr(self, "_lister", False) is False:
+            try:
+                self._lister = _child_lister(self.source())
+            except Exception:
+                self._lister = None
+        child = (self.row or {}).get("child") or {}
+        if self._lister is None or not child.get("pid"):
+            return self.scan()
+        src = self.source()
+        try:
+            out, stack = {}, [child["pid"]]
+            while stack and len(out) < 4096:
+                pid = stack.pop()
+                if pid in out:
+                    continue
+                p = src.read(pid)
+                if p is None:
+                    continue
+                out[pid] = p
+                stack.extend(self._lister(pid))
+            return out
+        except Exception:
+            return self.scan()
+
     def set_state(self, state, reason, **extra):
         if self.row.get("state") != state:
             self.row["state_changed_ts"] = round(self.clock.wall(), 3)
         self.row.update(state=state, reason=reason, **extra)
+        self.write_record()
+
+    def write_record(self):
         _write(self.record, self.row)
+        self._written = {k: v for k, v in self.row.items() if k != "footprint_ts"}
+        self._written_at = self.clock.mono()
+
+    def write_if_changed(self):
+        """A tick rewrites its record only when something a reader uses moved:
+        any field, a footprint change of 1 MiB or more, or a footprint_ts
+        about to age past the 10 s freshness readers apply."""
+        last = getattr(self, "_written", None)
+        if last is None or self.clock.mono() - self._written_at >= FOOTPRINT_STALE_S / 2:
+            return self.write_record()
+        now = {k: v for k, v in self.row.items() if k != "footprint_ts"}
+        fp_old, fp_new = last.get("footprint_bytes"), now.get("footprint_bytes")
+        last = dict(last, footprint_bytes=None, peak_bytes=None)
+        now = dict(now, footprint_bytes=None, peak_bytes=None)
+        moved = (fp_old is None) != (fp_new is None) or (
+            fp_old is not None and abs(fp_new - fp_old) >= (1 << 20))
+        if moved or now != last:
+            self.write_record()
 
     # --------------------------------------------------------- entry
 
@@ -855,6 +949,7 @@ class Runner:
         self.set_state("running", "command running")
         self.monitor = {"bad": 0, "failed": 0, "critical": 0, "clear_since": None}
         next_tick = self.clock.mono() + self.tick_s
+        waiter = _ExitWaiter(self.child.pid)
         while self.child.poll() is None:
             if self.cancelled[0]:
                 self.set_state("cancelling", "forwarding cancellation to command group",
@@ -864,10 +959,15 @@ class Runner:
             if self.mode == "protect" and self.clock.mono() >= next_tick:
                 next_tick = self.clock.mono() + self.tick_s
                 if self.tick() == "cancelled":
+                    waiter.close()
                     self.child.wait()
                     self.say(f"cancelled by policy (ended_by=policy, run_id={self.run_id})")
                     return 75
-            time.sleep(0.05)
+            # Sleep until the child exits, a signal arrives or the next tick
+            # is due, instead of waking 20 times a second to poll.
+            due = next_tick - self.clock.mono() if self.mode == "protect" else 1.0
+            waiter.wait(min(1.0, max(0.0, due)))
+        waiter.close()
         code = self.child.returncode
         if self.row.get("ended_by") == "policy":
             self.say(f"cancelled by policy (ended_by=policy, run_id={self.run_id})")
@@ -887,23 +987,23 @@ class Runner:
                     reading = self.read()
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
-                procs = self.scan()
+                procs = self.job_tree()
+                fp = None
+                if procs is not None:
+                    fp = _tree_footprint(procs, _kids(procs), self.row["child"])
                 now = clock.mono()
                 state, v = telemetry.strict_verdict(state, reading, now, error)
                 state = telemetry.apply_hysteresis(state, telemetry.is_good(v),
                                                    v.get("mono") or now, now)
                 c = None
                 if reading is not None:
-                    c = committed(jobs(self.state_dir), reading["used_bytes"],
-                                  reading["ram_total"], headroom_frac(self.state_dir),
-                                  procs, procs, degraded=procs is None)
+                    c = committed_recorded(jobs(self.state_dir), reading["used_bytes"],
+                                           reading["ram_total"], headroom_frac(self.state_dir),
+                                           clock.wall(), own=(self.run_id, fp))
                     state["committed"] = dict(c, ts=round(clock.wall(), 3))
                 _write(self.paths.admission, state)
         except (LedgerTimeout, Cancelled):
             return None
-        fp = None
-        if procs is not None:
-            fp = _tree_footprint(procs, _kids(procs), self.row["child"])
         if fp is not None:
             self.peak = max(self.peak or 0, fp)
             self.row.update(footprint_bytes=fp, footprint_ts=round(clock.wall(), 3),
@@ -924,16 +1024,16 @@ class Runner:
         elif state_now == "intervention_needed":
             if cause:
                 m["clear_since"] = None
-                _write(self.record, self.row)
+                self.write_if_changed()
             else:
                 m["clear_since"] = m["clear_since"] or now
                 if now - m["clear_since"] >= CLEAR_S:
                     self.row["intervention"] = None
                     self.set_state("running", "command running")
                 else:
-                    _write(self.record, self.row)
+                    self.write_if_changed()
         else:
-            _write(self.record, self.row)
+            self.write_if_changed()
         if (self.interruptible and m["critical"] >= AUTO_CANCEL_TICKS
                 and read_mode(self.state_dir)[2]):
             return self.policy_cancel()
@@ -1026,6 +1126,39 @@ class Runner:
             signal.signal(signum, previous)
 
 
+class _ExitWaiter:
+    """Blocks on kqueue for the child's exit or SIGINT/SIGTERM/SIGHUP (which
+    still reach the Python handlers), with a timeout. Without kqueue, or if
+    the child is already gone, it falls back to a short sleep."""
+
+    def __init__(self, pid):
+        self.kq = None
+        try:
+            kq = select.kqueue()
+            evs = [select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD,
+                                 select.KQ_NOTE_EXIT)]
+            evs += [select.kevent(s, select.KQ_FILTER_SIGNAL, select.KQ_EV_ADD)
+                    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]
+            kq.control(evs, 0, 0)
+            self.kq = kq
+        except (AttributeError, OSError):
+            pass
+
+    def wait(self, timeout):
+        if self.kq is None:
+            time.sleep(min(timeout, 0.05))
+            return
+        try:
+            self.kq.control(None, 4, timeout)
+        except OSError:
+            time.sleep(min(timeout, 0.05))
+
+    def close(self):
+        if self.kq is not None:
+            self.kq.close()
+            self.kq = None
+
+
 def _default_engine(runner, grace_s):
     """The S1 engine, aimed at this wrapper's own child with a token it mints
     for itself. Degraded inventory has no identity, so no token."""
@@ -1112,17 +1245,8 @@ def snapshot(state_dir, system=None, clock=None) -> dict:
     if system is not None and system.get("used_bytes") is not None:
         # Recorded footprints approximate the admission scan; a stale one
         # counts the whole reservation, as admission would.
-        now = time.time()
-        shown = [dict(r, child=None, child_pid=None) for r in rows]
-        c = committed(shown, system["used_bytes"], system["ram_bytes"], frac)
-        slack = 0
-        for r in rows:
-            if r.get("state") == "waiting":
-                continue
-            fresh = r.get("footprint_ts") and now - r["footprint_ts"] <= FOOTPRINT_STALE_S
-            slack += max(0, reservation_of(r) - ((r.get("footprint_bytes") or 0) if fresh else 0))
-        c.update(slack=slack, free=c["limit"] - c["used"] - slack,
-                 over=c["used"] + slack > c["limit"], ts=round(now, 3))
+        c = committed_recorded(rows, system["used_bytes"], system["ram_bytes"], frac, time.time())
+        c["ts"] = round(time.time(), 3)
     else:
         c = {"used": None, "slack": None, "limit": None, "free": None, "ram": None,
              "headroom_frac": frac, "over": None, "degraded": False,
