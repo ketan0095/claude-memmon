@@ -1629,8 +1629,14 @@ final class Model: ObservableObject {
         refresh()
     }
 
+    /// A legend row opens its section and scrolls the list to it.
+    func openFromLegend(_ sec: OwnerSection) {
+        sectionOpen[sec] = true
+        scrollTarget = sec
+    }
+
     func dismissBlocked(_ id: String) {
-        guard live else { return }
+        guard live else { actionLog.append("dismiss-blocked \(id)"); return }
         DispatchQueue.global(qos: .userInitiated).async {
             _ = CLI.run(["--dismiss-blocked", id], timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
@@ -3376,10 +3382,7 @@ struct ContentView: View {
         switch seg.kind {
         case .section(let sec):
             Button {
-                withAnimation(motion(0.16)) {
-                    model.sectionOpen[sec] = true
-                    model.scrollTarget = sec
-                }
+                withAnimation(motion(0.16)) { model.openFromLegend(sec) }
             } label: {
                 LegendRow(color: P.section(sec), name: seg.name, value: seg.shown)
             }
@@ -4755,6 +4758,13 @@ if ARGS.contains("--sections-probe") {
     // How a fixture's owners fall into sections, as the list would show them.
     _ = NSApplication.shared
     let (m, _) = MainActor.assumeIsolated { prepareFixture() }
+    // Probe-only interactions, driven through the same model methods the views call.
+    if ARGS.contains("--deselect") { m.expanded = nil }
+    if let name = argValue("--legend-click") {
+        guard let sec = OwnerSection(rawValue: name) else { fail("unknown section \(name)") }
+        m.openFromLegend(sec)
+    }
+    if let id = argValue("--dismiss") { m.dismissBlocked(id) }
     let rows = m.snap?.rows ?? []
     let out: [[String: Any]] = sectionedOwners(rows, by: m.sort).map { sec, owners in
         let (shown, hidden) = m.visible(sec, owners)
@@ -4772,6 +4782,7 @@ if ARGS.contains("--sections-probe") {
     let reduce = ARGS.contains("--reduce-motion")
     let data = try! JSONSerialization.data(withJSONObject: [
         "sections": out, "small": small, "ring": ring, "used": used ?? NSNull(),
+        "scroll_target": m.scrollTarget?.rawValue ?? NSNull(), "actions": m.actionLog,
         "status": ["kind": st.kind.rawValue, "text": st.text, "spoken": st.spoken],
         "motion": ["sweep": ringSweeps(reduceMotion: reduce, animate: true),
                    "sweep_render": ringSweeps(reduceMotion: reduce, animate: false),

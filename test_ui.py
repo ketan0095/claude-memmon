@@ -1051,6 +1051,25 @@ class HeaderAndRingTests(unittest.TestCase):
         exact = labels(a11y("overview.json"))
         self.assertIn("Show Claude sessions in the list, 9.5 GB", exact)
 
+    def test_clicking_a_legend_row_opens_and_scrolls_to_its_section(self):
+        before = {s["section"]: s["open"] for s in self.probe("overview.json")["sections"]}
+        self.assertFalse(before["service"])
+        after = self.probe("overview.json", "--legend-click", "service")
+        self.assertTrue({s["section"]: s["open"] for s in after["sections"]}["service"])
+        self.assertEqual(after["scroll_target"], "service")
+
+    def test_dismiss_calls_memmon_with_the_entry_id(self):
+        out = self.probe("stale-paused.json", "--dismiss", "1791449760000.fixture-a")
+        self.assertEqual(out["actions"], ["dismiss-blocked 1791449760000.fixture-a"])
+
+    def test_an_open_confirm_alone_keeps_its_section_open(self):
+        payload = effective(FIXTURES / "overview.json")
+        payload["_view"] = {"select": "claude:fixture-a", "confirm": "stop-job",
+                            "sections": ["-claude"]}
+        state = {s["section"]: s for s in self.probe(None, "--deselect", payload=payload)["sections"]}
+        self.assertTrue(state["claude"]["open"])
+        self.assertIn("claude:fixture-a", state["claude"]["shown"])
+
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
         self.assertIn("Show Claude sessions in the list, 9.5 GB", found)
