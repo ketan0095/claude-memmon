@@ -59,7 +59,8 @@
      },
      "command": {
       "raw": "pnpm typecheck",
-      "display": "pnpm typecheck"
+      "display": "pnpm typecheck",
+      "short": "pnpm typecheck"
      },
      "classification": {
       "source": "builtin",
@@ -90,7 +91,8 @@
      },
      "command": {
       "raw": "npx vitest run",
-      "display": "npx vitest run"
+      "display": "npx vitest run",
+      "short": "npx vitest run"
      },
      "classification": {
       "source": "builtin",

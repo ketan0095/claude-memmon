@@ -2320,7 +2320,8 @@ def gate_stats(limit: int | None = None) -> dict:
             # unknown rather than being explained with mutable current state.
             "session": {"id": sid, "name": r.get("session_name")},
             "command": {"raw": cmd,
-                        "display": r.get("cmd_display") or display_command(cmd)},
+                        "display": r.get("cmd_display") or display_command(cmd),
+                        "short": short_command(cmd)},
             "classification": None if legacy else classification,
             "legacy": legacy,
             "pressure": {"level": r.get("level") or "?",

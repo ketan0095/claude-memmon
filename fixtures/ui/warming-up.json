@@ -77,7 +77,8 @@
      },
      "command": {
       "raw": "npx vitest run",
-      "display": "npx vitest run"
+      "display": "npx vitest run",
+      "short": "npx vitest run"
      },
      "classification": {
       "source": "builtin",

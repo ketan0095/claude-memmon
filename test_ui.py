@@ -888,6 +888,16 @@ class SectionTests(unittest.TestCase):
         claude = next(l for l in labels(a11y_path(path)) if l.startswith("Claude sessions,"))
         self.assertNotIn("at least", claude)
 
+    def test_header_totals_follow_the_sort(self):
+        payload = effective(FIXTURES / "sections.json")
+        for sort, unit in (("cpu", "cores"), ("memory", "GB")):
+            path = Path(self.tmp.name) / f"{sort}.json"
+            path.write_text(json.dumps(dict(payload, _view={"sort": sort})))
+            header = next(l for l in labels(a11y_path(path)) if l.startswith("Claude sessions,"))
+            self.assertIn(unit, header, sort)
+            if sort == "cpu":
+                self.assertNotIn(" GB", header)
+
     def test_a_tiny_footprint_is_spoken_as_under_a_tenth(self):
         found = labels(a11y("sections-background.json"))
         row = next(l for l in found if l.startswith("Example Updater,"))

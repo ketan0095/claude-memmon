@@ -144,6 +144,8 @@ struct GateEvent: Identifiable {
     var ts: Double, action: String, mode: String
     var sessionID: String, sessionName: String?
     var commandRaw: String, commandDisplay: String
+    /// The operation alone; older payloads carry none.
+    var commandShort: String? = nil
     var classification: GateClassification?
     var legacy: Bool
     var level: String, score: Int?, reasons: [String]
@@ -222,6 +224,7 @@ struct GateStats {
                     sessionName: session["name"] as? String,
                     commandRaw: command["raw"] as? String ?? "",
                     commandDisplay: command["display"] as? String ?? "",
+                    commandShort: command["short"] as? String,
                     classification: match,
                     legacy: (d["legacy"] as? Bool) ?? (match == nil),
                     level: pressure["level"] as? String ?? "?",
@@ -2046,17 +2049,35 @@ struct OwnerRow: View {
 }
 
 /// A section's one-line header: open state, title, count and total memory.
+/// The section's total in the selected sort's unit. Memory and CPU sum to a
+/// lower bound ("≥") when a row is unmeasured; growth can be negative, so a
+/// partial sum would mislead and is not shown.
+func sectionMetric(_ rows: [Owner], _ sort: SortKey) -> String? {
+    switch sort {
+    case .memory:
+        let partial = rows.contains { $0.footprint == nil }
+        return sectionTotal(rows).map { (partial ? "≥ " : "") + gb($0) }
+    case .cpu:
+        let known = rows.compactMap { $0.cpu }
+        guard !known.isEmpty else { return nil }
+        return (known.count < rows.count ? "≥ " : "") + coresText(known.reduce(0, +))
+    case .growth:
+        let known = rows.compactMap { $0.growth }
+        guard !known.isEmpty, known.count == rows.count else { return nil }
+        return growthText(known.reduce(0, +)) + " / 10 min"
+    }
+}
+
 struct SectionHeader: View {
     var section: OwnerSection
     var rows: [Owner]
     var open: Bool
+    var sort: SortKey = .memory
     var onTap: () -> Void
 
     var body: some View {
         let count = sectionCount(section, rows)
-        // A row with no measured footprint makes the sum a lower bound.
-        let partial = rows.contains { $0.footprint == nil }
-        let total = sectionTotal(rows).map { (partial ? "≥ " : "") + gb($0) }
+        let total = sectionMetric(rows, sort)
         Button(action: onTap) {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
@@ -2076,7 +2097,7 @@ struct SectionHeader: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(section.title), \(count.spoken), \((total?.replacingOccurrences(of: "≥ ", with: "at least ")) ?? "memory not measured"), "
+        .accessibilityLabel("\(section.title), \(count.spoken), \((total?.replacingOccurrences(of: "≥ ", with: "at least ")) ?? (sort == .memory ? "memory not measured" : "\(sort.label) not available")), "
             + (open ? "expanded" : "collapsed"))
         .accessibilityAddTraits(.isButton)
     }
@@ -2717,23 +2738,31 @@ struct GateEventCard: View {
         return "Warning added to the session’s context; command ran"
     }
 
+    private var ruleLine: String {
+        guard let c = event.classification else { return "rule not recorded · \(event.level)" }
+        return "\(c.source == "learned" ? "learned" : "rule") \(c.rule) · \(event.level)"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: expanded ? 8 : 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(stopped ? "Stopped · command did not run" : "Warned · command ran")
-                    .font(ft(11, .medium)).foregroundColor(tint)
+        VStack(alignment: .leading, spacing: expanded ? 8 : 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle().fill(tint).frame(width: 6, height: 6).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                Text(event.commandShort ?? event.commandDisplay)
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                    .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text(eventTime(event.ts)).font(ft(11)).foregroundColor(P.muted)
+                Text(relative(event.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
-
-            Text(event.commandDisplay)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(P.text)
-                .lineLimit(expanded ? nil : 2)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-
             if expanded {
+                eventDetail(stopped ? "Stopped · command did not run" : "Warned · command ran",
+                            "\(eventTime(event.ts))")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Command").font(ft(10, .medium)).foregroundColor(P.muted)
+                    Text(event.commandDisplay)
+                        .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
                 eventDetail("Session", sessionLabel)
                 eventDetail("Command match", fullMatchLabel)
                 VStack(alignment: .leading, spacing: 2) {
@@ -2746,24 +2775,26 @@ struct GateEventCard: View {
                 }
                 eventDetail("Outcome", outcome)
             } else {
-                Text("Session \(sessionLabel) · \(relative(event.ts))")
-                    .font(ft(11)).foregroundColor(P.muted).lineLimit(1)
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text("\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
-                        .font(ft(11)).foregroundColor(P.muted)
-                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    Text("\(sessionLabel) · \(ruleLine)")
+                        .font(ft(11)).foregroundColor(P.muted).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 2)
                     Chevron(open: false)
                 }
+                .padding(.leading, 12)
             }
         }
-        .padding(10)
+        .padding(.horizontal, 10).padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(0.62), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 8).fill(P.panel))
         .contentShape(Rectangle())
+        .help(event.commandDisplay)
         .onTapGesture { withAnimation(animation) { expanded.toggle() } }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(stopped ? "Stopped, command did not run" : "Warned, command ran"): "
+            + "\(event.commandDisplay) · Session \(sessionLabel) · \(relative(event.ts)) · "
+            + "\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
+        .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isButton)
     }
 
@@ -2779,24 +2810,25 @@ struct GateEventCard: View {
 struct MissingGateEventCard: View {
     var item: PendingRetry
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 5) {
-                Text("Stopped · command did not run").font(ft(11, .medium)).foregroundColor(P.red)
-                Spacer()
-                Text(eventTime(item.ts)).font(ft(11)).foregroundColor(P.muted)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle().fill(P.red).frame(width: 6, height: 6).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                Text(item.commandShort ?? item.commandDisplay)
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(relative(item.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
-            Text(item.commandDisplay)
-                .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
-                .lineLimit(2).textSelection(.enabled)
-            Text("Session \(item.sessionName ?? item.sessionID) · \(relative(item.ts))")
-                .font(ft(11)).foregroundColor(P.muted)
-            Text("Stopped earlier · event details are no longer retained")
-                .font(ft(11)).foregroundColor(P.muted)
+            Text("\(item.sessionName ?? item.sessionID) · event details no longer retained")
+                .font(ft(11)).foregroundColor(P.muted).lineLimit(1).padding(.leading, 12)
         }
-        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
-        .accessibilityElement(children: .combine)
+        .padding(.horizontal, 10).padding(.vertical, 7).frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(P.panel))
+        .help(item.commandDisplay)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Stopped, command did not run: \(item.commandDisplay) · Session "
+            + "\(item.sessionName ?? item.sessionID) · \(relative(item.ts)) · "
+            + "Stopped earlier · event details are no longer retained")
     }
 }
 
@@ -3147,7 +3179,7 @@ struct ContentView: View {
             }
             ForEach(sections, id: \.0) { sec, rows in
                 let open = model.isOpen(sec, rows)
-                SectionHeader(section: sec, rows: rows, open: open) {
+                SectionHeader(section: sec, rows: rows, open: open, sort: model.sort) {
                     withAnimation(motion(0.16)) { model.toggle(sec, rows) }
                 }
                 if open {
