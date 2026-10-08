@@ -1,0 +1,19 @@
+{
+ "exit": 0,
+ "after_force": true,
+ "stdout": {
+  "result": "force_stopped",
+  "exited": 1,
+  "remaining": [
+   {
+    "pid": 48399,
+    "start": [
+     1791449140,
+     2
+    ],
+    "argv0": "node"
+   }
+  ],
+  "kept": []
+ }
+}

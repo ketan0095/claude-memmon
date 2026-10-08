@@ -2,7 +2,7 @@
  "exit": 3,
  "stdout": {
   "result": "respawned",
-  "reason": "worker restarted by the Claude daemon",
+  "reason": "daemon_restarted_worker",
   "exited": 9,
   "captured": 9,
   "remaining": [],

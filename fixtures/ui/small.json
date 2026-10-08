@@ -8,7 +8,7 @@
    "title": "Checkout copy fixes",
    "project": "acme-web",
    "worktree": "copy",
-   "activity": "Waiting for input",
+   "activity": "Idle",
    "confidence": "exact",
    "footprint_bytes": 644245094,
    "cpu_cores": 0.0,
@@ -34,6 +34,15 @@
   "gate": "on",
   "route": "off",
   "unmanaged_heavy": 0
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": 5.6,
+  "cpu_coverage": 0.6
  },
  "gate": {
   "installed": true,

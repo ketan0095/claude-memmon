@@ -1,0 +1,21 @@
+{
+ "_base": "overview.json",
+ "runner_jobs": [
+  {
+   "id": "run-fixture-1",
+   "resource": "heavy",
+   "label": "acme-web typecheck",
+   "state": "running",
+   "reason": "command running",
+   "elapsed_seconds": 42
+  },
+  {
+   "id": "run-fixture-2",
+   "resource": "heavy",
+   "label": "acme-api tests",
+   "state": "waiting",
+   "reason": "resource held by acme-web typecheck",
+   "elapsed_seconds": 12
+  }
+ ]
+}
