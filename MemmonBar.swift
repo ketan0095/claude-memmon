@@ -156,6 +156,10 @@ struct PendingRetry: Identifiable {
     var ts: Double, sessionID: String, sessionName: String?
     var commandRaw: String, commandDisplay: String, pressureLevel: String
     var eventRetained: Bool
+    /// memmon's id for `--dismiss-blocked`; older payloads carry none.
+    var pendingID: String? = nil
+    /// The operation alone (`pnpm test:affected`); the raw line stays in the label.
+    var commandShort: String? = nil
 }
 
 struct GateStats {
@@ -237,7 +241,9 @@ struct GateStats {
                 commandRaw: command["raw"] as? String ?? "",
                 commandDisplay: command["display"] as? String ?? "",
                 pressureLevel: d["pressure_level"] as? String ?? "?",
-                eventRetained: d["event_retained"] as? Bool ?? false)
+                eventRetained: d["event_retained"] as? Bool ?? false,
+                pendingID: d["id"] as? String,
+                commandShort: command["short"] as? String)
         }
         return s
     }
@@ -1515,6 +1521,14 @@ final class Model: ObservableObject {
         guard refreshQueued, !refreshing, !scannerBusy else { return }
         refreshQueued = false
         refresh()
+    }
+
+    func dismissBlocked(_ id: String) {
+        guard live else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = CLI.run(["--dismiss-blocked", id], timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async { self.refresh() }
+        }
     }
 
     func toggleGate(_ pause: Bool) {
@@ -3310,17 +3324,32 @@ struct ContentView: View {
                     Text("\(plural(g.pending.count, "blocked command")) waiting to retry")
                         .font(ft(12, .medium))
                     ForEach(g.pending.sorted { $0.ts > $1.ts }) { p in
-                        Text("\(p.commandDisplay) · \(p.sessionName ?? (p.sessionID.isEmpty ? "unknown session" : p.sessionID)) · blocked at \(p.pressureLevel) \(relative(p.ts))")
-                            .font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
+                        let who = p.sessionName ?? (p.sessionID.isEmpty ? "unknown session" : p.sessionID)
+                        let when = "blocked at \(p.pressureLevel) \(relative(p.ts))"
+                        HStack(alignment: .center, spacing: 6) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(p.commandShort ?? p.commandDisplay)
+                                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                                    .lineLimit(1).truncationMode(.middle)
+                                Text("\(who) · \(when)").font(ft(11)).foregroundColor(P.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .help(p.commandDisplay)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("\(p.commandDisplay) · \(who) · \(when)")
+                            Spacer(minLength: 4)
+                            if let id = p.pendingID {
+                                ActionButton(title: "Dismiss", variant: .link) { model.dismissBlocked(id) }
+                                    .accessibilityLabel("Dismiss blocked \(p.commandShort ?? p.commandDisplay)")
+                            }
+                        }
                     }
                     Text(copy).font(ft(11)).foregroundColor(tint).fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.amber.opacity(0.62), lineWidth: 1))
-                .accessibilityElement(children: .combine)
+                .accessibilityElement(children: .contain)
             }
             Button { withAnimation(motion(0.16)) { openGate.toggle() } } label: {
                 HStack(spacing: 5) {

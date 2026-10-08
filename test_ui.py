@@ -701,9 +701,19 @@ class AccessibilityTests(unittest.TestCase):
         self.assertLessEqual(abs(float(long["height"]) - float(short["height"])), 1)
 
     def test_pending_retries_listed_in_the_gate_section(self):
-        found = labels(a11y("overview.json"))
-        self.assertTrue(any(l.startswith("1 blocked command waiting to retry, pnpm typecheck") for l in found))
-        self.assertIn("Pause command protection", found)
+        rows = a11y("overview.json")
+        spoken = [r["label"] or r["value"] for r in rows]
+        self.assertIn("1 blocked command waiting to retry", spoken)
+        self.assertTrue(any(l.startswith("pnpm typecheck · Checkout refactor · blocked at CRITICAL")
+                            for l in spoken))
+        self.assertIn("Pause command protection", labels(rows))
+
+    def test_a_long_blocked_command_shows_short_and_can_be_dismissed(self):
+        rows = a11y("stale-paused.json")
+        spoken = [r["label"] or r["value"] for r in rows]
+        # VoiceOver keeps the whole line; the card shows only the operation.
+        self.assertTrue(any(l.startswith("timeout 1500 pnpm test:affected > /tmp/") for l in spoken))
+        self.assertIn("Dismiss blocked pnpm test:affected", labels(rows))
 
     def test_outcome_banners_and_degraded_banner_are_announced(self):
         stopped = a11y("outcome-stopped.json")

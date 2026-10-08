@@ -122,10 +122,12 @@
     },
     "command": {
      "raw": "pnpm typecheck",
-     "display": "pnpm typecheck"
+     "display": "pnpm typecheck",
+     "short": "pnpm typecheck"
     },
     "pressure_level": "CRITICAL",
-    "event_retained": true
+    "event_retained": true,
+    "id": "1791449760000.fixture-a"
    }
   ]
  },

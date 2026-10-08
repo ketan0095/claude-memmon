@@ -309,7 +309,8 @@ memmon                 live dashboard (repaints in place, alternate screen)
 memmon --once          one snapshot
 memmon --pressure      crash-risk verdict only (fast, no top)
 memmon --report        per-app / per-worktree averages from history
-memmon --blocked       commands the gate refused that nobody has re-run
+memmon --blocked       commands the gate refused in the last 2 hours that nobody has re-run
+memmon --dismiss-blocked ID   stop listing one of them (the menu bar's Dismiss)
 memmon --gate-log      gate impact: what was evaluated, advised, blocked
 memmon owners          every process, partitioned into exactly one owner
 memmon owners --json   the same as schema 2 JSON (what the menu bar reads)
@@ -680,6 +681,12 @@ Bash tool call
                                  Recorded in `memmon --blocked` to re-run later.
 ```
 
+A blocked command stays listed until the same session runs the same command
+again, until it is dismissed, or for 2 hours, whichever comes first. A pressure
+block is temporary: by then the session has retried in some form or moved on.
+The menu bar shows the operation itself (`pnpm test:affected`), not the whole
+shell line, which stays in the tooltip and the VoiceOver label.
+
 Exit code 2 is the only code that stops a tool. Every other path returns 0,
 including every error path — a monitoring tool must never be why work stops.
 
@@ -778,7 +785,7 @@ Everything lives in `~/.claude/memmon/`. Nothing is written to `/tmp`.
 |---|---|
 | `history.jsonl` | trims to last 7 days once past 12 MB (~1 MB/day) |
 | `gate.jsonl` | last 500 entries past 256 KB |
-| `latest.json`, `blocked.json` | fixed / last 50 |
+| `latest.json`, `blocked.json` | fixed / last 50, entries listed for 2 hours |
 | `sampler.err` | last 200 lines past 1 MB |
 | `owners-history.json` | 60 samples × 200 owners, under ~600 KB |
 | `cpu-baseline.json` | one sample of up to 4,096 processes |

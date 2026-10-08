@@ -2218,6 +2218,10 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
 
 
 PENDING = os.path.join(STATE_DIR, "blocked.json")
+# A pressure block is temporary: after this long the session has retried in
+# some form or moved on, so the entry stops asking to be re-run.
+PENDING_TTL_S = 2 * 3600
+WRAPPERS = {"timeout", "gtimeout", "nice", "time", "caffeinate", "env", "command"}
 
 
 def session_name_for(session_id: str) -> str:
@@ -2331,8 +2335,10 @@ def gate_stats(limit: int | None = None) -> dict:
         "ts": p.get("ts", 0),
         "session": {"id": (p.get("session_id") or "")[:8],
                     "name": p.get("session")},
+        "id": pending_id(p),
         "command": {"raw": p.get("cmd", ""),
-                    "display": display_command(p.get("cmd", ""))},
+                    "display": display_command(p.get("cmd", "")),
+                    "short": short_command(p.get("cmd", ""))},
         "pressure_level": p.get("level") or "?",
         "event_retained": any(
             e["retry_status"] == "waiting"
@@ -2371,11 +2377,54 @@ def gate_stats(limit: int | None = None) -> dict:
 
 
 def load_pending() -> list[dict]:
+    """Outstanding blocked commands, without any older than PENDING_TTL_S."""
     try:
         with open(PENDING) as fh:
-            return json.load(fh)
+            items = json.load(fh)
     except Exception:
         return []
+    now = time.time()
+    return [i for i in items if now - (i.get("ts") or 0) < PENDING_TTL_S]
+
+
+def pending_id(item: dict) -> str:
+    return f"{int((item.get('ts') or 0) * 1000)}.{(item.get('session_id') or '')[:8]}"
+
+
+def dismiss_pending(item_id: str) -> bool:
+    """Drop one outstanding entry by its id. False when nothing matched."""
+    items = load_pending()
+    kept = [i for i in items if pending_id(i) != item_id]
+    if len(kept) == len(items):
+        return False
+    save_pending(kept)
+    return True
+
+
+def short_command(cmd: str, limit: int = 60) -> str:
+    """The operation itself, e.g. `pnpm test:affected`: the heavy segment of a
+    pipeline, without wrappers such as `timeout 1500` or its redirections."""
+    commands = shell_commands(cmd)
+    plain = [t for t in commands if t and t[0] != "cd"] or commands
+    tokens = next((t for t in commands if _builtin_for_tokens(t)),
+                  plain[0] if plain else [])
+    out: list[str] = []
+    for t in tokens:
+        if re.match(r"^\d*[<>&|]", t):
+            break
+        out.append(t)
+    while out and (out[0] in WRAPPERS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0])):
+        head = out.pop(0)
+        while out and out[0].startswith("-"):
+            flag = out.pop(0)
+            if flag in ("-n", "-s", "-k") and out:
+                out.pop(0)
+        if head in ("timeout", "gtimeout") and out and re.match(r"^[\d.]+[smhd]?$", out[0]):
+            out.pop(0)
+    text = " ".join(out) or display_command(cmd)
+    if HOME:
+        text = text.replace(HOME + "/", "~/")
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
 def save_pending(items: list[dict]) -> None:
@@ -2928,6 +2977,8 @@ def main() -> int:
                     help="PreToolUse hook: gate heavy commands on memory pressure")
     ap.add_argument("--blocked", action="store_true",
                     help="commands the gate refused that nobody has re-run")
+    ap.add_argument("--dismiss-blocked", metavar="ID",
+                    help="stop listing one blocked command (its id from --blocked)")
     ap.add_argument("--off", nargs="?", const="forever", metavar="DURATION",
                     help="pause the gate entirely, e.g. --off 8h (default: until --on)")
     ap.add_argument("--on", action="store_true", help="resume the gate")
@@ -2997,17 +3048,25 @@ def main() -> int:
         save_pending([])
         print("outstanding-blocked list cleared")
         return 0
+    if args.dismiss_blocked:
+        if dismiss_pending(args.dismiss_blocked):
+            print("Dismissed.")
+            return 0
+        print("No outstanding blocked command has that id.", file=sys.stderr)
+        return 1
     if args.blocked:
         pend = load_pending()
         if not pend:
-            print("Nothing outstanding — no command has been blocked.")
+            print("Nothing outstanding in the last "
+                  f"{PENDING_TTL_S // 3600} hours — no command is waiting to be re-run.")
             return 0
         lvl = pressure(read_vm(fast=True))["level"]
         print(f"{len(pend)} command(s) blocked and not yet re-run:\n")
         for b in pend:
             print(f"  {time.strftime('%H:%M', time.localtime(b['ts']))}  "
-                  f"{b.get('session', '?')}")
+                  f"{b.get('session', '?')}  ·  {short_command(b.get('cmd', ''))}")
             print(f"        {b.get('cmd', '')[:100]}")
+            print(f"        dismiss: memmon --dismiss-blocked {pending_id(b)}")
             if b.get("cwd"):
                 print(f"        in {b['cwd']}")
         print()

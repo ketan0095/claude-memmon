@@ -100,11 +100,13 @@
      "name": "Checkout refactor"
     },
     "command": {
-     "raw": "pnpm typecheck",
-     "display": "pnpm typecheck"
+     "raw": "timeout 1500 pnpm test:affected > /tmp/acme-web-affected.log 2>&1; echo \"exit=$?\"; grep -E \"Test Files|FAIL\" /tmp/acme-web-affected.log | head -15",
+     "display": "timeout 1500 pnpm test:affected > /tmp/acme-web-affected.log 2>&1; echo \"exit=$?\"; grep -E \"Test Files|FAIL\" /tmp/acme-web-affected.log | head -15",
+     "short": "pnpm test:affected"
     },
     "pressure_level": "CRITICAL",
-    "event_retained": true
+    "event_retained": true,
+    "id": "1791449760000.fixture-a"
    }
   ]
  }

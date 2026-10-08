@@ -193,6 +193,46 @@ printf 'saved prompt'
         self.assertIsNone(event["classification"])
         self.assertIsNone(event["session"]["name"])
 
+    def write_pending(self, *ages):
+        now = memmon.time.time()
+        items = [{"ts": now - age, "session_id": f"0000aa{k:02d}-x", "session": "Checkout refactor",
+                  "cmd": f"timeout 1500 pnpm test:affected > /tmp/t{k}.log 2>&1; echo done",
+                  "cwd": "", "level": "CRITICAL"} for k, age in enumerate(ages)]
+        with open(memmon.PENDING, "w") as fh:
+            json.dump(items, fh)
+        return items
+
+    def test_blocked_commands_expire_after_two_hours(self):
+        self.write_pending(60, memmon.PENDING_TTL_S + 60)
+        pending = memmon.gate_stats()["pending_retry"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["session"]["id"], "0000aa00")
+
+    def test_pending_rows_carry_an_id_and_a_short_command(self):
+        self.write_pending(60)
+        row = memmon.gate_stats()["pending_retry"][0]
+        self.assertEqual(row["command"]["short"], "pnpm test:affected")
+        self.assertTrue(row["command"]["raw"].startswith("timeout 1500"))
+        self.assertRegex(row["id"], r"^\d+\.0000aa00$")
+
+    def test_dismiss_removes_only_the_named_entry(self):
+        items = self.write_pending(60, 120)
+        self.assertTrue(memmon.dismiss_pending(memmon.pending_id(items[0])))
+        left = memmon.load_pending()
+        self.assertEqual([i["session_id"] for i in left], ["0000aa01-x"])
+        self.assertFalse(memmon.dismiss_pending("0.nothing"))
+
+    def test_short_command_drops_wrappers_redirects_and_cd(self):
+        cases = {
+            "cd ~/a && pnpm -w typecheck": "pnpm -w typecheck",
+            "FOO=1 npx vitest run src/a.test.ts": "npx vitest run src/a.test.ts",
+            "nice -n 10 cargo build --release 2>&1 | tail": "cargo build --release",
+            "timeout -k 5 600 make -j8": "make -j8",
+        }
+        for cmd, want in cases.items():
+            self.assertEqual(memmon.short_command(cmd), want, cmd)
+        self.assertEqual(len(memmon.short_command("echo " + "x" * 90)), 60)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
