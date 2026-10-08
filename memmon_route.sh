@@ -21,17 +21,16 @@ case "$1" in
   *colima*|*next*|*expo*) ;;
   *) run_plain "$1" ;;
 esac
-[ -f "$M/memmon.py" ] || run_plain "$1"
+[ -f "$M/memmon.py" ] && [ -f "$M/memmon_route.py" ] || run_plain "$1"
 
-# Classify with a 1 s watchdog; a timeout or any failure passes through.
-verdict=$(
-  /usr/bin/python3 "$M/memmon.py" route-classify "$1" 2>/dev/null &
-  c=$!
-  ( sleep 1; kill -9 "$c" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
-  wait "$c"
-  kill "$w" 2>/dev/null
-)
+# Classify within 1 s: alarm(1) is the interpreter's first act and SIGALRM
+# ends it, so a hang or any failure yields no verdict and passes through.
+# -I keeps the session's working directory off sys.path.
+verdict=$(/usr/bin/python3 -I -c 'import signal, sys
+signal.alarm(1)
+sys.path.insert(0, sys.argv[1])
+import memmon_route
+memmon_route.classify_main(sys.argv[2])' "$M" "$1" 2>/dev/null)
 tab=$(printf '\t')
 case "$verdict" in
   "wrap$tab"*)

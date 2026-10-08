@@ -8,6 +8,7 @@ package tools on PATH are fakes that count their invocations."""
 
 import json
 import os
+import shutil
 from pathlib import Path
 import shlex
 import subprocess
@@ -20,22 +21,26 @@ import memmon_route as route
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "memmon_route.sh")
+# The installed memmon.py: run as a script it only records a `run`; imported
+# (by the classifier) it is the real memmon.
 SHIM = """import os, sys
-sys.path.insert(0, {repo!r})
-import memmon_route
-state = os.path.join(os.environ["HOME"], ".claude", "memmon")
-if sys.argv[1] == "route-classify":
-    if os.path.exists(os.path.join(state, "force-wrap")):
-        print("wrap\tforced"); sys.exit(0)
-    if os.path.exists(os.path.join(state, "hang-classifier")):
-        import time; time.sleep(5)
-    sys.exit(memmon_route.cli(sys.argv[1:], state))
-if sys.argv[1] == "run":
-    with open(os.path.join(state, "wrapped.jsonl"), "a") as fh:
-        fh.write(__import__("json").dumps(sys.argv[2:]) + "\\n")
-    sys.exit(0)
-sys.exit(99)
+if __name__ != "__main__":
+    import importlib.util
+    sys.path.insert(1, {repo!r})
+    spec = importlib.util.spec_from_file_location("memmon_real", {repo!r} + "/memmon.py")
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    globals().update({{k: getattr(real, k) for k in dir(real) if not k.startswith("__")}})
+else:
+    state = os.path.join(os.environ["HOME"], ".claude", "memmon")
+    if sys.argv[1] == "run":
+        with open(os.path.join(state, "wrapped.jsonl"), "a") as fh:
+            fh.write(__import__("json").dumps(sys.argv[2:]) + "\\n")
+        sys.exit(0)
+    sys.exit(99)
 """
+HANG = "import time\ntime.sleep(5)\n"
+FORCE_WRAP = "def classify_main(invocation):\n    print('wrap\\tforced')\n"
 FAKE_TOOL = """#!/bin/sh
 echo "$(basename "$0") $*" >> "$HOME/calls"
 exit "${FAKE_EXIT:-0}"
@@ -62,6 +67,7 @@ class RouteScriptTests(unittest.TestCase):
         self.state = self.home / ".claude" / "memmon"
         (self.state / "runner" / "coord").mkdir(parents=True)
         (self.state / "memmon.py").write_text(SHIM.format(repo=HERE))
+        shutil.copy(os.path.join(HERE, "memmon_route.py"), self.state / "memmon_route.py")
         self.bin = self.home / "bin"
         self.bin.mkdir()
         for tool in TOOLS:
@@ -140,7 +146,7 @@ class RouteScriptTests(unittest.TestCase):
     def test_launcher_checks_origin_before_the_classifier(self):
         """The launcher's own origin check, with a classifier that would wrap
         anything: hooks, MCP startup and non-Claude callers still pass."""
-        (self.state / "force-wrap").touch()
+        (self.state / "memmon_route.py").write_text(FORCE_WRAP)
         for origin in (HOOK, {}, {"CLAUDE_PROJECT_DIR": "/tmp/acme-web"}):
             with self.subTest(origin=origin):
                 (self.state / "wrapped.jsonl").unlink(missing_ok=True)
@@ -153,6 +159,7 @@ class RouteScriptTests(unittest.TestCase):
         """B30: the runner would refuse (124/125) if it were reached; the
         hook never reaches it."""
         (self.state / "memmon.py").write_text("import sys; sys.exit(124)\n")
+        (self.state / "memmon_route.py").write_text(FORCE_WRAP)
         out = self.route("pnpm test || exit 2", origin=HOOK, raw=True, extra={"FAKE_EXIT": "1"})
         self.assertEqual((out.returncode, self.calls()), (2, ["pnpm test"]))
 
@@ -161,19 +168,19 @@ class RouteScriptTests(unittest.TestCase):
         self.assert_passes("pnpm test", expect_calls=1)
 
     def test_classifier_failure_or_timeout(self):
-        (self.state / "hang-classifier").touch()
+        (self.state / "memmon_route.py").write_text(HANG)
         t0 = time.monotonic()
-        self.assert_passes("pnpm test", expect_calls=1)
-        self.assertLess(time.monotonic() - t0, 3.0)
-        (self.state / "hang-classifier").unlink()
-        (self.state / "memmon.py").write_text("raise SystemExit('broken install')\n")
+        out = self.assert_passes("pnpm test", expect_calls=1)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(out.stderr, "")
+        (self.state / "memmon_route.py").write_text("raise SystemExit('broken install')\n")
         self.assert_passes("pnpm test", expect_calls=2)
-        (self.state / "memmon.py").unlink()
+        (self.state / "memmon_route.py").unlink()
         self.assert_passes("pnpm test", expect_calls=3)
 
     def test_benign_commands_run_immediately_with_telemetry_broken(self):
         """B21: benign commands never reach the classifier or the runner."""
-        (self.state / "memmon.py").write_text("import time; time.sleep(10)\n")
+        (self.state / "memmon_route.py").write_text("import time; time.sleep(10)\n")
         t0 = time.monotonic()
         out = self.route("echo hello && ls x")
         self.assertEqual(out.stdout, "hello\n")

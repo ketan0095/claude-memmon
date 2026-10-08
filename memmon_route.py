@@ -231,6 +231,16 @@ def route_off(state_dir, settings_path=None) -> tuple:
 
 # ------------------------------------------------------------------ CLI
 
+def classify_main(invocation: str) -> None:
+    """memmon_route.sh's entry point. Prints one verdict line; any failure
+    prints "pass", and so does a timeout, by printing nothing."""
+    try:
+        verdict, detail = route_classify(invocation)
+    except Exception as exc:
+        verdict, detail = "pass", f"classifier error: {type(exc).__name__}"
+    print(f"{verdict}\t{detail}")
+
+
 def cli(argv, state_dir, classify=None, settings_path=None, split=None) -> int:
     if argv[0] == "route-classify":
         try:
