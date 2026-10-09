@@ -1105,8 +1105,10 @@ class OverheadTests(Base):
         coord.mkdir(parents=True, exist_ok=True)
         (coord / "admission-state.json").write_text(json.dumps(st))
         cpu_log = str(self.root / "cpu.json")
+        # A small reservation keeps the bench about monitoring cost, not about
+        # how much memory this machine happens to have free.
         proc = self.launch("import time; time.sleep(20)", real=True, cpu_log=cpu_log,
-                           tick_s=2.0, poll_interval=1.0, hysteresis_s=30.0)
+                           tick_s=2.0, poll_interval=1.0, hysteresis_s=30.0, reserve=0.1)
         self.finish(proc, timeout=60)
         m = json.loads(Path(cpu_log).read_text())
         self.assertGreater(m["wall"], 19.5)
