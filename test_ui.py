@@ -2477,6 +2477,31 @@ class ExplainTests(StubCase):
         r, _ = self.run_steps("click", reply={"text": "All clear.", "mode": "quiet", "title": "Nothing to do"})
         self.assertEqual((r["heading"], r["quiet"]), ("Nothing to do", True))
 
+    def test_items_render_in_order_one_element_each(self):
+        found = said("explain-now.json")
+        rows = ["Checkout refactor, Let its typecheck finish before starting another build., It holds 8.9 GB while building.",
+                "VM · colima, Stop it from its app if no session needs it., 6.5 GB, idle for the last hour.",
+                "Example Browser, Close the tabs you aren't using."]           # no why: no trailing part
+        idx = [found.index(r) for r in rows]
+        self.assertEqual(idx, sorted(idx))
+        # The joined text is not shown as well.
+        self.assertFalse(any(l.startswith("Checkout refactor: Let its") for l in found))
+
+    def test_each_items_dot_is_its_owners_section(self):
+        r = host("explain", FIXTURES / "explain-now.json")
+        self.assertEqual([(i["owner"], i["section"]) for i in r["items"]],
+                         [("Checkout refactor", "claude"), ("VM · colima", None), ("Example Browser", "app")])
+        r = host("explain", FIXTURES / "explain-patterns.json")
+        self.assertEqual([i["section"] for i in r["items"]], [None, None, "app"])
+
+    def test_without_items_the_text_is_shown_as_is(self):
+        r, _ = self.run_steps("click")
+        self.assertEqual((r["items"], r["text"]), ([], self.REPLY["text"]))
+        self.assertTrue(any("**Billing API tests** (Codex)" in l for l in said("explain-reply.json")))
+        reply = dict(self.REPLY, items=[{"owner": "Example Browser", "action": "Close tabs.", "why": ""}])
+        r, _ = self.run_steps("click", reply=reply)
+        self.assertEqual(r["items"], [{"owner": "Example Browser", "section": "app"}])
+
     def test_fixture_mode_logs_the_exact_argv(self):
         self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],
                          ["memmon explain --json"])

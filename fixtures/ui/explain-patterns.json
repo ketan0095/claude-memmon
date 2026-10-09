@@ -8,7 +8,24 @@
     "title": "Patterns this week",
     "model": "claude-haiku-5-5",
     "chars_sent": 910,
-    "text": "Memory peaks above 40 GB on days with two or more Claude sessions building at once; stagger typechecks.\nContainer VM stays near 7 GB all week even when idle; consider stopping it overnight."
+    "text": "acme-web typecheck: Stagger typechecks across sessions.\nVM · colima: Stop it overnight.\nExample Browser: Restart it once a day.",
+    "items": [
+     {
+      "owner": "acme-web typecheck",
+      "action": "Stagger typechecks across sessions.",
+      "why": "Peaks pass 40 GB on days two sessions build at once."
+     },
+     {
+      "owner": "VM · colima",
+      "action": "Stop it overnight.",
+      "why": "It stays near 7 GB all week, even when idle."
+     },
+     {
+      "owner": "Example Browser",
+      "action": "Restart it once a day.",
+      "why": "It grows by about 1 GB a day."
+     }
+    ]
    }
   }
  }

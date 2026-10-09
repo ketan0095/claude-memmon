@@ -1553,12 +1553,39 @@ struct SettingsInfo {
     }
 }
 
+/// One suggestion from `memmon explain --json` items (D47c). Shown only as
+/// text; nothing in it is run.
+struct ExplainItem: Equatable {
+    var owner: String, action: String, why: String
+
+    static func decode(_ d: [String: Any]) -> ExplainItem? {
+        guard let owner = str(d["owner"]), let action = str(d["action"]) else { return nil }
+        return ExplainItem(owner: owner, action: action, why: str(d["why"]) ?? "")
+    }
+
+    var spoken: String { [owner, action, why].filter { !$0.isEmpty }.joined(separator: ", ") }
+}
+
+/// The section of the owner an item names, by the snapshot's own titles
+/// (an owner's title, or one of its job labels); nil when nothing matches.
+func explainSection(_ name: String, _ s: OwnersSnap?) -> OwnerSection? {
+    guard let s else { return nil }
+    let key = name.lowercased()
+    for o in s.rows {
+        if o.title.lowercased() == key || o.jobs.contains(where: { $0.label.lowercased() == key }) {
+            return ownerSection(o)
+        }
+    }
+    return nil
+}
+
 /// `memmon explain --json` (D47): exit 0 with {text, chars_sent, model}, or
 /// exit 2 with {error}. The reply is only ever shown as plain text.
 enum ExplainOutcome {
     /// `mode` is "now", "patterns" or "quiet"; quiet means memmon answered
     /// itself and Claude was not asked. Both are absent from older memmon.
-    case reply(text: String, chars: Int?, model: String?, mode: String? = nil, title: String? = nil)
+    case reply(text: String, chars: Int?, model: String?, mode: String? = nil, title: String? = nil,
+               items: [ExplainItem] = [])
     case failed(String)
 
     static func of(_ r: CLIResult) -> ExplainOutcome {
@@ -1568,7 +1595,8 @@ enum ExplainOutcome {
         if r.exit == 0, let j, let t = j["text"] as? String {
             return .reply(text: t.trimmingCharacters(in: .whitespacesAndNewlines),
                           chars: int(j["chars_sent"]), model: str(j["model"]),
-                          mode: str(j["mode"]), title: str(j["title"]))
+                          mode: str(j["mode"]), title: str(j["title"]),
+                          items: (j["items"] as? [[String: Any]] ?? []).compactMap(ExplainItem.decode))
         }
         if let e = j.flatMap({ str($0["error"]) }) { return .failed(readable(e)) }
         return .failed("Could not ask Claude: memmon's answer could not be read.")
@@ -2704,6 +2732,8 @@ final class Model: ObservableObject {
     /// The answer's mode and title from memmon; nil from an older memmon.
     @Published var explainMode: String?
     @Published var explainTitle: String?
+    /// The answer as owner / action / why rows; empty from an older memmon.
+    @Published var explainItems: [ExplainItem] = []
     var explainQuiet: Bool { explainMode == "quiet" }
     /// The card's title once there is an answer.
     var explainHeading: String { explainTitle ?? "Claude’s suggestions" }
@@ -2720,6 +2750,7 @@ final class Model: ObservableObject {
         explainText = nil
         explainMode = nil
         explainTitle = nil
+        explainItems = []
         let args = ["explain", "--json"]
         guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
         explainSeq += 1
@@ -2746,8 +2777,9 @@ final class Model: ObservableObject {
     func applyExplain(_ o: ExplainOutcome) {
         explainBusy = false
         switch o {
-        case .reply(let text, _, _, let mode, let title):
+        case .reply(let text, _, _, let mode, let title, let items):
             explainText = text
+            explainItems = items
             explainMode = mode
             explainTitle = title
             explainError = nil
@@ -5453,9 +5485,13 @@ struct ContentView: View {
                         Image(systemName: "checkmark.circle").font(.system(size: 13, weight: .medium))
                             .foregroundColor(P.green).padding(.top, 1).accessibilityHidden(true)
                     }
-                    Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
+                    if model.explainItems.isEmpty || model.explainQuiet {
+                        Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    } else {
+                        explainItemList(model.explainItems)
+                    }
                 }
                 HStack(alignment: .top, spacing: 8) {
                     if !model.explainQuiet {
@@ -5474,6 +5510,35 @@ struct ContentView: View {
         .panel(12)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Ask Claude")
+    }
+
+    /// One row per item: the owner (with its section's dot), what to do,
+    /// and why. Plain text throughout.
+    private func explainItemList(_ items: [ExplainItem]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(items.enumerated()), id: \.offset) { k, item in
+                if k > 0 { Rectangle().fill(P.border).frame(height: 1) }
+                let sec = explainSection(item.owner, model.snap)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Circle().fill(sec.map(P.section) ?? P.muted).frame(width: 7, height: 7)
+                            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                        Text(verbatim: item.owner).font(ft(12, .semibold)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(verbatim: item.action).font(ft(12)).foregroundColor(P.text)
+                        .fixedSize(horizontal: false, vertical: true).padding(.leading, 13)
+                    if !item.why.isEmpty {
+                        Text(verbatim: item.why).font(ft(11)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true).padding(.leading, 13)
+                    }
+                }
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(item.spoken)
+            }
+        }
     }
 
     // MARK: settings (D43)
@@ -7160,6 +7225,9 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 report["text"] = model.explainText ?? NSNull()
                 report["heading"] = model.explainText == nil ? NSNull() : model.explainHeading
                 report["quiet"] = model.explainQuiet
+                report["items"] = model.explainItems.map {
+                    ["owner": $0.owner, "section": explainSection($0.owner, model.snap)?.rawValue ?? NSNull()] as [String: Any]
+                }
                 report["error"] = model.explainError ?? NSNull()
                 report["actions"] = model.actionLog
             case "usage":
