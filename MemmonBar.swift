@@ -5297,8 +5297,7 @@ struct ContentView: View {
                 Text("Settings").font(ft(15, .semibold)).accessibilityAddTraits(.isHeader)
                 if busy { ProgressView().controlSize(.small) }
                 Spacer()
-                ActionButton(title: "Done", variant: .link) { withAnimation(motion(0.12)) { model.closeSettings() } }
-                    .accessibilityLabel("Close settings")
+                // Closing is the header's × (or Esc), so there is one way, not two.
             }
             .padding(.horizontal, 4)
             if let e = model.settingsError {
@@ -6933,6 +6932,16 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 guard let rid = argValue("--run-id") else { fail("notice-click needs --run-id") }
                 let t = NoticeTarget(runId: rid, state: argValue("--state") ?? "intervention_needed",
                                      label: argValue("--label") ?? "The job")
+                if ARGS.contains("--notifications-off") {
+                    // memmon's notifications setting is off: a click is ignored.
+                    final class Off: Notifier {
+                        func post(id: String, title: String, body: String, userInfo: [String: Any],
+                                  done: @escaping (Bool) -> Void) { done(true) }
+                    }
+                    let a = InterventionAlerts(notifier: Off(), store: MemoryStore())
+                    a.enabled = false
+                    model.alerts = a
+                }
                 model.openFromNotification(t)
                 report["pending"] = model.pendingNotice != nil
                 var landing = model.snap!

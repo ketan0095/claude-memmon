@@ -2084,6 +2084,13 @@ class SettingsPanelTests(StubCase):
     def test_notifications_on_still_posts(self):
         self.assertEqual(self.settings("settings-panel.json", ["intervene"])["posted"], 1)
 
+    def test_only_the_header_closes_settings(self):
+        found = said("settings-panel.json")
+        self.assertNotIn("Done", found)
+        self.assertEqual(found.count("Close settings"), 1)        # the header's ×
+        r = self.settings("settings-panel.json", ["close"])
+        self.assertFalse(r["open"])
+
     def test_labels(self):
         found = said("settings-panel.json")
         for label in ["Close settings", "Gate mode, Stop at Critical", "Choose Stop at Danger",
@@ -2155,6 +2162,11 @@ class NotificationClickTests(unittest.TestCase):
             # Once that confirm has closed, the next refresh opens the notice's confirm.
             self.assertEqual((r["phase"], r["confirm_token"]), ("ask", "tok-fixture-managed-index-fresh"), busy)
             self.assertEqual(r["actions"], [])
+
+    def test_a_click_is_ignored_while_notifications_are_off(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--notifications-off")
+        self.assertEqual((r["pending"], r["selected"], r["phase"], r["banner"], r["actions"]),
+                         (False, None, "closed", None, []))
 
     def test_notifications_carry_the_job_but_no_token(self):
         with tempfile.TemporaryDirectory() as d:
