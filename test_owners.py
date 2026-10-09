@@ -918,6 +918,18 @@ class LegacyCompatTests(unittest.TestCase):
         for m in mods:
             self.assertIn(f'"$DEST_DIR/{m}.py"', script, m)
 
+    def test_install_never_copies_over_a_live_file(self):
+        # The README promises a temp file and a rename for every installed file:
+        # the gate runs before every Bash command, so a half-written one would
+        # break every session mid-upgrade.
+        with open(os.path.join(HERE, "install.sh")) as fh:
+            script = fh.read()
+        for line in script.splitlines():
+            m = re.match(r'\s*cp\s+"\$SRC_DIR/[^"]+\.(?:py|sh)"\s+"([^"]+)"', line)
+            if m:
+                self.assertIn("$$", m.group(1), line)
+        self.assertIn('mv -f "$GATE.$$" "$GATE"', script)
+
     LEGACY_KEYS = {"ts", "vm", "pressure", "blocked", "gate", "jobs", "sessions",
                    "idle_sessions", "orphans", "orphan_total", "overhead",
                    "service_owner", "worktrees", "other_heavy", "apps"}
@@ -954,7 +966,12 @@ class LegacyCompatTests(unittest.TestCase):
         self.assertEqual(set(row), {"ts", "ram_used", "swap_used", "swap_total",
                                     "free_pct", "load", "orphan", "swapins", "swapouts",
                                     "pressure", "_lh_streak", "sessions", "apps",
-                                    "worktrees", "worktree_tags", "overhead"})
+                                    "worktrees", "worktree_tags", "overhead",
+                                    # S2.8's documented row additions (D10 update)
+                                    "mono", "uptime", "boot", "level_reason", "rates",
+                                    "rates_source", "lh_streak", "kernel_level",
+                                    "under_pressure", "pressure_suggestions",
+                                    "suggestions_ts"})
 
     def test_runway_copy_is_a_trend_to_the_floor(self):
         # P11: the estimate is to the 20 % floor, never "runs out".

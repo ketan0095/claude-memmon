@@ -1,0 +1,26 @@
+{
+ "_base": "overview.json",
+ "_settings": {
+  "schema_version": 1,
+  "gate_mode": {
+   "value": "warn",
+   "source": "env",
+   "choices": [
+    "block-critical",
+    "block",
+    "warn",
+    "off"
+   ]
+  },
+  "paused_until": 1791460800.0,
+  "runner_mode": "protect",
+  "auto_cancel_interruptible": true,
+  "pressure_suggestions": true,
+  "notifications": false,
+  "state_dir": "/opt/example/memmon",
+  "warning": "MEMMON_GATE in the hook environment overrides this setting"
+ },
+ "_view": {
+  "settings": true
+ }
+}

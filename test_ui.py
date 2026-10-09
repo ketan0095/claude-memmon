@@ -673,9 +673,10 @@ class AccessibilityTests(unittest.TestCase):
     def test_managed_jobs_card_lists_running_and_waiting_jobs(self):
         found = [r["label"] or r["value"] for r in a11y("managed-jobs.json")]
         self.assertIn("Managed jobs", found)
-        self.assertIn("Managed job acme-web typecheck · running · 42s, heavy, command running", found)
-        self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, resource held by acme-web typecheck",
-                      found)
+        # A schema 1 row (no reservation, estimate or queue fields) keeps
+        # what S1 said: its reason and age.
+        self.assertIn("Managed job acme-web typecheck, running, command running · 42s", found)
+        self.assertIn("Managed job acme-api tests, waiting, resource held by acme-web typecheck · 12s", found)
 
     def test_cpu_total_only_with_full_coverage(self):
         self.assertIn("CPU still measuring some processes", self.spoken("small.json"))
@@ -1486,7 +1487,7 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertEqual(payload["runner_jobs"], [self.LEASE])
         spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
         self.assertIn("CPU still measuring some processes", spoken)
-        self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, memory pressure: WATCH",
+        self.assertIn("Managed job acme-api tests, waiting, memory pressure: WATCH · 12s",
                       [r["label"] or r["value"] for r in rows])
 
     def test_generated_session_detail_and_stop_confirm(self):
@@ -1503,3 +1504,1044 @@ class GeneratorContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- Stage 2
+
+def s2(fixture=None, payload=None, *flags):
+    """The S2 part of --sections-probe, for a fixture or an inline payload."""
+    with tempfile.TemporaryDirectory() as d:
+        if payload is not None:
+            path = Path(d) / "payload.json"
+            path.write_text(json.dumps(payload))
+        else:
+            path = FIXTURES / fixture
+        return run_json("--sections-probe", "--fixture", str(path), *flags)
+
+
+def payload(fixture, **change):
+    """A fixture flattened through its _base chain, with keys replaced."""
+    return dict(effective(FIXTURES / fixture), **change)
+
+
+def said(fixture):
+    """Every label, or the text itself for a plain text element."""
+    return [r["label"] or r["value"] for r in a11y(fixture)]
+
+
+def host(check, fixture, *extra):
+    return run_json("--selftest-host", check, "--fixture", str(fixture), *extra)
+
+
+class ManagedJobsCardTests(StubCase):
+    """M6a / M6b: the managed-jobs card built from jobs --json schema 2."""
+
+    def test_m6a_budget_line_rows_and_strict_queue(self):
+        r = s2("managed-jobs-v2.json")["s2"]
+        self.assertEqual(r["budget"], ["Committed 34.4 of 38.4 GB limit · 4.0 GB free to admit",
+                                       "30.5 GB in use + 3.9 GB reserved but not yet used"])
+        self.assertIsNone(r["hold"])
+        self.assertEqual([(m["state"], m["detail"]) for m in r["managed"]], [
+            ("Running", "3.2 GB now / 4.0 GB reserved · 2 min"),
+            ("Running", "19.4 GB now / 22.5 GB reserved · 6 min"),
+            ("Waiting", "needs 6.0 GB (learned from 5 runs) · waiting for budget · gives up in 8 min"),
+            ("Waiting", "needs 4.0 GB (unknown — default) · queued behind #1")])
+        found = labels(a11y("managed-jobs-v2.json"))
+        self.assertIn("Managed job #1 Billing API tests, waiting, needs 6.0 GB (learned from 5 runs) · "
+                      "waiting for budget · gives up in 8 min", found)
+        self.assertIn("Managed job #2 Checkout typecheck, waiting, needs 4.0 GB (unknown — default) · "
+                      "queued behind #1", found)
+        # A distinct mode control, not a view filter.
+        self.assertIn("Protection mode, protect", found)
+        self.assertIn("Protect, current protection mode", found)
+        self.assertIn("Set protection mode to Paused", found)
+
+    def test_m6b_over_limit_holds_and_puts_the_intervention_first(self):
+        r = s2("managed-jobs-intervention.json")["s2"]
+        head, sub = r["budget"]
+        self.assertEqual(head, "Committed 49.2 GB · over the 38.4 GB limit by 10.8 GB")
+        self.assertIn("20 % of memory (9.6 GB)", sub)
+        self.assertIn("headroom target is not currently met", sub)
+        self.assertEqual(r["hold"], "Holding new heavy work — memory must stay at Watch or better for 30 s")
+        first = r["managed"][0]
+        self.assertEqual(first["state"], "Intervention needed")
+        self.assertEqual(first["detail"], "grew to 7.9 GB, above its 4.0 GB reservation; memory DANGER · "
+                                          "new heavy work is on hold")
+        self.assertTrue(first["stop"])
+        self.assertEqual(r["managed"][2]["detail"],
+                         "needs 6.0 GB (learned from 5 runs) · on hold · gives up in 6 min")
+        found = labels(a11y("managed-jobs-intervention.json"))
+        self.assertIn("Holding new heavy work — memory must stay at Watch or better for 30 s", found)
+        self.assertIn("Stop job Search index rebuild: stops the job and its memmon run wrapper (asks to confirm)",
+                      found)
+
+    def test_intervention_stop_needs_an_s1_token(self):
+        p = payload("managed-jobs-intervention.json")
+        p["owners"] = [o for o in p["owners"] if not o["owner_id"].startswith("job:")]
+        self.assertFalse(s2(payload=p)["s2"]["managed"][0]["stop"])
+        p = payload("managed-jobs-intervention.json", inventory="degraded")
+        self.assertFalse(s2(payload=p)["s2"]["managed"][0]["stop"])
+
+    def test_intervention_stop_finds_a_managed_child_job(self):
+        p = payload("managed-jobs-intervention.json")
+        p["owners"] = [o for o in p["owners"] if not o["owner_id"].startswith("job:")]
+        p["owners"][0]["jobs"].append({"job_id": "48501.1791449958.120044", "kind": "build",
+                                       "label": "index", "action": "stop-managed-job",
+                                       "managed": True, "token": "tok-child-managed"})
+        self.assertTrue(s2(payload=p)["s2"]["managed"][0]["stop"])
+
+    def test_only_protect_mode_holds(self):
+        for mode in ("observe", "paused"):
+            p = payload("managed-jobs-intervention.json")
+            p["runner"] = dict(p["runner"], mode=mode)
+            r = s2(payload=p)["s2"]
+            self.assertIsNone(r["hold"], mode)
+            self.assertEqual(r["mode"], mode)
+
+    def test_telemetry_hold_says_memmon_cannot_read_pressure(self):
+        p = payload("managed-jobs-intervention.json")
+        p["runner"] = dict(p["runner"], admission={"open": False, "reason": "telemetry unavailable",
+                                                   "hysteresis_s": 30})
+        self.assertEqual(s2(payload=p)["s2"]["hold"],
+                         "Holding new heavy work — memmon can’t read memory pressure right now")
+
+    def test_unavailable_budget_says_why(self):
+        p = payload("managed-jobs-v2.json")
+        p["runner"] = dict(p["runner"], committed={"used": None, "slack": None, "limit": None,
+                                                   "free": None, "reason": "system memory unavailable"})
+        self.assertEqual(s2(payload=p)["s2"]["budget"],
+                         ["Committed memory not available · system memory unavailable", None])
+
+    def test_schema_1_payload_keeps_the_s1_card(self):
+        r = s2("managed-jobs.json")["s2"]
+        self.assertIsNone(r["mode"])
+        self.assertIsNone(r["budget"])
+        self.assertEqual(r["managed"][0]["detail"], "command running · 42s")
+
+    def idle_hold(self, **runner):
+        p = payload("managed-jobs-intervention.json", runner_jobs=[])
+        p["runner"] = dict(p["runner"], queue={"length": 0, "max": 32}, **runner)
+        return p
+
+    def test_a_hold_on_an_idle_machine_shows_no_banner_and_no_card(self):
+        r = s2(payload=self.idle_hold())["s2"]
+        self.assertEqual((r["hold"], r["card"]), (None, False))
+        self.assertFalse(any(l.startswith("Holding new heavy work") for l in labels(a11y_path_payload(self.idle_hold()))))
+        # A runner that is not protecting still shows its card, never a hold.
+        r = s2(payload=self.idle_hold(mode="paused"))["s2"]
+        self.assertEqual((r["hold"], r["card"]), (None, True))
+
+    def test_a_hold_shows_once_work_is_waiting(self):
+        p = self.idle_hold()
+        p["runner"]["queue"]["length"] = 1
+        r = s2(payload=p)["s2"]
+        self.assertEqual((bool(r["hold"]), r["card"]), (True, True))
+        # The queue count can lag the rows: a waiting row is enough.
+        p = self.idle_hold()
+        p["runner_jobs"] = [effective(FIXTURES / "managed-jobs-intervention.json")["runner_jobs"][2]]
+        self.assertTrue(s2(payload=p)["s2"]["hold"])
+
+    def test_mode_control_runs_run_mode_and_nothing_else(self):
+        fixture = FIXTURES / "managed-jobs-v2.json"
+        self.assertEqual(host("run-mode", fixture, "--mode", "paused")["actions"], ["run-mode paused"])
+        self.assertEqual(host("run-mode", fixture, "--mode", "off")["actions"], [])
+        calls = self.dir / "calls.jsonl"
+        script = self.dir / "memmon_calls.py"
+        script.write_text("import json, sys\n"
+                          f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                          "print('{}')\n")
+        host("run-mode", fixture, "--mode", "observe", "--script", str(script))
+        made = [json.loads(l) for l in calls.read_text().splitlines()]
+        self.assertEqual(made[0], ["run-mode", "observe"])
+        self.assertTrue(all(c[0] in ("run-mode", "owners") for c in made), made)
+
+
+class UnknownPressureTests(StubCase):
+    """M7c: UNKNOWN is never Normal and never green."""
+
+    def test_unknown_is_muted_with_a_question_mark(self):
+        r = s2("pressure-unknown.json")
+        self.assertEqual(r["s2"]["pressure"], {"word": "Unknown", "headline": "Unknown", "tone": "muted",
+                                               "glyph": True})
+        self.assertEqual((r["status"]["kind"], r["status"]["text"]), ("plain", "Sampled 6 min ago"))
+        self.assertNotIn("stale", r["status"]["text"])
+        # Busy states never hide staleness, and the spoken label keeps it.
+        busy = s2("pressure-unknown.json", None, "--refreshing")["status"]
+        self.assertEqual((busy["kind"], busy["text"]), ("plain", "Sampled 6 min ago"))
+        self.assertIn(", stale", busy["spoken"])
+        found = labels(a11y("pressure-unknown.json"))
+        ring = next(l for l in found if l.startswith("Memory "))
+        self.assertIn("pressure unknown", ring)
+        self.assertNotIn("normal", ring.lower())
+        self.assertIn("Sampled 6 min ago by the background sampler, stale, pressure unknown", found)
+
+    def test_a_fresh_unknown_is_not_live(self):
+        p = payload("pressure-unknown.json", ts=effective(FIXTURES / "pressure-unknown.json")["_now"] - 2)
+        st = s2(payload=p)["status"]
+        self.assertEqual((st["kind"], st["text"]), ("plain", "Sampled 2s ago"))
+
+    def test_only_healthy_is_normal_and_green(self):
+        for level, word, tone in [("HEALTHY", "Normal", "green"), ("WATCH", "Watch", "amber"),
+                                  ("DANGER", "Danger", "red"), ("CRITICAL", "Critical", "red"),
+                                  ("UNKNOWN", "Unknown", "muted"), (None, "Unknown", "muted")]:
+            p = payload("overview.json")
+            p["system"] = dict(p["system"], score_level=level)
+            self.assertEqual(s2(payload=p)["s2"]["pressure"]["word"], word, level)
+            self.assertEqual(s2(payload=p)["s2"]["pressure"]["tone"], tone, level)
+
+    def test_status_item_dot_is_neutral_for_unknown(self):
+        path = self.dir / "latest.json"
+        path.write_text(json.dumps({"ts": 1000, "swap_used": 2 * 1024 ** 3, "pressure": "UNKNOWN",
+                                    "level_reason": "no rate baseline", "rates": "unavailable"}))
+        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 2.0G")
+
+    def test_a_lower_bound_level_is_shown_as_at_least(self):
+        p = payload("overview.json")
+        p["system"] = dict(p["system"], score_level="WATCH", level_reason="lower bound: vm_stat failed",
+                           rates="unavailable")
+        self.assertEqual(s2(payload=p)["s2"]["pressure"]["headline"], "≥ Watch")
+        ring = next(l for l in labels(a11y_path_payload(p)) if l.startswith("Memory "))
+        self.assertIn("pressure at least watch", ring)
+        p["system"]["level_reason"] = None
+        self.assertEqual(s2(payload=p)["s2"]["pressure"]["headline"], "Watch")
+
+    def test_kernel_level_stands_in_when_the_strict_read_failed(self):
+        p = payload("under-pressure.json")
+        p["system"] = dict(p["system"], score_level="UNKNOWN", pressure_level=None, kernel_level="critical",
+                           level_reason="vm_stat failed", rates="unavailable")
+        found = said_payload(p)
+        self.assertIn("Under pressure, kernel critical", found)
+        self.assertTrue(any("macOS reports critical pressure" in l and l.startswith("CPU") for l in found), found)
+
+    def test_retry_copy_under_unknown_says_the_gate_lets_it_run(self):
+        found = said("pressure-unknown.json")
+        self.assertTrue(any("a retry runs without a memory check" in l for l in found), found)
+
+
+class CoverageTests(unittest.TestCase):
+    """S2.7: the route sentence is coverage[0]; protection.route is the state."""
+
+    def pill(self, p):
+        rows = a11y_path_payload(p)
+        return next(r for r in rows if r["label"].startswith("Protection "))
+
+    def test_coverage_lines_follow_the_protection_pill(self):
+        lines = ["Route on: heavy Bash from Claude sessions started after it was turned on",
+                 "2 heavy processes not started through memmon run",
+                 "Codex, other apps and terminals are covered only when they call memmon run"]
+        row = self.pill(payload("overview.json", coverage=lines))
+        self.assertEqual(row["label"], "Protection partial · 2 heavy processes not started through memmon run")
+        self.assertEqual(row["described"] or row["value"], ". ".join(lines))
+
+    def test_without_coverage_the_route_state_is_named(self):
+        row = self.pill(payload("overview.json"))
+        self.assertEqual(row["described"] or row["value"], "Route off")
+
+
+def said_payload(p):
+    return [r["label"] or r["value"] for r in a11y_path_payload(p)]
+
+
+def a11y_path_payload(p):
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "payload.json"
+        path.write_text(json.dumps(p))
+        return a11y_path(path)
+
+
+class GapNoticeTests(unittest.TestCase):
+    """M7b: the sampling-gap notice (S2.10, AD-S2-13)."""
+
+    def expected(self, g):
+        hm = lambda t: time.strftime("%H:%M", time.localtime(t))
+        return (f"memmon couldn’t sample for 21 min while the Mac was awake "
+                f"({hm(g['from_ts'])}–{hm(g['to_ts'])}). Readings around the gap may be incomplete.")
+
+    def gap(self, **change):
+        p = payload("sampler-gap.json")
+        p["sampler"] = dict(p["sampler"], last_gap=dict(p["sampler"]["last_gap"], **change))
+        return p
+
+    def test_a_starved_gap_shows_with_its_times(self):
+        g = effective(FIXTURES / "sampler-gap.json")["sampler"]["last_gap"]
+        self.assertEqual(s2("sampler-gap.json")["s2"]["gap_notice"], self.expected(g))
+        found = labels(a11y("sampler-gap.json"))
+        self.assertIn(self.expected(g), found)
+        self.assertIn("Dismiss the sampling gap notice", found)
+
+    def test_only_a_starved_gap_with_five_awake_minutes_within_a_day(self):
+        now = effective(FIXTURES / "sampler-gap.json")["_now"]
+        self.assertIsNone(s2(payload=self.gap(cause="sleep"))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(cause="reboot", awake_s=None))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(awake_s=299))["s2"]["gap_notice"])
+        self.assertIsNotNone(s2(payload=self.gap(awake_s=300))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=self.gap(to_ts=now - 86_401, from_ts=now - 90_000))["s2"]["gap_notice"])
+        self.assertIsNone(s2(payload=payload("sampler-gap.json", sampler=None))["s2"]["gap_notice"])
+
+    def test_a_later_sleep_gap_does_not_hide_a_recent_starved_one(self):
+        p = payload("sampler-gap.json")
+        starved = p["sampler"]["last_gap"]
+        sleep = {"cause": "sleep", "gap_s": 540.0, "asleep_s": 490.0, "awake_s": 50.0,
+                 "from_ts": starved["to_ts"] + 30, "to_ts": starved["to_ts"] + 570}
+        p["sampler"] = dict(p["sampler"], last_gap=sleep, last_starved_gap=starved)
+        self.assertEqual(s2(payload=p)["s2"]["gap_notice"], self.expected(starved))
+        # Without last_starved_gap (an older payload), last_gap still drives it.
+        self.assertEqual(s2("sampler-gap.json")["s2"]["gap_notice"], self.expected(starved))
+        # A payload that says there is no starved gap shows nothing, whatever last_gap is.
+        p["sampler"] = dict(p["sampler"], last_gap=starved, last_starved_gap=None)
+        self.assertIsNone(s2(payload=p)["s2"]["gap_notice"])
+
+    def test_dismissal_keys_the_starved_gap(self):
+        r = host("gap-dismiss", FIXTURES / "sampler-gap-after-sleep.json")
+        starved = effective(FIXTURES / "sampler-gap-after-sleep.json")["sampler"]["last_starved_gap"]
+        self.assertIsNotNone(r["before"])
+        self.assertIsNone(r["after"])
+        self.assertEqual(r["stored"], starved["to_ts"])
+
+    def test_dismissal_hides_that_gap_and_not_a_later_one(self):
+        g = effective(FIXTURES / "sampler-gap.json")["sampler"]["last_gap"]
+        r = host("gap-dismiss", FIXTURES / "sampler-gap.json",
+                 "--next", str(FIXTURES / "next" / "sampler-gap-later.json"))
+        self.assertEqual(r["before"], self.expected(g).split(" Readings")[0])
+        self.assertIsNone(r["after"])
+        self.assertEqual(r["stored"], g["to_ts"])
+        self.assertIsNotNone(r["next"])
+        self.assertIsNone(s2("sampler-gap.json", None, "--dismissed-gap", str(g["to_ts"]))["s2"]["gap_notice"])
+
+
+class UnderPressureCardTests(StubCase):
+    """M7a: unmanaged heavy work under pressure (S2.11, I-14)."""
+
+    def test_rows_follow_m7a(self):
+        r = s2("under-pressure.json")["s2"]
+        self.assertTrue(r["under_pressure_card"])
+        self.assertEqual([(x["title"], x["evidence"], x["button"], x["note"]) for x in r["suggestions"]], [
+            ("vitest · acme-web", "8.8 GB · growing 120 MB/min · idle for 31 min", "Stop tests…", None),
+            ("vite dev server · acme-web", "3.3 GB · running 5 h", "Stop server…", None),
+            ("vite dev server · billing-api", "1.2 GB · not enough history", None,
+             "orphaned · stop it where it was started")])
+        self.assertEqual(r["suggestions"][0]["owner_line"], "under Claude session “Checkout refactor”")
+        found = said("under-pressure.json")
+        self.assertIn("Under pressure, DANGER", found)
+        self.assertIn("Stop tests: vitest · acme-web (asks to confirm)", found)
+        self.assertIn("memmon never stops these on its own.", found)
+        self.assertFalse(any(l.startswith("Stop server: vite dev server · billing-api") for l in found))
+
+    def test_at_most_three_rows(self):
+        p = payload("under-pressure.json")
+        extra = dict(p["pressure_suggestions"][1], job_id="9240.1791400000.0", footprint=1024 ** 3)
+        p["pressure_suggestions"] = p["pressure_suggestions"] + [extra]
+        self.assertEqual(len(s2(payload=p)["s2"]["suggestions"]), 3)
+
+    def test_card_only_while_under_pressure(self):
+        self.assertFalse(s2(payload=payload("under-pressure.json", under_pressure=False))["s2"]["under_pressure_card"])
+        # An older payload without the predicate falls back to DANGER/CRITICAL.
+        p = payload("under-pressure.json")
+        del p["under_pressure"]
+        self.assertTrue(s2(payload=p)["s2"]["under_pressure_card"])
+        p["system"] = dict(p["system"], score_level="WATCH")
+        self.assertFalse(s2(payload=p)["s2"]["under_pressure_card"])
+        # UNKNOWN with a kernel warning is under pressure when memmon says so.
+        p = payload("under-pressure.json")
+        p["system"] = dict(p["system"], score_level="UNKNOWN")
+        self.assertTrue(s2(payload=p)["s2"]["under_pressure_card"])
+
+    def test_no_button_without_a_token_or_identity(self):
+        p = payload("under-pressure.json")
+        p["pressure_suggestions"][0] = dict(p["pressure_suggestions"][0], token=None)
+        self.assertFalse(s2(payload=p)["s2"]["suggestions"][0]["can_stop"])
+        rows = s2(payload=payload("under-pressure.json", inventory="degraded"))["s2"]["suggestions"]
+        self.assertFalse(any(x["can_stop"] for x in rows))
+
+    def confirm(self, *extra):
+        return host("suggest", FIXTURES / "under-pressure-confirm.json", *extra)
+
+    def test_confirmed_stop_uses_the_s1_stop_and_token(self):
+        r = self.confirm()
+        self.assertEqual(r["phase_before"], "ask")
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest"])
+
+    def test_token_more_than_120_s_old_is_never_sent(self):
+        self.assertEqual(self.confirm("--age", "119")["actions"],
+                         ["act stop-job --target tok-fixture-s1-vitest"])
+        r = self.confirm("--age", "121")
+        self.assertEqual(r["actions"], [])
+        self.assertEqual(r["phase"], "closed")
+        self.assertTrue(r["banner"].startswith("Nothing done"))
+
+    def test_the_token_comes_from_the_latest_refresh(self):
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-fresh.json"))
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest-fresh"])
+
+    def test_perform_rereads_the_token_even_without_a_rebind(self):
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-fresh.json"), "--no-rebind")
+        self.assertEqual(r["actions"], ["act stop-job --target tok-fixture-s1-vitest-fresh"])
+        r = self.confirm("--next", str(FIXTURES / "next" / "rebind-suggestion-gone.json"), "--no-rebind")
+        self.assertEqual(r["actions"], [])
+        self.assertTrue(r["banner"].startswith("Nothing done"))
+
+    def test_a_suggestion_gone_or_changed_closes_the_confirm(self):
+        for name, says in [("rebind-suggestion-gone.json", "no longer listed under pressure"),
+                           ("rebind-suggestion-changed.json", "changed while this was open")]:
+            r = self.confirm("--next", str(FIXTURES / "next" / name))
+            self.assertEqual((r["phase_before"], r["actions"]), ("closed", []), name)
+            self.assertIn(says, r["banner"])
+
+    def test_confirm_says_what_it_stops_and_what_keeps_running(self):
+        found = said("under-pressure-confirm.json")
+        self.assertIn("Stop vitest?", found)
+        self.assertTrue(any("vitest in acme-web · under Claude session “Checkout refactor”" in l for l in found))
+        self.assertIn("Stop tests: send stop signal to Vitest", found)
+        self.assertIn("Cancel, keep the job running", found)
+
+
+class PressureSourceTests(unittest.TestCase):
+    """S2.9: the kernel's pressure events refresh only while the popover is open."""
+
+    def test_source_runs_only_while_open(self):
+        r = host("pressure-watch", FIXTURES / "overview.json")
+        self.assertEqual((r["active_before"], r["active_open"], r["active_closed"]), (False, True, False))
+        self.assertEqual(r["events_open"], 2)
+        self.assertEqual(r["events_closed"], 2)
+        self.assertEqual(r["scans"], 0)      # a fixture model never spawns memmon
+
+
+def job(id_="a" * 32, state="intervention_needed", changed=100.0, **extra):
+    return dict({"id": id_, "label": "Search index rebuild", "state": state, "state_changed_ts": changed,
+                 "intervention": {"cause": "growth", "since_ts": changed}, "footprint_bytes": 8 * 1024 ** 3,
+                 "reservation_bytes": 4 * 1024 ** 3}, **extra)
+
+
+class InterventionNotificationTests(unittest.TestCase):
+    """S2.5 / AD-S2-8: one notification per job per state change, never repeated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def probe(self, rounds, store=True, *extra):
+        seq = self.dir / "seq.json"
+        seq.write_text(json.dumps(rounds))
+        args = ["--notify-probe", "--sequence", str(seq), *extra]
+        if store:
+            args += ["--store", str(self.dir / "store.json")]
+        return run_json(*args)
+
+    def test_one_notification_per_state_change(self):
+        running = job(state="running", intervention=None)
+        r = self.probe([[running], [job()], [job()], [job()], [running], [job(changed=200.0)]])
+        self.assertEqual([len(x) for x in r["rounds"]], [0, 1, 0, 0, 0, 1])
+        self.assertEqual(r["posted"][0]["title"], "Search index rebuild needs attention")
+        self.assertIn("It grew to 8.0 GB, above its 4.0 GB reservation", r["posted"][0]["body"])
+
+    def test_a_relaunch_does_not_repeat(self):
+        self.assertEqual(len(self.probe([[job()]])["posted"]), 1)
+        self.assertEqual(len(self.probe([[job()]])["posted"]), 0)
+
+    def test_only_states_that_need_a_person(self):
+        states = ["waiting", "starting", "running", "cancelling", "detached", "done", "gave_up",
+                  "stopped_by_user"]
+        r = self.probe([[job(id_=f"{k:032x}", state=s) for k, s in enumerate(states)]])
+        self.assertEqual(r["posted"], [])
+        r = self.probe([[job(state="cancelled_by_policy", changed=300.0)]])
+        self.assertEqual(r["posted"][0]["title"], "memmon cancelled Search index rebuild")
+
+    def test_notifications_off_in_config_posts_nothing_and_never_replays(self):
+        cfg = self.dir / "config.json"
+        cfg.write_text(json.dumps({"notifications": False, "headroom_frac": 0.2}))
+        r = self.probe([[job()]], True, "--config", str(cfg))
+        self.assertEqual((r["posted"], len(r["remembered"])), ([], 1))
+        self.assertEqual(self.probe([[job()]])["posted"], [])        # turned back on: no replay
+        cfg.write_text(json.dumps({"headroom_frac": 0.2}))
+        self.assertEqual(len(self.probe([[job(changed=900.0)]], True, "--config", str(cfg))["posted"]), 1)
+        self.assertEqual(len(self.probe([[job(changed=901.0)]], True, "--config", str(self.dir / "absent"))["posted"]), 1)
+
+    def test_a_failed_hand_over_is_retried_and_not_remembered(self):
+        r = self.probe([[job()], [job()], [job()]], True, "--fail-adds", "1")
+        self.assertEqual([len(x) for x in r["rounds"]], [1, 1, 0])
+        self.assertEqual(len(r["remembered"]), 1)
+        r = self.probe([[job(changed=500.0)]], True, "--fail-adds", "5")
+        self.assertEqual(len(r["remembered"]), 1)          # the failed one is not added
+        self.assertEqual(len(self.probe([[job(changed=500.0)]])["posted"]), 1)
+
+    def runner_dir(self):
+        runner = self.dir / "runner"
+        (runner / "coord").mkdir(parents=True, exist_ok=True)
+        return runner
+
+    def record(self, runner, rid, body=None, lease="held"):
+        (runner / f"{rid}.json").write_text(body if body is not None else json.dumps(job(id_=rid)))
+        if lease is None:
+            return
+        fh = open(runner / f"{rid}.lease", "w")
+        self.addCleanup(fh.close)
+        if lease == "held":
+            fcntl.flock(fh, fcntl.LOCK_EX)
+
+    def test_runner_records_are_read_from_disk_by_run_id_only(self):
+        runner = self.runner_dir()
+        self.record(runner, "b" * 32)
+        (runner / "coord" / "admission-state.json").write_text(json.dumps(job(id_="c" * 32)))
+        (runner / "not-a-run.json").write_text(json.dumps(job(id_="d" * 32)))
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertEqual([p["id"].split("|")[0] for p in r["posted"]], ["b" * 32])
+
+    def test_a_record_without_a_live_lease_never_notifies(self):
+        runner = self.runner_dir()
+        self.record(runner, "1" * 32, lease="free")       # the runner died: lease unlocked
+        self.record(runner, "2" * 32, lease=None)         # no lease at all
+        self.record(runner, "3" * 32)
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertEqual([p["id"].split("|")[0] for p in r["posted"]], ["3" * 32])
+
+    def test_oversized_garbage_and_excess_records_are_skipped(self):
+        runner = self.runner_dir()
+        big = json.dumps(dict(job(id_="4" * 32), pad="x" * (300 * 1024)))
+        self.record(runner, "4" * 32, body=big)
+        self.record(runner, "5" * 32, body="{not json")
+        self.record(runner, "6" * 32, body="[1, 2]")
+        self.assertEqual(self.probe([], True, "--runner-dir", str(runner))["posted"], [])
+        for k in range(70):
+            self.record(runner, f"{k + 0x100:032x}")
+        r = self.probe([], True, "--runner-dir", str(runner))
+        self.assertLessEqual(len(r["posted"]), 64)
+        self.assertGreater(len(r["posted"]), 0)
+
+
+SETTINGS = {"schema_version": 1,
+            "gate_mode": {"value": "block-critical", "source": "config",
+                          "choices": ["block-critical", "block", "warn", "off"]},
+            "paused_until": None, "runner_mode": "protect", "auto_cancel_interruptible": False,
+            "pressure_suggestions": True, "notifications": True, "state_dir": "/opt/example/memmon"}
+
+
+class SettingsPanelTests(StubCase):
+    """D43: the Settings panel. Every change goes through memmon and shows
+    only memmon's answer."""
+
+    def settings(self, fixture, steps, script=None):
+        extra = ["--do", ",".join(steps)] + (["--script", script] if script else [])
+        return host("settings", FIXTURES / fixture, *extra)
+
+    def memmon_stub(self, set_reply, code=0):
+        """Records every argv; `settings set` answers `set_reply`, the rest the fixture state."""
+        calls = self.dir / "calls.jsonl"
+        script = self.dir / "memmon_settings.py"
+        script.write_text(
+            "import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "a = sys.argv[1:]\n"
+            "if a[:2] == ['settings', 'set']:\n"
+            f"    print(json.dumps({set_reply!r})); sys.exit({code})\n"
+            f"print(json.dumps({SETTINGS!r}))\n")
+        return str(script), calls
+
+    def test_each_control_logs_its_exact_argv(self):
+        r = self.settings("settings-panel.json", [
+            "gate:block", "runner:observe", "auto:on", "suggest:off", "notify:off",
+            "pause:1h", "pause:8h", "pause:forever", "resume", "folder", "open"])
+        self.assertEqual(r["actions"], [
+            "memmon settings set gate_mode block",
+            "memmon settings set runner_mode observe",
+            "memmon settings set auto_cancel_interruptible true",
+            "memmon settings set pressure_suggestions false",
+            "memmon settings set notifications false",
+            "memmon --off 1h", "memmon --off 8h", "memmon --off", "memmon --on",
+            "open /opt/example/memmon",
+            "memmon settings --json"])
+
+    def test_env_locked_gate_mode_is_never_written(self):
+        r = self.settings("settings-env-locked.json", ["gate:block", "runner:paused"])
+        self.assertTrue(r["locked"])
+        self.assertEqual(r["actions"], ["memmon settings set runner_mode paused"])
+        found = said("settings-env-locked.json")
+        self.assertIn("Gate mode, Warn only, locked: MEMMON_GATE in the hook environment overrides this setting",
+                      found)
+        self.assertIn("MEMMON_GATE in the hook environment overrides this setting", " ".join(found))
+
+    def test_a_change_shows_memmon_answer(self):
+        reply = dict(SETTINGS, gate_mode=dict(SETTINGS["gate_mode"], value="block"), notifications=False)
+        script, calls = self.memmon_stub(reply)
+        r = self.settings("settings-panel.json", ["gate:block", "intervene"], script)
+        self.assertEqual(json.loads(calls.read_text().splitlines()[0]), ["settings", "set", "gate_mode", "block"])
+        self.assertEqual((r["gate_mode"], r["error"]), ("block", None))
+        # memmon said notifications are off: MemmonBar's own notices follow.
+        self.assertEqual((r["notifications"], r["alerts_enabled"], r["posted"]), (False, False, 0))
+
+    def test_a_refused_change_is_shown_and_never_applied(self):
+        script, _ = self.memmon_stub({"error": "gate_mode must be one of block-critical, block, warn, off",
+                                      "key": "gate_mode"}, code=2)
+        r = self.settings("settings-panel.json", ["gate:block"], script)
+        self.assertEqual(r["gate_mode"], "block-critical")
+        self.assertEqual(r["error"], "Could not change command protection: "
+                                     "gate_mode must be one of block-critical, block, warn, off.")
+        script, _ = self.memmon_stub("not json")
+        r = self.settings("settings-panel.json", ["notify:off"], script)
+        self.assertEqual(r["notifications"], True)
+        self.assertEqual(r["error"], "Could not change notifications: memmon's answer could not be read.")
+
+    def test_notifications_on_still_posts(self):
+        self.assertEqual(self.settings("settings-panel.json", ["intervene"])["posted"], 1)
+
+    def test_only_the_header_closes_settings(self):
+        found = said("settings-panel.json")
+        self.assertNotIn("Done", found)
+        self.assertEqual(found.count("Close settings"), 1)        # the header's ×
+        r = self.settings("settings-panel.json", ["close"])
+        self.assertFalse(r["open"])
+
+    def test_labels(self):
+        found = said("settings-panel.json")
+        for label in ["Close settings", "Gate mode, Stop at Critical", "Choose Stop at Danger",
+                      "Pause command protection for 1 h", "Pause command protection until resumed",
+                      "Auto-cancel interruptible jobs under CRITICAL. memmon stops jobs started with "
+                      "--interruptible after 10 s at CRITICAL",
+                      "Suggest stops under pressure. Lists heavy jobs memmon can’t hold. memmon never stops "
+                      "them on its own.", "Open data folder", "Set protection mode to Observe"]:
+            self.assertIn(label, found)
+        self.assertNotIn("Resume command protection", found)          # not paused
+        self.assertIn("Resume command protection", said("settings-env-locked.json"))
+        self.assertIn("Settings", said("overview.json"))                # the header's gear
+        self.assertIn("Settings error: Could not change protection mode: runner_mode must be one of "
+                      "protect, observe, paused.", said("settings-error.json"))
+
+
+INDEX_RUN = "3f0c2a9e5b7d4c1a8e6f2b0d9c4a7e15"
+
+
+class NotificationClickTests(unittest.TestCase):
+    """D44: a click on an intervention notification opens the normal confirm,
+    with the token from the refresh the click starts, and never stops."""
+
+    def click(self, *extra):
+        return host("notice-click", FIXTURES / "managed-jobs-intervention.json", "--run-id", INDEX_RUN,
+                    "--label", "Search index rebuild", *extra)
+
+    def test_click_selects_the_job_and_opens_its_stop_confirm(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"))
+        self.assertEqual(r["selected"], "job:" + INDEX_RUN)
+        self.assertEqual((r["phase"], r["confirm_action"]), ("ask", "stop-managed-job"))
+        self.assertEqual(r["actions"], [])            # nothing is stopped by the click
+
+    def test_the_confirm_carries_the_fresh_token(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"))
+        self.assertEqual(r["confirm_token"], "tok-fixture-managed-index-fresh")
+
+    def test_the_confirm_is_built_from_the_fresh_payload_not_the_old_one(self):
+        # The job's owner restarted under a new identity: a confirm opened on
+        # the old payload would be closed as "changed"; the fresh one opens.
+        r = self.click("--next", str(FIXTURES / "next" / "notice-restarted.json"))
+        self.assertEqual((r["phase"], r["confirm_token"]), ("ask", "tok-fixture-managed-index-restarted"))
+        self.assertIsNone(r["banner"])
+
+    def test_only_the_confirm_click_stops(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--confirm-click")
+        self.assertEqual(r["actions"], ["perform"])
+
+    def test_a_job_that_is_gone_says_so(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-gone.json"))
+        self.assertEqual((r["phase"], r["actions"]), ("closed", []))
+        self.assertEqual(r["banner"], "Nothing done — Search index rebuild is no longer running.")
+
+    def test_a_job_that_recovered_is_selected_without_a_confirm(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-recovered.json"))
+        self.assertEqual((r["phase"], r["selected"]), ("closed", "job:" + INDEX_RUN))
+        self.assertIn("no longer needs attention", r["banner"])
+
+    def test_a_policy_cancel_shows_its_outcome_and_no_confirm(self):
+        r = self.click("--state", "cancelled_by_policy", "--next", str(FIXTURES / "next" / "notice-gone.json"))
+        self.assertEqual((r["phase"], r["actions"]), ("closed", []))
+        self.assertTrue(r["banner"].startswith("Search index rebuild was cancelled by policy"))
+
+    def test_a_busy_confirm_is_never_replaced_by_a_click(self):
+        for busy in ("working", "partial"):
+            r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--busy", busy)
+            self.assertEqual((r["kept_phase"], r["still_pending"]), (busy, True), busy)
+            self.assertNotEqual(r["kept_owner"], "job:" + INDEX_RUN)
+            # Once that confirm has closed, the next refresh opens the notice's confirm.
+            self.assertEqual((r["phase"], r["confirm_token"]), ("ask", "tok-fixture-managed-index-fresh"), busy)
+            self.assertEqual(r["actions"], [])
+
+    def test_a_click_is_ignored_while_notifications_are_off(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--notifications-off")
+        self.assertEqual((r["pending"], r["selected"], r["phase"], r["banner"], r["actions"]),
+                         (False, None, "closed", None, []))
+
+    def test_notifications_carry_the_job_but_no_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            seq = Path(d) / "seq.json"
+            seq.write_text(json.dumps([[job(wrapper_pid=48500, child_pid=48501)]]))
+            r = run_json("--notify-probe", "--sequence", str(seq))
+        info = r["posted"][0]["user_info"]
+        self.assertEqual(info, {"run_id": "a" * 32, "state": "intervention_needed",
+                                "label": "Search index rebuild", "wrapper_pid": 48500, "child_pid": 48501})
+
+
+class UsageCardTests(StubCase):
+    """D45: the "Last 7 days" card. It is collapsed by default, reads
+    history only while open (cached 5 min), and never invents a day."""
+
+    def probe(self, fixture):
+        return s2(fixture)["s2"]["usage"]
+
+    def test_three_views_decode_and_summarise(self):
+        u = self.probe("usage-protection.json")["views"]
+        self.assertEqual([b["label"] for b in u["memory"]["bars"]], ["Fri", "Sat", "Sun", "Mon", "Tue", "Wed", "Thu"])
+        self.assertEqual(u["memory"]["summary"], "Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.")
+        self.assertEqual(u["memory"]["bars"][4]["spoken"], "Tue, peak 44.1 GB, average 33.8 GB")
+        self.assertEqual(u["consumers"]["summary"],
+                         "Top consumers on average: Claude sessions 11.2 GB, Shared services 7.1 GB, Mac apps 4.6 GB.")
+        self.assertEqual(u["protection"]["summary"],
+                         "16 warned and 7 stopped this week; managed jobs held 7, cancelled 1.")
+        self.assertIn("managed-job holds and cancels not recorded",
+                      self.probe("usage-memory.json")["views"]["protection"]["summary"])
+
+    def test_empty_days_stay_empty(self):
+        u = self.probe("usage-empty-days.json")["views"]
+        for view in ("memory", "consumers"):
+            sat, sun = u[view]["bars"][1], u[view]["bars"][2]
+            self.assertEqual((sat["fraction"], sat["empty"], sat["spoken"]), (None, True, "Sat, no samples"), view)
+            self.assertEqual(sun["fraction"], None, view)
+        tue = u["memory"]["bars"][4]
+        self.assertTrue(tue["few"])
+        self.assertTrue(tue["spoken"].endswith(", few samples (42), may be low"))
+        # History starts mid-week: the first measured bar says so.
+        self.assertTrue(u["memory"]["bars"][0]["spoken"].endswith(", earlier history incomplete"))
+        self.assertTrue(u["consumers"]["bars"][4]["spoken"].endswith(", few samples (42), may be low"))
+        found = said("usage-empty-days.json")
+        self.assertIn("Sat, no samples", found)
+        self.assertTrue(any(l.startswith("Tue, peak") and l.endswith("few samples (42), may be low") for l in found))
+
+    def test_the_chart_has_no_footnotes(self):
+        for f in ("usage-empty-days.json", "usage-memory.json", "usage-protection.json"):
+            joined = " ".join(said(f))
+            for gone in ("No samples:", "Few samples:", "≈ estimated from free memory on older days", "is incomplete."):
+                self.assertNotIn(gone, joined, (f, gone))
+            if f != "usage-protection.json":
+                self.assertIn("Daily peak", joined)          # the legend row stays
+
+    def test_dev_and_missing_sections_decode_as_optional(self):
+        p = payload("usage-consumers.json")
+        for k, d in enumerate(p["_usage"]["series"]):
+            d["by_section"] = {"claude": 4 * 1024 ** 3, "dev": (k + 1) * 1024 ** 3, "codex": None}
+            d["runner"] = {"held": None, "cancelled": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "consumers"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]
+        self.assertEqual(u["top"], ["claude", "dev"])
+        self.assertIn("Terminals & editors 7.0 GB", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertNotIn("Codex", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertFalse(u["runner_recorded"])
+        self.assertIn("not recorded", u["views"]["protection"]["summary"])
+
+    def test_dev_as_the_largest_section_leads_the_legend(self):
+        u = self.probe("usage-consumers-dev.json")
+        self.assertEqual(u["top"], ["dev", "claude", "service"])
+        self.assertTrue(u["views"]["consumers"]["summary"].startswith(
+            "Top consumers on average: Terminals & editors 14.7 GB"))
+        self.assertIn("Terminals & editors 15.9 GB", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertIn("Terminals & editors", " ".join(said("usage-consumers-dev.json")))
+
+    def test_headline_value_and_caption_per_view(self):
+        u = self.probe("usage-protection.json")["views"]
+        self.assertEqual((u["memory"]["value"], u["memory"]["caption"]), ("41.2 GB", "today’s peak · week high 44.1 GB"))
+        self.assertEqual((u["consumers"]["value"], u["consumers"]["caption"]), ("11.6 GB", "today’s top · Claude sessions"))
+        self.assertEqual((u["protection"]["value"], u["protection"]["caption"]), ("23", "7 stopped · 16 warned this week"))
+        self.assertEqual(u["memory"]["axis"], ["0", "24 GB", "48 GB"])
+        self.assertEqual(u["consumers"]["axis"], ["0", "18 GB", "36 GB"])
+        self.assertEqual(u["protection"]["axis"], ["0", "4", "8"])
+        dev = self.probe("usage-consumers-dev.json")["views"]["consumers"]
+        self.assertEqual((dev["value"], dev["caption"]), ("15.9 GB", "today’s top · Terminals & editors"))
+        # The sentence stays as the spoken summary of the headline.
+        self.assertIn(u["protection"]["summary"], said("usage-protection.json"))
+
+    def test_estimated_memory_is_marked(self):
+        p = payload("usage-memory.json")
+        u = self.probe("usage-memory.json")["views"]["memory"]
+        self.assertEqual(u["value"], "41.2 GB")                      # today is measured
+        self.assertTrue(u["bars"][0]["spoken"].endswith(", estimated from free memory"))
+        for d in p["_usage"]["series"]:
+            d["mem_basis"] = "estimated"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            est = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]["views"]["memory"]
+        self.assertEqual((est["value"], est["caption"]), ("≈ 41.2 GB", "today’s peak · week high ≈ 44.1 GB"))
+        # Without the field nothing is marked.
+        plain = self.probe("usage-protection.json")["views"]["memory"]
+        self.assertFalse(any("estimated" in b["spoken"] for b in plain["bars"]))
+        self.assertNotIn("≈", plain["value"] + plain["caption"])
+
+    def test_today_is_found_by_date_not_position(self):
+        # The fixtures' _now is 09:00 UTC on their last date, the same local
+        # date from UTC-9 to UTC+14.
+        p = payload("usage-memory.json")
+        import datetime
+        for d in p["_usage"]["series"]:
+            d["date"] = (datetime.date.fromisoformat(d["date"]) - datetime.timedelta(days=1)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]
+        self.assertTrue(u["views"]["memory"]["summary"].startswith("No samples today"), u["views"]["memory"]["summary"])
+        self.assertTrue(self.probe("usage-memory.json")["views"]["memory"]["summary"].startswith("Today’s peak 41.2 GB"))
+
+    def test_an_open_card_rereads_expired_history_when_the_popover_opens(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,age:100,popover,age:201,popover,popover")
+        self.assertEqual(self.calls(calls).count("usage"), 2)
+
+    def test_a_collapsed_card_never_reads_when_the_popover_opens(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,collapse,age:400,popover,popover")
+        self.assertEqual(self.calls(calls).count("usage"), 1)
+
+    def test_a_day_with_no_samples_drops_any_values_it_carries(self):
+        p = payload("usage-empty-days.json")
+        p["_usage"]["series"][1].update(mem_peak_bytes=40 * 1024 ** 3, by_section={"claude": 1})
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]["views"]
+        self.assertIsNone(u["memory"]["bars"][1]["fraction"])
+        self.assertIsNone(u["consumers"]["bars"][1]["fraction"])
+
+    def stub(self):
+        calls = self.dir / "calls.jsonl"
+        owners = self.dir / "owners.json"
+        owners.write_text(json.dumps(effective(FIXTURES / "overview.json")))
+        usage = effective(FIXTURES / "usage-memory.json")["_usage"]
+        script = self.dir / "memmon_usage.py"
+        script.write_text(
+            "import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:2] == ['usage']:\n"
+            f"    print(json.dumps({usage!r}))\n"
+            "else:\n"
+            f"    print(open({str(owners)!r}).read())\n")
+        return str(script), calls
+
+    def calls(self, path):
+        return [json.loads(l)[0] for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_no_fetch_while_collapsed_or_on_refresh(self):
+        script, calls = self.stub()
+        r = host("usage", FIXTURES / "overview.json", "--script", script, "--do", "refresh,refresh")
+        self.assertFalse(r["open"])
+        self.assertEqual(self.calls(calls), ["owners", "owners"])
+        r = host("usage", FIXTURES / "overview.json", "--script", script, "--do", "expand,refresh,view:consumers")
+        self.assertTrue(r["loaded"])
+        self.assertEqual(self.calls(calls).count("usage"), 1)
+
+    def test_history_is_cached_for_five_minutes(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,collapse,age:299,expand,collapse,age:2,expand")
+        self.assertEqual(self.calls(calls).count("usage"), 2)
+
+    def test_collapsed_by_default_and_spoken_as_one_line(self):
+        self.assertIn("Last 7 days", said("overview.json"))
+        cached = said("usage-collapsed.json")
+        self.assertIn("Last 7 days, Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", cached)
+        expanded = said("usage-memory.json")
+        self.assertIn("Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", expanded)
+        self.assertIn("Fri, peak about 34.2 GB, average 26.1 GB, estimated from free memory", expanded)
+        self.assertIn("Choose Top consumers", expanded)
+
+
+class ThemeTests(unittest.TestCase):
+    """D48: MemmonBar's own theme, stored in UserDefaults (a file here) and
+    applied to the popover. Renders stay on --light/--dark."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = str(Path(self.tmp.name) / "prefs.json")
+
+    def probe(self, *extra):
+        return run_json("--theme-probe", "--store", self.store, *extra)
+
+    def test_default_is_system_with_no_forced_appearance(self):
+        r = self.probe()
+        self.assertEqual((r["theme"], r["stored"], r["appearance"]), ("system", None, None))
+
+    def test_a_choice_is_stored_applied_and_kept_across_launches(self):
+        r = self.probe("--set", "dark")
+        self.assertEqual((r["stored"], r["appearance"]), ("dark", "NSAppearanceNameDarkAqua"))
+        again = self.probe()                       # a relaunch reads it back
+        self.assertEqual((again["before"], again["before_appearance"]), ("dark", "NSAppearanceNameDarkAqua"))
+        r = self.probe("--set", "light")
+        self.assertEqual((r["stored"], r["appearance"]), ("light", "NSAppearanceNameAqua"))
+        r = self.probe("--set", "system")
+        self.assertEqual((r["stored"], r["appearance"]), ("system", None))
+
+    def test_an_unknown_stored_value_is_system(self):
+        Path(self.store).write_text(json.dumps({"memmon.theme": "sepia"}))
+        self.assertEqual((self.probe()["theme"], self.probe()["appearance"]), ("system", None))
+
+    def test_system_says_which_look_macos_uses(self):
+        r = self.probe("--system-style", "Dark", "--flip-to", "Light")
+        self.assertEqual((r["system_label"], r["system_label_after"]), ("System (Dark)", "System (Light)"))
+        r = self.probe("--flip-to", "Dark")
+        self.assertEqual((r["system_label"], r["system_label_after"]), ("System (Light)", "System (Dark)"))
+
+    def test_settings_offers_the_theme(self):
+        found = said("settings-panel.json")
+        self.assertIn("Theme, System (Light)", found)
+        self.assertIn("System (Light), current choice", found)
+        self.assertIn("Theme, System (Dark)", [r["label"] for r in a11y("settings-panel.json", "--dark")])
+        self.assertIn("Choose Dark", found)
+
+
+class ExplainTests(StubCase):
+    """D47: a click asks Claude at once (memmon explain --json), bounded to
+    60 s and cancellable. The reply is plain text memmon never acts on."""
+
+    REPLY = {"text": "**Checkout refactor** holds 8.9 GB.\nRun `memmon act stop-job --target x` to free it.",
+             "model": "claude-haiku-5-5", "chars_sent": 812, "elapsed_s": 3.1}
+
+    def stub(self, reply=None, code=0, sleep=0.0):
+        calls = self.dir / "calls.jsonl"
+        owners = self.dir / "owners.json"
+        owners.write_text(json.dumps(effective(FIXTURES / "overview.json")))
+        script = self.dir / "memmon_explain_stub.py"
+        script.write_text(
+            "import json, sys, time\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "a = sys.argv[1:]\n"
+            "if a[:1] == ['explain']:\n"
+            f"    time.sleep({sleep}); print(json.dumps({reply if reply is not None else self.REPLY!r})); sys.exit({code})\n"
+            "else:\n"
+            f"    print(open({str(owners)!r}).read())\n")
+        return str(script), calls
+
+    def run_steps(self, steps, **stub):
+        script, calls = self.stub(**stub)
+        r = host("explain", FIXTURES / "overview.json", "--script", script, "--do", steps)
+        made = [json.loads(l) for l in calls.read_text().splitlines()] if calls.exists() else []
+        return r, [c for c in made if c[0] == "explain"]
+
+    def test_nothing_is_asked_without_a_click(self):
+        r, made = self.run_steps("refresh,popover,refresh")
+        self.assertEqual((r["open"], made), (False, []))
+
+    def test_a_click_asks_claude_at_once_with_no_preview(self):
+        r, made = self.run_steps("click")
+        self.assertEqual(made, [["explain", "--json"]])
+        self.assertEqual(r["text"], self.REPLY["text"])
+
+    def test_one_ask_at_a_time_and_the_reply_runs_nothing(self):
+        r, made = self.run_steps("click-twice", sleep=0.5)
+        self.assertEqual(made, [["explain", "--json"]])
+        self.assertEqual(r["text"], self.REPLY["text"])
+        # A command in the reply is only text: memmon runs nothing after it.
+        self.assertFalse(any(c[1:2] == ["act"] for c in made))
+
+    def test_cancel_drops_a_late_answer(self):
+        r, made = self.run_steps("click-nowait,cancel,wait", sleep=1.0)
+        self.assertEqual(made[-1], ["explain", "--json"])
+        self.assertIsNone(r["text"])
+        self.assertEqual(r["error"], "Cancelled. Nothing was changed.")
+
+    def test_the_wait_is_bounded_to_60_s(self):
+        self.assertEqual(run_json("--constants")["explain_timeout"], 60)
+
+    def test_errors_are_readable(self):
+        cases = [({"error": "claude not found on PATH, ~/.local/bin, /opt/homebrew/bin or /usr/local/bin"},
+                  "Claude Code isn’t installed, or memmon can’t find it"),
+                 ({"error": "claude did not answer within 60 s"}, "Claude did not answer within 60 s."),
+                 ({"error": "claude exited 1: rate limited"}, "Claude stopped with an error: exit 1: rate limited."),
+                 ("not json", "Could not ask Claude: memmon's answer could not be read.")]
+        for reply, says in cases:
+            r, _ = self.run_steps("click", reply=reply, code=0 if reply == "not json" else 2)
+            self.assertTrue(r["error"].startswith(says), (reply, r["error"]))
+            self.assertIsNone(r["text"])
+
+    def test_the_title_comes_from_the_mode(self):
+        for fixture, heading in [("explain-now.json", "Free memory now"),
+                                 ("explain-patterns.json", "Patterns this week"),
+                                 ("explain-quiet.json", "Nothing to do"),
+                                 ("explain-reply.json", "Claude’s suggestions")]:     # no mode or title
+            self.assertIn(heading, said(fixture), fixture)
+        reply = dict(self.REPLY, mode="patterns", title="Patterns this week")
+        r, _ = self.run_steps("click", reply=reply)
+        self.assertEqual((r["heading"], r["quiet"]), ("Patterns this week", False))
+        r, _ = self.run_steps("click")
+        self.assertEqual((r["heading"], r["quiet"]), ("Claude’s suggestions", False))
+
+    def test_quiet_has_no_from_claude_footer(self):
+        quiet = said("explain-quiet.json")
+        self.assertIn("Memory pressure is normal and nothing stands out this week.", quiet)
+        self.assertNotIn("From Claude. memmon never acts on it.", quiet)
+        self.assertIn("Ask again", quiet)
+        self.assertIn("Close Ask Claude", quiet)
+        for f in ("explain-now.json", "explain-patterns.json"):
+            self.assertIn("From Claude. memmon never acts on it.", said(f), f)
+        r, _ = self.run_steps("click", reply={"text": "All clear.", "mode": "quiet", "title": "Nothing to do"})
+        self.assertEqual((r["heading"], r["quiet"]), ("Nothing to do", True))
+
+    def test_items_render_in_order_one_element_each(self):
+        found = said("explain-now.json")
+        rows = ["Checkout refactor, Let its typecheck finish before starting another build., It holds 8.9 GB while building.",
+                "VM · colima, Stop it from its app if no session needs it., 6.5 GB, idle for the last hour.",
+                "Example Browser, Close the tabs you aren't using."]           # no why: no trailing part
+        idx = [found.index(r) for r in rows]
+        self.assertEqual(idx, sorted(idx))
+        # The joined text is not shown as well.
+        self.assertFalse(any(l.startswith("Checkout refactor: Let its") for l in found))
+
+    def test_each_items_dot_is_its_owners_section(self):
+        r = host("explain", FIXTURES / "explain-now.json")
+        self.assertEqual([(i["owner"], i["section"]) for i in r["items"]],
+                         [("Checkout refactor", "claude"), ("VM · colima", None), ("Example Browser", "app")])
+        r = host("explain", FIXTURES / "explain-patterns.json")
+        self.assertEqual([i["section"] for i in r["items"]], [None, None, "app"])
+
+    def test_without_items_the_text_is_shown_as_is(self):
+        r, _ = self.run_steps("click")
+        self.assertEqual((r["items"], r["text"]), ([], self.REPLY["text"]))
+        self.assertTrue(any("**Billing API tests** (Codex)" in l for l in said("explain-reply.json")))
+        reply = dict(self.REPLY, items=[{"owner": "Example Browser", "action": "Close tabs.", "why": ""}])
+        r, _ = self.run_steps("click", reply=reply)
+        self.assertEqual(r["items"], [{"owner": "Example Browser", "section": "app"}])
+
+    def test_the_fallback_is_one_bullet_per_line(self):
+        found = said("explain-reply.json")
+        lines = [l for l in found if l.startswith(("Checkout refactor (Claude", "Container VM uses",
+                                                     "Example Browser has", "**Billing API tests**"))]
+        self.assertEqual(len(lines), 4, found)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "e.json"
+            path.write_text(json.dumps(dict(effective(FIXTURES / "overview.json"), _view={"explain": {
+                "exit": 0, "stdout": {"text": "- Container VM: stop it from its app.\n\n2. Example Browser: close tabs.\nnothing else"}}})))
+            three = [r["label"] for r in a11y_path(path)]
+        self.assertIn("Container VM: stop it from its app.", three)
+        self.assertIn("Example Browser: close tabs.", three)
+        self.assertIn("nothing else", three)
+        self.assertFalse(any("\n" in l or ("Container VM" in l and "Example Browser" in l) for l in three))
+
+    def test_owner_before_a_colon_is_split_out(self):
+        r = run_json("--explain-line-probe", "--line", "VM · colima: stop it overnight.")
+        self.assertEqual(r, {"owner": "VM · colima", "rest": "stop it overnight."})
+        self.assertEqual(run_json("--explain-line-probe", "--line", "Close unused tabs.")["owner"], None)
+
+    def test_fixture_mode_logs_the_exact_argv(self):
+        self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],
+                         ["memmon explain --json"])
+
+    def test_cards_say_what_they_show(self):
+        found = said("explain-reply.json")
+        self.assertTrue(any(l.startswith("Checkout refactor (Claude session) holds 8.9 GB") for l in found), found)
+        self.assertTrue(any("**Billing API tests** (Codex)" in l for l in found), found)
+        self.assertIn("From Claude. memmon never acts on it.", found)
+        self.assertIn("Ask Claude what to do about memory", said("overview.json"))
+        busy = said("explain-busy.json")
+        self.assertIn("Cancel asking Claude", busy)
+        self.assertIn("Asking Claude… up to 60 s.", busy)
+        for gone in ("Send this summary to Claude", "Not now", "What is sent to Claude"):
+            self.assertNotIn(gone, busy)
+        self.assertTrue(any(l.startswith("Claude Code isn’t installed") for l in said("explain-error.json")))

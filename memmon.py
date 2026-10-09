@@ -45,6 +45,10 @@ OWNERS_HISTORY = os.path.join(STATE_DIR, "owners-history.json")
 CPU_BASELINE = os.path.join(STATE_DIR, "cpu-baseline.json")
 # Serialises every stop, including the menu bar's quit-app, across processes.
 ACTIONS_LOCK = os.path.join(STATE_DIR, "runner", "coord", "actions.lock")
+# Sampler state (S2.10, S2.11). The sampler is the only writer of all three.
+PRESSURE_FILE = os.path.join(STATE_DIR, "pressure.json")
+JOB_HISTORY = os.path.join(STATE_DIR, "job-history.json")
+PRESSURE_EPISODE = os.path.join(STATE_DIR, "runner", "coord", "pressure-episode.json")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
 CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
@@ -69,6 +73,14 @@ DEFAULT_CONFIG = {
     "project_roots": [],
     "worktree_pattern": r"monorepo(?:-([A-Za-z0-9._-]+))?",
     "ticket_pattern": r"[A-Z]{2,6}-\d+",
+    # memmon run's admission limit is RAM x (1 - headroom_frac).
+    "headroom_frac": 0.20,
+    # false turns S2.11 off: no suggestion scan, card, notification or naming.
+    "pressure_suggestions": True,
+    # false silences the sampler's notifications (and MemmonBar's).
+    "notifications": True,
+    # The gate's policy when MEMMON_GATE is not set in the hook's environment.
+    "gate_mode": None,
 }
 
 
@@ -181,6 +193,9 @@ def read_ps() -> dict[int, dict]:
     return procs
 
 
+KERNEL_LEVELS = {1: "normal", 2: "warning", 4: "critical"}
+
+
 def read_vm(fast: bool = False, header: str = "", vm_stat_text: str | None = None) -> dict:
     """System-wide memory picture.
 
@@ -198,13 +213,22 @@ def read_vm(fast: bool = False, header: str = "", vm_stat_text: str | None = Non
     # One sysctl spawn for both values, and os.* for the three that are constants
     # for the life of the machine. This runs on every gated Bash command, where
     # six forks measured 18ms of the ~85ms budget.
-    swap = _sh(["sysctl", "-n", "vm.swapusage", "kern.memorystatus_level"])
-    m = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M\s+free = ([\d.]+)M", swap)
+    # The boot session and the kernel's own level ride on the same spawn: a
+    # rate baseline is only valid within one boot, and S2.11's trigger reads
+    # the kernel level when the rates are unavailable.
+    out = _sh(["sysctl", "vm.swapusage", "kern.memorystatus_level",
+               "kern.memorystatus_vm_pressure_level", "kern.bootsessionuuid"])
+    sysctls = dict(line.split(": ", 1) for line in out.splitlines() if ": " in line)
+    m = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M\s+free = ([\d.]+)M",
+                  sysctls.get("vm.swapusage", ""))
     if m:
         vm["swap_total"] = int(float(m.group(1)) * MB)
         vm["swap_used"] = int(float(m.group(2)) * MB)
-    lvl = re.search(r"^\s*(\d+)\s*$", swap, re.M)
-    vm["free_pct"] = int(lvl.group(1)) if lvl else 0
+    lvl = sysctls.get("kern.memorystatus_level", "").strip()
+    vm["free_pct"] = int(lvl) if lvl.isdigit() else 0
+    kern = sysctls.get("kern.memorystatus_vm_pressure_level", "").strip()
+    vm["kernel_level"] = KERNEL_LEVELS.get(int(kern)) if kern.isdigit() else None
+    vm["boot"] = sysctls.get("kern.bootsessionuuid", "").strip() or None
     vm["ram_total"] = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
     if fast:
@@ -297,145 +321,176 @@ def page_size(vm_stat_text: str | None = None) -> int:
 # The free-% level the runway estimate projects toward. See pressure().
 HEADROOM_FLOOR = 20
 
-_prev_vm: dict = {}
+# Rate baselines. A rate needs two readings 2-300 s apart on CLOCK_MONOTONIC_RAW
+# and from the same kern.bootsessionuuid. free_pct is a whole percentage, so one
+# tick over 2 s would read as 30 %/min: its delta needs a baseline at least 30 s
+# old, kept separately from the 2 s one. Rates computed less than 5 s ago may be
+# reused by a reader that comes too soon after its baseline.
+RATE_MIN_S, RATE_MAX_S = 2, 300
+FREE_MIN_S = 30
+RATE_CACHE_S = 5
+
+
+def mono_now() -> float:
+    """CLOCK_MONOTONIC_RAW: keeps counting while the Mac sleeps."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
+
+def uptime_now() -> float:
+    """CLOCK_UPTIME_RAW: the same clock, stopped while the Mac sleeps."""
+    return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+
+
+def _has_counters(vm: dict) -> bool:
+    return all(isinstance(vm.get(k), (int, float)) for k in ("swapins", "swapouts"))
+
+
+def score_pressure(vm: dict, rates: dict | None, free_delta_min: float | None = None,
+                   carried_streak: int = 0, rates_source: str | None = None,
+                   reason: str | None = None, advance: bool = True) -> dict:
+    """How close is this machine to the freeze, and how fast is it getting
+    there: memmon_telemetry.score(), the one scorer every reader shares (B26).
+
+    `rates` is None when no valid baseline exists; free_delta_min is None
+    when the free_pct baseline is younger than 30 s. Without rates a verdict
+    of WATCH or worse stands as a lower bound and anything milder is UNKNOWN:
+    a reading never says HEALTHY without rates (I-13)."""
+    import memmon_telemetry
+    why = reason or "no valid rate baseline"
+    out = memmon_telemetry.score(vm, rates, free_delta_min, carried_streak,
+                                 level_reason=why, advance=advance)
+    if rates is None and out["level"] != "UNKNOWN":
+        out["level_reason"] = f"lower bound: {why}"
+    if rates is None:
+        out["thrash_mbs"] = out["swapin_mbs"] = out["swapout_mbs"] = None
+        out["swap_growth_mbmin"] = None
+    out["rates_source"] = rates_source if rates is not None else None
+    out["kernel_level"] = vm.get("kernel_level")
+    return out
+
+
+_prev_vm: dict = {}       # rate baseline: counters, _mono, _boot, _lh_streak
+_free_base: dict = {}     # free_pct baseline: free_pct, _mono, _boot
+_last_rates: dict = {}    # rates, _mono, _boot: reused for up to 5 s
+
+
+def _read_row(path: str) -> dict | None:
+    try:
+        with open(path) as fh:
+            row = json.load(fh)
+        return row if isinstance(row, dict) else None
+    except Exception:
+        return None
+
+
+RATE_FIELDS = ("swapin_mbs", "swapout_mbs", "swap_growth_mbmin")
+
+
+def _legacy_baseline(row: dict, vm: dict, now: float) -> float | None:
+    """The mono-equivalent time of a v1 latest.json row (no mono, no boot),
+    which is what the installed sampler writes until the first S2 run. It is
+    aged by wall ts as v1 did, 2-300 s. Without a boot id, counters that went
+    backwards against this read mean a reboot came in between: refused."""
+    ts = row.get("ts")
+    if not isinstance(ts, (int, float)) or not _has_counters(row) \
+            or row.get("rates") == "unavailable" or not _has_counters(vm):
+        return None
+    age = time.time() - ts
+    if not RATE_MIN_S <= age <= RATE_MAX_S:
+        return None
+    if any(vm[k] < row[k] for k in ("swapins", "swapouts")):
+        return None
+    return now - age
+
+
+def _seed_from_files(now: float, boot: str | None, vm: dict | None = None) -> None:
+    """A one-shot reader has no in-process history, so it seeds from the
+    sampler: pressure.json first, then latest.json, each only when it is from
+    this boot and 2-300 s old by CLOCK_MONOTONIC_RAW. A file younger than 2 s
+    lends its own in-run rates instead, as the 5 s cache. A v1 latest.json row
+    seeds by its wall age instead (see _legacy_baseline)."""
+    global _prev_vm, _free_base, _last_rates
+    if boot is None:
+        return
+    for path in (PRESSURE_FILE, SNAPSHOT):
+        row = _read_row(path)
+        if (row and path == SNAPSHOT and "mono" not in row and "boot" not in row
+                and vm is not None):
+            mono = _legacy_baseline(row, vm, now)
+            if mono is not None:
+                streak = row.get("_lh_streak", 0) or 0
+                _prev_vm = {**row, "_mono": mono, "_boot": boot, "_lh_streak": streak}
+                _free_base = {"free_pct": row.get("free_pct"), "mono": mono, "boot": boot}
+                return
+            continue
+        if not row or row.get("boot") != boot or not isinstance(
+                row.get("mono"), (int, float)):
+            continue
+        age = now - row["mono"]
+        streak = row.get("lh_streak", row.get("_lh_streak", 0)) or 0
+        base = {**row, "_mono": row["mono"], "_boot": boot, "_lh_streak": streak}
+        free = {"free_pct": row.get("free_pct"), "mono": row["mono"], "boot": boot}
+        if (0 <= age < RATE_MIN_S and row.get("rates") == "ok"
+                and all(isinstance(row.get(k), (int, float)) for k in RATE_FIELDS)):
+            _last_rates = {"rates": {k: row[k] for k in RATE_FIELDS},
+                           "_mono": row["mono"], "_boot": boot}
+            _prev_vm, _free_base = base, free
+            return
+        # A row whose own rates were unavailable has no trustworthy counters.
+        if (RATE_MIN_S <= age <= RATE_MAX_S and _has_counters(row)
+                and row.get("rates") != "unavailable"):
+            _prev_vm, _free_base = base, free
+            return
 
 
 def pressure(vm: dict) -> dict:
-    """How close is this machine to the freeze, and how fast is it getting there.
-
-    Levels are NOT read off swap usage. macOS grows swap on demand, so a full
-    swapfile means nothing; the freeze comes from jetsam deciding pageout cannot
-    keep up with allocation. The signals that actually precede it are the swapin
-    rate (working set no longer fits, pages being read back as fast as they are
-    evicted) and a collapsing free percentage."""
-    global _prev_vm
-    now = time.time()
+    """score_pressure() for every reader except the sampler, with the rates
+    taken from an in-process baseline, else one seeded from the sampler's
+    files. See score_pressure() for the verdict itself."""
+    global _prev_vm, _free_base, _last_rates
+    import memmon_telemetry
+    now = mono_now()
+    boot = vm.get("boot")
     if not _prev_vm:
-        # A one-shot run has no in-process history, so fall back to the sample
-        # the launchd sampler wrote. Live mode overwrites this each refresh.
-        try:
-            with open(SNAPSHOT) as fh:
-                cached = json.load(fh)
-            if 5 <= now - cached.get("ts", 0) <= 300 and "swapins" in cached:
-                _prev_vm = {**cached, "_ts": cached["ts"],
-                            "_lh_streak": cached.get("_lh_streak", 0)}
-        except Exception:
-            pass
+        _seed_from_files(now, boot, vm)
     prev = _prev_vm
+    same_boot = bool(prev) and boot is not None and prev.get("_boot") == boot
+    carried = (prev.get("_lh_streak", 0) or 0) if same_boot else 0
+    rates, source, reason, advance = None, None, "no valid rate baseline", True
+    dt = now - prev["_mono"] if same_boot else None
+    if not _has_counters(vm):
+        reason = "vm_stat unavailable"
+    elif dt is not None and RATE_MIN_S <= dt <= RATE_MAX_S and _has_counters(prev):
+        rates = memmon_telemetry.rates_between(
+            {**prev, "mono": prev["_mono"], "page_size": page_size()},
+            {**vm, "mono": now, "page_size": page_size()})
+        source = "baseline"
+    elif (dt is not None and 0 <= dt < RATE_MIN_S and _last_rates
+          and _last_rates.get("_boot") == boot
+          and 0 <= now - _last_rates["_mono"] <= RATE_CACHE_S):
+        rates, source, advance = dict(_last_rates["rates"]), "cached", False
+    elif dt is not None and 0 <= dt < RATE_MIN_S:
+        reason, advance = "baseline under 2 s old", False
+    elif dt is not None and dt > RATE_MAX_S:
+        reason = "baseline over 300 s old"
+    elif prev and not same_boot:
+        reason = "baseline from another boot"
 
-    rates = {"swapin_mbs": 0.0, "swapout_mbs": 0.0,
-             "free_delta_min": 0.0, "swap_growth_mbmin": 0.0}
-    dt = now - prev.get("_ts", 0) if prev else 0
-    if prev and 2 <= dt <= 300:
-        rates["swapin_mbs"] = max(0, vm.get("swapins", 0)
-                                  - prev.get("swapins", 0)) * page_size() / dt / 1e6
-        rates["swapout_mbs"] = max(0, vm.get("swapouts", 0)
-                                   - prev.get("swapouts", 0)) * page_size() / dt / 1e6
-        rates["free_delta_min"] = (vm.get("free_pct", 0)
-                                   - prev.get("free_pct", 0)) * 60.0 / dt
-        rates["swap_growth_mbmin"] = (vm.get("swap_used", 0)
-                                      - prev.get("swap_used", 0)) / MB * 60.0 / dt
-    _prev_vm = {**vm, "_ts": now}
+    free_delta = None
+    cur = {"free_pct": vm.get("free_pct"), "mono": now, "boot": boot}
+    if source == "baseline":
+        free_delta = memmon_telemetry.free_delta_between(_free_base, cur)
+    fb = _free_base
+    if (free_delta is not None or not fb or fb.get("boot") != boot
+            or not 0 <= now - fb.get("mono", now) <= RATE_MAX_S):
+        _free_base = cur
 
-    free = vm.get("free_pct", 100)
-    thrash = rates["swapin_mbs"] + rates["swapout_mbs"]
-    ram_total = max(vm.get("ram_total", 1), 1)
-    swap_ratio = vm.get("swap_used", 0) / ram_total
-    reasons, score = [], 0
-
-    # Swap held against RAM SIZE is the strongest discriminator available.
-    # Replaying this morning's near-freeze: swap sat at 1.1-1.4x RAM throughout,
-    # versus 0.15x when idle. Swap as a share of swap_total is useless here
-    # because macOS grows the swapfile to match demand.
-    if swap_ratio >= 1.0:
-        score += 4
-        reasons.append(f"swap {swap_ratio:.1f}x RAM size")
-    elif swap_ratio >= 0.5:
-        score += 2
-        reasons.append(f"swap {swap_ratio:.1f}x RAM size")
-    elif swap_ratio >= 0.25:
-        score += 1
-        reasons.append(f"swap {int(swap_ratio * 100)}% of RAM size")
-
-    # Sustained two-way paging is the thrash signature that precedes a stall.
-    if thrash >= 150:
-        score += 4; reasons.append(f"heavy thrashing {thrash:.0f} MB/s")
-    elif thrash >= 50:
-        score += 2; reasons.append(f"paging {thrash:.0f} MB/s")
-    elif thrash >= 10:
-        score += 1; reasons.append(f"paging {thrash:.0f} MB/s")
-
-    # free_pct is a weak signal on this machine — it sits near 28% both when
-    # healthy and mid-crisis — so only genuinely extreme values count.
-    if free <= 12:
-        score += 3; reasons.append(f"kernel headroom down to {free}%")
-    elif free <= 20:
-        score += 2; reasons.append(f"kernel headroom {free}%")
-
-    if rates["swap_growth_mbmin"] >= 500:
-        score += 2; reasons.append(
-            f"swap growing {rates['swap_growth_mbmin']:.0f} MB/min")
-    elif rates["swap_growth_mbmin"] >= 150:
-        score += 1; reasons.append(
-            f"swap growing {rates['swap_growth_mbmin']:.0f} MB/min")
-
-    load_ratio = vm.get("load", 0) / max(vm.get("ncpu", 8), 1)
-    if load_ratio >= 3:
-        score += 2; reasons.append(f"load {vm.get('load', 0):.0f} on "
-                                   f"{vm.get('ncpu', 8)} cores")
-    elif load_ratio >= 1.75:
-        score += 1; reasons.append(f"load {vm.get('load', 0):.0f}")
-
-    # Rough runway: free% is falling this fast, so this long until it reaches
-    # the level where the machine is genuinely in trouble.
-    #
-    # The target was 10%, which this machine has never reached — the minimum
-    # across 2,536 samples is 18%, and only 2 samples went below 20%. Projecting
-    # toward a level that never occurs makes the estimate optimistic: it always
-    # reported more runway than the machine actually had. 20% is the region
-    # stress actually reaches here.
-    headroom = None
-    drop = -rates["free_delta_min"]
-    if drop > 0.5 and free > HEADROOM_FLOOR:
-        headroom = (free - HEADROOM_FLOOR) / drop
-
-    if score >= 7:
-        level, color = "CRITICAL", "red"
-    elif score >= 4:
-        level, color = "DANGER", "red"
-    elif score >= 2:
-        level, color = "WATCH", "yellow"
-    else:
-        level, color = "HEALTHY", "green"
-    # Escalating on headroom needs care: it is a straight-line projection from
-    # the rate of change of free_pct — the weakest signal here, demoted in the
-    # scoring above because it reads ~28% both mid-crisis and idle. One noisy
-    # derivative should not be able to move the verdict a whole tier on its own,
-    # and when it does, the card has to say so: a DANGER whose listed reasons
-    # only add up to WATCH is worse than no warning.
-    low = headroom is not None and headroom < 5
-    streak = (prev.get("_lh_streak", 0) + 1) if low else 0
-    _prev_vm["_lh_streak"] = streak
-    if low and streak >= 2 and level == "WATCH":
-        level, color = "DANGER", "red"
-        reasons.append(f"headroom falling, ~{headroom:.0f} min to "
-                       f"{HEADROOM_FLOOR}%")
-
-    # Distance to the next tier. A bare score is meaningless to read; "2 more
-    # points and this becomes DANGER" is not.
-    tiers = [("WATCH", 2), ("DANGER", 4), ("CRITICAL", 7)]
-    nxt, to_next = None, None
-    for name, need in tiers:
-        if score < need:
-            nxt, to_next = name, need - score
-            break
-
-    if level == "HEALTHY":
-        headroom = None          # see README: "appears only when something is wrong"
-    return {"level": level, "color": color, "score": score,
-            "reasons": reasons, "headroom_min": headroom,
-            "next_level": nxt, "to_next": to_next, "lh_streak": streak,
-            "thrash_mbs": thrash, **rates}
+    out = score_pressure(vm, rates, free_delta, carried, source, reason, advance)
+    if advance:
+        _prev_vm = {**vm, "_mono": now, "_boot": boot, "_lh_streak": out["lh_streak"]}
+        if source == "baseline":
+            _last_rates = {"rates": dict(rates), "_mono": now, "_boot": boot}
+    return out
 
 
 # The VM is Docker; folding it here rather than in one of two front ends means
@@ -826,6 +881,9 @@ def build_advice(snap: dict) -> str:
     hot = [s for s in snap.get("sessions") or []
            if s.get("swap", 0) > 0.5 * max(s.get("mem", 1), 1)]
 
+    if level == "UNKNOWN":
+        return (f"Pressure unknown: {p.get('level_reason') or 'no valid rate baseline'}. "
+                "No verdict until the next reading has a baseline.")
     if level == "HEALTHY":
         if p.get("to_next"):
             return (f"Safe to start work — {p['to_next']} more point"
@@ -1157,13 +1215,26 @@ def app_group(cmd: str) -> str:
         ("Code Helper", "VS Code"), ("Spotify", "Spotify"),
         ("Notion", "Notion"), ("zoom.us", "Zoom"), ("Obsidian", "Obsidian"),
         ("WindowServer", "WindowServer"), ("Figma", "Figma"),
+        # Browsers, terminals and editors, by their bundle's path, so a
+        # helper (Google Chrome Helper (Renderer), …) groups under its app.
+        # Names are memmon_common.APP_NAMES display names. Canary before Chrome.
+        ("Google Chrome Canary", "Google Chrome Canary"),
+        ("Google Chrome", "Google Chrome"), ("Safari.app", "Safari"),
+        ("Arc.app", "Arc"), ("Firefox.app", "Firefox"),
+        ("Microsoft Edge", "Microsoft Edge"), ("Ghostty.app", "Ghostty"),
+        ("iTerm.app", "iTerm2"), ("Terminal.app", "Terminal"), ("Warp.app", "Warp"),
+        ("Zed.app", "Zed"),
+        # Not Xcode.app/Contents/Developer: git, clang and swift run from there.
+        ("Xcode.app/Contents/MacOS", "Xcode"),
+        ("Xcode.app/Contents/SharedFrameworks", "Xcode"),
+        ("OrbStack", "OrbStack"),
     ):
         if needle in cmd:
             return name
     return ""
 
 
-def collect() -> dict:
+def collect(pres: dict | None = None) -> dict:
     from memmon_runner import jobs
     ps = read_ps()
     top, top_header = read_top()
@@ -1402,7 +1473,7 @@ def collect() -> dict:
     snap = {
         "ts": time.time(),
         "vm": vm,
-        "pressure": pressure(vm),
+        "pressure": dict(pres) if pres is not None else pressure(vm),
         "blocked": load_pending(),
         "gate": gate_stats(),
         "jobs": jobs(STATE_DIR),
@@ -1519,6 +1590,10 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
         detail = " · ".join(p.get("reasons") or []) or "no pressure signals"
         nxt = (f"  {p['to_next']} pt → {p['next_level']}"
                if p.get("to_next") else "")
+        if p.get("level") == "UNKNOWN":
+            detail, nxt = p.get("level_reason") or "no valid rate baseline", ""
+        elif p.get("level_reason"):
+            detail += f" ({p['level_reason']})"
         head = f" ▌ {p['level']:<9}"
         L.append(col(head, p["color"], on)
                  + col(detail, "grey" if p["level"] == "HEALTHY" else p["color"], on)
@@ -1697,42 +1772,281 @@ def render(snap: dict, on: bool = True, max_lines: int | None = None) -> str:
 
 
 LEVEL_ICON = {"HEALTHY": "🟢", "WATCH": "🟠", "DANGER": "🔴", "CRITICAL": "🔴"}
+# A cached sample older than this is stale for display (not for rates).
+STALE_DISPLAY_S = 180
+
+
+def _status_text(level: str, swap_used: int, reclaimable: int) -> str:
+    if level == "UNKNOWN":
+        return "memmon: pressure unknown"
+    s = f"{LEVEL_ICON.get(level, '')} {human(swap_used)} swap"
+    if level != "HEALTHY":
+        s += f" · {level}"
+    if reclaimable > GB:
+        s += f" · {human(reclaimable)} reclaimable"
+    return s
 
 
 def statusline(snap: dict) -> str:
-    vm = snap["vm"]
     level = (snap.get("pressure") or {}).get("level", "HEALTHY")
-    s = f"{LEVEL_ICON.get(level, '')} {human(vm.get('swap_used', 0))} swap"
-    if level != "HEALTHY":
-        s += f" · {level}"
-    if snap["orphan_total"] > GB:
-        s += f" · {human(snap['orphan_total'])} reclaimable"
-    return s
+    return _status_text(level, snap["vm"].get("swap_used", 0), snap["orphan_total"])
+
+
+def cached_statusline(row: dict, now: float) -> str:
+    """The status line from the sampler's row; it never blocks on `top`."""
+    age = now - row["ts"]
+    if age > STALE_DISPLAY_S:
+        return f"memmon: no sample for {int(age // 60)} min"
+    return _status_text(row.get("pressure", "HEALTHY"), row.get("swap_used", 0),
+                        row.get("orphan", 0))
 
 
 # ------------------------------------------------------------- history/report
 
-def log_sample(snap: dict) -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
+class SamplerBudget(BaseException):
+    """The sampler run's 40 s wall budget ran out. A BaseException, so _sh's
+    `except Exception` can never swallow it."""
+
+
+SAMPLER_BUDGET_S = 40
+SAMPLER_VM_STAT_S = 10
+GAP_S = 150                 # a sampling gap: more than this since the previous row
+STARVED_NOTICE_S = 300      # awake time a gap needs before it is notified
+
+
+def notify(text: str, title: str = "memmon", subtitle: str = "",
+           run=subprocess.run) -> None:
+    """Post one notification. The text reaches osascript only as `on run argv`
+    arguments, never inside the script, so a label or a command can never be
+    read as AppleScript. Nothing is posted when settings turn notifications off."""
+    if CONFIG.get("notifications", True) is False:
+        return
+    run(["osascript", "-e", "on run argv",
+         "-e", "display notification (item 1 of argv) with title (item 2 of argv) "
+               "subtitle (item 3 of argv)",
+         "-e", "end run", text, title, subtitle],
+        capture_output=True, timeout=10)
+
+
+def gap_record(prev: dict | None, cur: dict) -> dict | None:
+    """The sampling gap between the previous row and this reading, or None.
+
+    CLOCK_MONOTONIC_RAW keeps counting through sleep and CLOCK_UPTIME_RAW does
+    not, so within one boot their deltas split a gap exactly into time asleep
+    and unsampled awake time, however many sleeps it holds. Both clocks start
+    afresh at boot, so a changed kern.bootsessionuuid is a reboot and cannot
+    be split. Wall ts is for display only, and nothing is back-filled."""
+    import memmon_telemetry
+    if not prev or prev.get("boot") is None or cur.get("boot") is None:
+        return None
+    try:
+        gap = memmon_telemetry.gap_record(prev, cur, GAP_S)
+    except (KeyError, TypeError):
+        return None
+    if gap is not None:
+        gap.update(from_ts=prev.get("ts"), to_ts=cur.get("ts"))
+    return gap
+
+
+def notifiable_gap(gap: dict | None) -> bool:
+    """A starved gap with at least 5 min of unsampled awake time."""
+    return bool(gap) and gap.get("cause") == "starved" and \
+        (gap.get("awake_s") or 0) >= STARVED_NOTICE_S
+
+
+def _previous_row(boot: str | None) -> dict | None:
+    """The newest earlier reading: this boot's pressure.json or latest.json,
+    whichever is later by mono; else any row, which then marks a reboot."""
+    rows = [r for r in (_read_row(PRESSURE_FILE), _read_row(SNAPSHOT))
+            if r and r.get("boot") and isinstance(r.get("mono"), (int, float))]
+    same = [r for r in rows if r["boot"] == boot]
+    if same:
+        return max(same, key=lambda r: r["mono"])
+    return rows[0] if rows else None
+
+
+READING_KEYS = ("free_pct", "swap_used", "swap_total", "ram_total", "load", "ncpu",
+                "swapins", "swapouts", "pageins", "pageouts", "page_size",
+                "used_bytes", "kernel_level")
+
+
+def sampler_reading(source=None, clock=None) -> dict:
+    """The sampler's pressure phase: two strict reads at least 2 s apart, so
+    the paging and swap-growth rates come from inside this run even after a
+    gap. sysctls go through ctypes; vm_stat gets 10 s, and when a read fails
+    the instantaneous sysctl signals still score as a lower bound. free_delta
+    needs the previous pressure file, from this boot and 30-300 s old. The
+    result is written to pressure.json atomically before anything slower runs.
+
+    Rates use the reads' own CLOCK_MONOTONIC; the row's mono is
+    CLOCK_MONOTONIC_RAW, the gap clock, as is pressure.json's."""
+    import memmon_owners
+    import memmon_pressure
+    import memmon_telemetry as T
+    clock = clock or T.SYSTEM_CLOCK
+    boot = clock.boot()
+    prev_file = _read_row(PRESSURE_FILE)
+    prev_row = _previous_row(boot)
+    vm, rates, reason = {}, None, None
+    try:
+        r1 = T.read_pressure_strict(source, clock, vm_stat_timeout=SAMPLER_VM_STAT_S,
+                                    budget_s=SAMPLER_VM_STAT_S)
+        clock.sleep(max(0.0, RATE_MIN_S - (clock.mono() - r1["mono"])))
+        vm = T.read_pressure_strict(source, clock, vm_stat_timeout=SAMPLER_VM_STAT_S,
+                                    budget_s=SAMPLER_VM_STAT_S)
+        rates = T.rates_between(r1, vm)
+    except (T.TelemetryError, ValueError) as exc:
+        rates, reason = None, f"strict read failed: {exc}"
+        try:
+            vm = T.read_instant(source, clock)
+        except T.TelemetryError as exc2:
+            vm, reason = {}, f"strict read failed: {exc2}"
+    vm = {**vm, "kernel_level": vm.get("pressure_level")}
+    mono, up, ts = clock.raw(), clock.uptime(), clock.wall()
+    same = bool(prev_file) and boot is not None and prev_file.get("boot") == boot \
+        and isinstance(prev_file.get("mono"), (int, float))
+    age = mono - prev_file["mono"] if same else None
+    carried = (prev_file.get("lh_streak", 0) or 0) if same and 0 <= age <= RATE_MAX_S else 0
+    free_delta = (T.free_delta_between(prev_file, {**vm, "mono": mono, "boot": boot})
+                  if rates is not None and same else None)
+    pres = score_pressure(vm, rates, free_delta, carried,
+                          "in_run" if rates is not None else None, reason)
+    reading = {"ts": ts, "mono": mono, "uptime": up, "boot": boot,
+               **{k: vm[k] for k in READING_KEYS if vm.get(k) is not None}}
+    gap = gap_record(prev_row, reading)
+    record = {**reading, **{k: pres[k] for k in (
+        "level", "score", "reasons", "headroom_min", "rates", "rates_source",
+        "level_reason", "lh_streak", *RATE_FIELDS, "free_delta_min")},
+        "under_pressure": memmon_pressure.under_pressure(
+            pres["level"], pres["rates"], vm.get("kernel_level")),
+        "gap": gap, "last_gap": gap or (prev_file or {}).get("last_gap"),
+        # Kept apart so a later sleep or reboot gap cannot end its 24 h notice.
+        "last_starved_gap": gap if notifiable_gap(gap) else (
+            (prev_file or {}).get("last_starved_gap"))}
+    memmon_owners.write_json_atomic(PRESSURE_FILE, record)
+    return {"record": record, "pressure": pres, "vm": vm}
+
+
+def suggestions_enabled() -> bool:
+    return CONFIG.get("pressure_suggestions", True) is not False
+
+
+def sampler_owners(snap: dict, reading: dict, source=None, ctx=None, clock=None,
+                   mono=None) -> dict | None:
+    """The sampler's libproc share: S1's owner history and CPU baseline, then
+    S2.11's job history on every run, and the suggestions, episode and
+    notification only while under_pressure holds. Never calls act."""
+    import memmon_owners
+    import memmon_pressure as mp
+    tick = owners_sampler_tick(source, ctx, clock=clock, mono=mono)
+    if tick is None or not suggestions_enabled():
+        return tick
+    inv, part = tick["inv"], tick["part"]
+    prof = load_profile()
+    kind_of = mp.Classifier(lambda cmd: classify_command(cmd, prof), job_tokens)
+    rec = reading["record"]
+    hist = mp.update_job_history(memmon_owners.read_json(JOB_HISTORY, {}), inv,
+                                 mp.heavy_pids(inv, kind_of), rec["uptime"], rec["boot"])
+    memmon_owners.write_json_atomic(JOB_HISTORY, hist)
+    rows = []
+    if rec["under_pressure"]:
+        from memmon_runner import jobs
+        rows = mp.suggestions(inv, part, kind_of, leases=jobs(STATE_DIR), history=hist,
+                              ram_bytes=rec.get("ram_total"))
+    snap["pressure_suggestions"] = mp.without_tokens(rows)
+    gap = rec.get("gap")
+    sends, before = mp.run_episode(
+        PRESSURE_EPISODE, now_ts=rec["ts"], mono=rec["mono"], boot=rec["boot"],
+        pressured=rec["under_pressure"], unknown=rec["level"] == "UNKNOWN",
+        gap=bool(gap and gap["cause"] != "reboot"), rows=rows)
+    for row in sends:
+        # The state says "sent" before the send (at most once). A send that
+        # fails gives the job and the 5 min floor back, so the next run retries.
+        try:
+            notify(suggestion_text(row), "memmon · memory under pressure",
+                   "Open memmon to review it; nothing was stopped")
+        except Exception:
+            mp.rollback_notification(PRESSURE_EPISODE, row["job_id"], rec["mono"], before)
+    return tick
+
+
+def _log_row(snap: dict, reading: dict | None) -> dict:
     vm = snap["vm"]
+    p = snap.get("pressure") or {}
+    rec = (reading or {}).get("record") or {}
     row = {
         "ts": int(snap["ts"]),
         "ram_used": vm.get("ram_used", 0), "swap_used": vm.get("swap_used", 0),
         "swap_total": vm.get("swap_total", 0), "free_pct": vm.get("free_pct", 0),
         "load": vm.get("load", 0), "orphan": snap["orphan_total"],
         # Counters, so the next run can compute paging rates against this point.
-        "swapins": vm.get("swapins", 0), "swapouts": vm.get("swapouts", 0),
-        "pressure": (snap.get("pressure") or {}).get("level", "?"),
+        # null when vm_stat was not read: a defaulted 0 reads as since-boot thrash.
+        "swapins": vm.get("swapins"), "swapouts": vm.get("swapouts"),
+        "pressure": p.get("level", "?"),
         # Carries the low-headroom streak across process boundaries: every CLI
         # invocation is a fresh process, so without this the streak could never
         # reach 2 and the escalation would never fire outside the live loop.
-        "_lh_streak": (snap.get("pressure") or {}).get("lh_streak", 0),
+        "_lh_streak": p.get("lh_streak", 0),
         "sessions": {s["name"]: s["mem"] for s in snap["sessions"]},
         "apps": {k: v["mem"] for k, v in snap["apps"].items()},
         "worktrees": {f"build:{r['name']}": r["mem"] for r in snap.get("worktrees", [])},
         "worktree_tags": {r["name"]: r.get("tag", "") for r in snap.get("worktrees", [])},
         "overhead": (snap.get("overhead") or {}).get("mem", 0),
     }
+    row.update(_s2_fields(p, rec, vm))
+    if reading is not None:
+        row["pressure_suggestions"] = snap.get("pressure_suggestions") or []
+        row["suggestions_ts"] = row["ts"]
+    else:
+        # The live dashboard never scans for suggestions. It carries the
+        # sampler's list, the under_pressure it was computed under and when,
+        # rather than writing an empty list the gate would trust.
+        prev = _read_row(SNAPSHOT) or {}
+        row["under_pressure"] = bool(prev.get("under_pressure"))
+        row["pressure_suggestions"] = prev.get("pressure_suggestions") or []
+        row["suggestions_ts"] = prev.get("suggestions_ts")
+    return row
+
+
+def _s2_fields(p: dict, rec: dict, vm: dict) -> dict:
+    """What every row gains in S2: the gap clocks and the honesty fields."""
+    import memmon_pressure
+    out = {"mono": rec.get("mono", mono_now()), "uptime": rec.get("uptime", uptime_now()),
+           "boot": rec.get("boot", vm.get("boot")),
+           "level_reason": p.get("level_reason"), "rates": p.get("rates"),
+           "rates_source": p.get("rates_source"), "lh_streak": p.get("lh_streak", 0),
+           "kernel_level": p.get("kernel_level"),
+           "under_pressure": memmon_pressure.under_pressure(
+               p.get("level"), p.get("rates"), p.get("kernel_level"))}
+    if rec.get("gap"):
+        out["gap"] = rec["gap"]
+    if rec.get("used_bytes") is not None:
+        # The strict reader's "used" (the health card's basis), for usage.
+        out["used_bytes"] = rec["used_bytes"]
+    return out
+
+
+def _append_row(row: dict, reading: dict | None = None) -> None:
+    import memmon_owners
+    import signal
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # The append and the flag are one step as far as the budget goes: SIGALRM
+    # is held until both are done, so an expiry either precedes the row (and a
+    # partial row follows) or only re-publishes it, never both.
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        with open(HISTORY, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        if reading is not None:
+            reading["row"] = row
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+    memmon_owners.write_json_atomic(SNAPSHOT, row)
+
+
+def log_sample(snap: dict, reading: dict | None = None) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    row = _log_row(snap, reading)
     # Notify once on the falling edge, when the machine becomes usable again and
     # something is still waiting to be re-run. Only on the transition, so it
     # cannot nag every minute.
@@ -1745,22 +2059,96 @@ def log_sample(snap: dict) -> None:
     pend = load_pending()
     if (was in ("DANGER", "CRITICAL") and now_level in ("HEALTHY", "WATCH")
             and pend):
-        subprocess.run([
-            "osascript", "-e",
-            f'display notification "{len(pend)} blocked command(s) can be '
-            f'retried" with title "memmon" subtitle "Memory pressure cleared"',
-        ], capture_output=True)
-
+        try:
+            notify(f"{len(pend)} blocked command(s) can be retried", "memmon",
+                   "Memory pressure cleared")
+        except Exception:
+            pass
     try:
         learn(snap)
     except Exception:
         pass
 
-    with open(HISTORY, "a") as fh:
-        fh.write(json.dumps(row) + "\n")
-    with open(SNAPSHOT, "w") as fh:
-        json.dump(row, fh)
+    _append_row(row, reading)
     _trim_history()
+
+
+def gap_notice(gap: dict) -> str:
+    """The copy never says why sampling stopped: an unloaded sampler looks
+    the same as a starved one."""
+    def hm(ts):
+        return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
+    return (f"memmon couldn't sample for {round(gap['awake_s'] / 60)} min while the "
+            f"Mac was awake ({hm(gap.get('from_ts'))}–{hm(gap.get('to_ts'))}). "
+            "Readings around the gap may be incomplete.")
+
+
+def write_partial(reading: dict | None) -> dict:
+    """The row a budget-killed run leaves: whatever the pressure phase knew."""
+    rec = (reading or {}).get("record") or {}
+    row = {"ts": int(time.time()), "partial": True,
+           "partial_reason": "sampler budget exceeded",
+           "mono": rec.get("mono", mono_now()), "uptime": rec.get("uptime", uptime_now()),
+           "boot": rec.get("boot")}
+    if rec:
+        row.update({k: rec[k] for k in ("free_pct", "swap_used", "swap_total", "load",
+                                        "swapins", "swapouts", "kernel_level") if k in rec})
+        row.update(pressure=rec["level"], _lh_streak=rec.get("lh_streak", 0),
+                   lh_streak=rec.get("lh_streak", 0), level_reason=rec.get("level_reason"),
+                   rates=rec.get("rates"), rates_source=rec.get("rates_source"),
+                   under_pressure=rec.get("under_pressure", False))
+        if rec.get("gap"):
+            row["gap"] = rec["gap"]
+    else:
+        row.update(pressure="UNKNOWN", level_reason="sampler budget exceeded",
+                   rates="unavailable", under_pressure=False)
+    _append_row(row)
+    return row
+
+
+def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> int:
+    """One `memmon --log` run under a 40 s wall budget. launchd never starts a
+    second instance while one runs, so without the budget a run whose
+    subprocess timeouts add up would hide every interval behind it. On expiry
+    the partial row is written atomically and the run still exits 0."""
+    import signal
+
+    def expired(signum, frame):
+        raise SamplerBudget()
+    old = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, budget_s)
+    reading, done = None, False
+    try:
+        reading = sampler_reading(source, clock)
+        # Posted as soon as pressure.json holds the gap: the slow collection
+        # below is exactly what a starved machine may not finish. A gap is
+        # discovered by one run only, so this posts once.
+        gap = reading["record"].get("gap")
+        if notifiable_gap(gap):
+            try:
+                notify(gap_notice(gap), "memmon", "Sampling gap")
+            except Exception:
+                pass
+        snap = collect(pres=reading["pressure"])
+        try:
+            sampler_owners(snap, reading)
+        except Exception as exc:
+            print(f"owners sample failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        log_sample(snap, reading)
+        done = True
+    except SamplerBudget:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if (reading or {}).get("row"):
+            import memmon_owners
+            memmon_owners.write_json_atomic(SNAPSHOT, reading["row"])
+        elif not done:
+            write_partial(reading)
+            print("memmon: sampler budget exceeded; partial row written",
+                  file=sys.stderr)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    return 0
 
 
 # Retention. Rows are ~690 bytes, so 1 sample/min is ~1 MB/day.
@@ -1773,14 +2161,31 @@ HISTORY_KEEP_ROWS = 10_080         # 7 days at 1/min
 ERRLOG_TRIM_AT = 1 * MB
 
 
+def _replace_lines(path: str, lines: list) -> None:
+    """Rewrite a file through a unique temp file and os.replace, so an
+    interruption (the sampler's budget is an asynchronous BaseException)
+    leaves either the old file or the new one, never a truncated one."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.writelines(lines)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _trim_history() -> None:
     try:
-        if os.path.getsize(HISTORY) < HISTORY_TRIM_AT:
-            return
-        with open(HISTORY) as fh:
-            rows = fh.readlines()
-        with open(HISTORY, "w") as fh:
-            fh.writelines(rows[-HISTORY_KEEP_ROWS:])
+        if os.path.getsize(HISTORY) >= HISTORY_TRIM_AT:
+            with open(HISTORY) as fh:
+                rows = fh.readlines()
+            _replace_lines(HISTORY, rows[-HISTORY_KEEP_ROWS:])
     except Exception:
         pass
     # launchd appends the sampler's stderr forever; nothing else bounds it.
@@ -1789,11 +2194,9 @@ def _trim_history() -> None:
         if os.path.getsize(err) > ERRLOG_TRIM_AT:
             with open(err) as fh:
                 tail = fh.readlines()[-200:]
-            with open(err, "w") as fh:
-                fh.writelines(tail)
+            _replace_lines(err, tail)
     except Exception:
         pass
-
 
 def report(days: int) -> str:
     if not os.path.isfile(HISTORY):
@@ -1820,18 +2223,44 @@ def report(days: int) -> str:
     L = [f"memmon report · {len(rows)} samples over {days}d "
          f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(rows[0]['ts']))} → "
          f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(rows[-1]['ts']))})", ""]
-    swaps = [r["swap_used"] for r in rows]
-    peak = max(rows, key=lambda r: r["swap_used"])
-    L.append(f"  swap   avg {human(sum(swaps) // len(swaps))}   "
-             f"peak {human(peak['swap_used'])} at "
-             f"{time.strftime('%b %d %H:%M', time.localtime(peak['ts']))}")
+    # A partial row (sampler budget exceeded) lacks what it never collected,
+    # so each average runs over the rows that carry its field.
+    swapped = [r for r in rows if isinstance(r.get("swap_used"), (int, float))]
+    if swapped:
+        swaps = [r["swap_used"] for r in swapped]
+        peak = max(swapped, key=lambda r: r["swap_used"])
+        L.append(f"  swap   avg {human(sum(swaps) // len(swaps))}   "
+                 f"peak {human(peak['swap_used'])} at "
+                 f"{time.strftime('%b %d %H:%M', time.localtime(peak['ts']))}")
     # Report the recorded verdict, not a free_pct threshold that has never been
-    # crossed on this machine (min observed 18 across 2,487 rows).
+    # crossed on this machine (min observed 18 across 2,487 rows). UNKNOWN is
+    # not a score, so it counts as unscored.
     bad = sum(1 for r in rows if r.get("pressure") in ("DANGER", "CRITICAL"))
-    known = sum(1 for r in rows if r.get("pressure"))
+    known = sum(1 for r in rows
+                if r.get("pressure") in ("HEALTHY", "WATCH", "DANGER", "CRITICAL"))
+    unscored = len(rows) - known
     if known:
         L.append(f"  time at DANGER or worse: {bad * 100 // known}% "
-                 f"of {known} scored samples")
+                 f"of {known} scored samples"
+                 + (f" ({unscored} unscored)" if unscored else ""))
+    partial = sum(1 for r in rows if r.get("partial"))
+    if partial:
+        L.append(f"  {partial} partial sample(s): the sampler ran out of its 40 s budget")
+    gaps = [r["gap"] for r in rows if isinstance(r.get("gap"), dict)]
+    if gaps:
+        L.append(f"  sampling gaps ({len(gaps)}):")
+        for g in gaps:
+            frm = (time.strftime("%b %d %H:%M", time.localtime(g["from_ts"]))
+                   if g.get("from_ts") else "?")
+            to = (time.strftime("%H:%M", time.localtime(g["to_ts"]))
+                  if g.get("to_ts") else "?")
+            if g.get("cause") == "reboot":
+                L.append(f"    {frm} → {to}  reboot")
+            else:
+                L.append(f"    {frm} → {to}  {g.get('cause')}: "
+                         f"{dur(int(g.get('awake_s', 0)))} awake unsampled"
+                         + (f", {dur(int(g.get('asleep_s') or 0))} asleep"
+                            if g.get("asleep_s") else ""))
     L.append("")
     L.append(f"  {'OWNER':<32}{'AVG':>8}{'PEAK':>8}{'SEEN':>7}")
     for name, vals in sorted(agg.items(), key=lambda kv: -sum(kv[1]) / len(kv[1])):
@@ -2152,8 +2581,33 @@ class _PositionAwareHeavyMatcher:
 HEAVY_CMD = _PositionAwareHeavyMatcher()
 
 
+def suggestion_text(row: dict) -> str:
+    """One pressure suggestion as a sentence: "vitest in acme-web holds 8.8 GB
+    and has been idle 31 min." Idle and growing are labels, never reasons to
+    stop anything."""
+    bits = [f"{row['label']} holds {human(row['footprint'])}"]
+    if row.get("idle_s"):
+        bits.append(f"has been idle {row['idle_s'] // 60} min")
+    elif (row.get("growth_mb_min") or 0) > 0:
+        bits.append(f"is growing {row['growth_mb_min']:.0f} MB/min")
+    return " and ".join(bits) + "."
+
+
+def top_suggestion(cached: dict, now: float) -> dict | None:
+    """The sampler's top suggestion, only while its row is at most 180 s old
+    and says under_pressure. The gate reads nothing else, so its budget holds."""
+    if not suggestions_enabled() or not cached.get("under_pressure"):
+        return None
+    made = cached.get("suggestions_ts", cached.get("ts")) or 0
+    if not 0 <= now - made <= STALE_DISPLAY_S:
+        return None
+    rows = cached.get("pressure_suggestions") or []
+    return rows[0] if rows and isinstance(rows[0], dict) else None
+
+
 def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
-                  mode: str, classification: dict | None = None) -> tuple[str, str]:
+                  mode: str, classification: dict | None = None,
+                  now: float | None = None) -> tuple[str, str]:
     """Pure decision, so it can be tested without provoking real memory pressure.
 
     Returns (action, message) where action is allow | warn | block."""
@@ -2162,7 +2616,8 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
         return "allow", ""
 
     level = pres.get("level", "HEALTHY")
-    if level == "HEALTHY":
+    # UNKNOWN allows silently and injects nothing: the gate fails open.
+    if level in ("HEALTHY", "UNKNOWN"):
         return "allow", ""
 
     why = " · ".join(pres.get("reasons") or []) or level
@@ -2193,6 +2648,10 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
             bits.append(f"{name} has {tag} resident holding {human(mem)}.")
         else:
             bits.append(f"{name} is holding {human(mem)}.")
+    top = top_suggestion(cached, time.time() if now is None else now)
+    if top is not None:
+        bits.append(suggestion_text(top) + " Ask the user before stopping it; "
+                    "do not stop it yourself.")
     room = pres.get("headroom_min")
     if room is not None and room < 30:
         bits.append(f"At the current rate, about {room:.0f} min until free memory "
@@ -2290,6 +2749,22 @@ def _read_gate_rows(limit: int | None = 400) -> list[dict]:
     return out
 
 
+GATE_MODES = ("block-critical", "block", "warn", "off")
+
+
+def gate_mode() -> tuple:
+    """(mode, source). MEMMON_GATE in the hook's environment wins, then
+    config.json's gate_mode (`memmon settings set gate_mode …`), then the
+    default. config.json is already loaded at import, so this costs nothing."""
+    env = os.environ.get("MEMMON_GATE")
+    if env is not None:
+        return env, "env"
+    cfg = CONFIG.get("gate_mode")
+    if cfg in GATE_MODES:
+        return cfg, "config"
+    return "block-critical", "default"
+
+
 def gate_stats(limit: int | None = None) -> dict:
     """Retained decisions plus inspectable warning/stop events for the UI."""
     rows = _read_gate_rows(limit)
@@ -2298,8 +2773,8 @@ def gate_stats(limit: int | None = None) -> dict:
         acts[r.get("action", "?")] += 1
     lat = sorted(r.get("ms", 0) for r in rows if r.get("action") != "error")
     paused = pause_until()
-    mode = os.environ.get("MEMMON_GATE", "block-critical")
-    if mode not in ("block-critical", "block", "warn", "off"):
+    mode = gate_mode()[0]
+    if mode not in GATE_MODES:
         mode = "block-critical"
     pending = load_pending()
     def is_pending(sid: str, cmd: str) -> bool:
@@ -2481,7 +2956,6 @@ def gate() -> int:
         payload = json.loads(raw or "{}")
         tool = payload.get("tool_name", "")
         cmd = (payload.get("tool_input") or {}).get("command", "")
-        mode = os.environ.get("MEMMON_GATE", "block-critical")
 
         if pause_until():
             return 0
@@ -2495,7 +2969,11 @@ def gate() -> int:
             except Exception:
                 pass
         classification = classify_command(cmd)
-        if mode == "off" or tool != "Bash" or not classification["matched"]:
+        if tool != "Bash" or not classification["matched"]:
+            return 0
+        # Heavy path only: the policy (env, then config.json, then default).
+        mode, mode_source = gate_mode()
+        if mode == "off":
             return 0
 
         vm = read_vm(fast=True)
@@ -2518,12 +2996,13 @@ def gate() -> int:
             with open(path, "a") as fh:
                 fh.write(json.dumps({
                     "ts": event_ts, "cmd": cmd, "cmd_display": display_command(cmd),
-                    "mode": mode,
+                    "mode": mode, "mode_source": mode_source,
                     "level": pres.get("level"), "action": action,
                     "session": sid, "session_name": lookup_session_name(sid),
                     "cwd": payload.get("cwd", ""),
                     "score": pres.get("score"),
                     "reasons": pres.get("reasons", []),
+                    "level_reason": pres.get("level_reason"),
                     "classification": {k: v for k, v in classification.items()
                                        if k != "matched"},
                     # Measured, so "is this slowing anyone down" is answerable
@@ -2623,8 +3102,8 @@ def wait_safe(timeout: int) -> int:
             print(f"clear: {pres['level']}")
             return 0
         left = int(deadline - time.time())
-        print(f"{pres['level']} — {' · '.join(pres['reasons'])} "
-              f"(waiting, {left}s left)", flush=True)
+        why = " · ".join(pres["reasons"]) or pres.get("level_reason") or ""
+        print(f"{pres['level']} — {why} (waiting, {left}s left)", flush=True)
         time.sleep(15)
     print("timed out still under pressure")
     return 1
@@ -2646,13 +3125,13 @@ def job_tokens(cmd: str) -> list:
     return out
 
 
-def _owners_ctx(titles: bool = True):
+def _owners_ctx(titles: bool = True, leases: list | None = None):
     import memmon_owners
     from memmon_runner import jobs
     ctx = memmon_owners.Context(
         sessions_dir=CLAUDE_SESSIONS_DIR, socks_dir=CC_SOCKS_DIR,
         codex_home=CODEX_HOME, jobs_dir=JOBS_DIR, roster_path=CLAUDE_ROSTER,
-        leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
+        leases=jobs(STATE_DIR) if leases is None else leases, rv_map=map_pids_to_jobs,
         lsof=lambda args: _sh(["lsof", *args], timeout=5))
     if titles:
         prof = load_profile()
@@ -2688,7 +3167,8 @@ def system_block(reader=None) -> dict:
     its reason, never a healthy-looking default."""
     import memmon_procs
     out = {"ram_bytes": None, "used_bytes": None, "pressure_level": None,
-           "score_level": None, "reason": None}
+           "score_level": None, "reason": None, "level_reason": None,
+           "rates": "unavailable", "rates_source": None}
     shared = []
 
     def vm_stat_once(cmd, **kw):
@@ -2703,14 +3183,68 @@ def system_block(reader=None) -> dict:
         out["reason"] = f"{type(exc).__name__}: {exc}"
     text = shared[0].stdout if shared and shared[0].returncode == 0 else None
     try:
-        out["score_level"] = pressure(read_vm(fast=True, vm_stat_text=text))["level"]
+        vm = read_vm(fast=True, vm_stat_text=text)
+        p = pressure(vm)
+        out.update(score_level=p["level"], level_reason=p.get("level_reason"),
+                   rates=p.get("rates", "unavailable"), rates_source=p.get("rates_source"))
+        if out["pressure_level"] is None:
+            out["kernel_level"] = vm.get("kernel_level")
     except Exception:
         pass
     return out
 
 
+def runner_snapshot(system: dict) -> dict:
+    """`memmon jobs --json` (schema 2), reusing the health card's strict read.
+    Display only: nothing here admits."""
+    try:
+        import memmon_runner
+        strict = ({k: system[k] for k in ("ram_bytes", "used_bytes", "pressure_level")}
+                  if system.get("used_bytes") is not None else None)
+        return memmon_runner.snapshot(STATE_DIR, system=strict)
+    except Exception as exc:
+        return {"reason": f"{type(exc).__name__}: {exc}"}
+
+
+def sampler_block(now: float | None = None) -> dict:
+    """When the sampler last ran and the last sampling gap it recorded. The
+    gap shows only once the next run discovers it; until then, age_s grows."""
+    rec = _read_row(PRESSURE_FILE) or {}
+    last = rec.get("ts")
+    age = (time.time() if now is None else now) - last if isinstance(
+        last, (int, float)) else None
+    return {"last_ts": last, "age_s": None if age is None else round(age, 1),
+            "stale": age is None or age > STALE_DISPLAY_S,
+            "last_gap": rec.get("last_gap"),
+            "last_starved_gap": rec.get("last_starved_gap")}
+
+
+def pressure_suggestions(sample, ctx, payload: dict, history=None) -> list:
+    """owners --json's suggestion rows, the only place their tokens exist.
+    S1's child-job rows are reused by job_id; the rest get S1-format tokens."""
+    import memmon_owners
+    import memmon_pressure as mp
+    s1_jobs = {j["job_id"]: j for o in payload["owners"] for j in o.get("jobs") or []
+               if j.get("kind") != "conversation"}
+    return mp.suggestions(
+        sample.inv, sample.part, mp.Classifier(ctx.classify, ctx.commands),
+        leases=ctx.leases, ram_bytes=(payload.get("system") or {}).get("ram_bytes"),
+        history=memmon_owners.read_json(JOB_HISTORY, {}) if history is None else history,
+        s1_jobs=s1_jobs, mint=True)
+
+
+def route_status() -> dict:
+    """memmon route's own status; "off" whenever it cannot be read."""
+    try:
+        import memmon_route
+        st = memmon_route.status(STATE_DIR)
+        return {"state": st.get("state", "off"), "line": st.get("line") or "Route off"}
+    except Exception:
+        return {"state": "off", "line": "Route off"}
+
+
 def protection_block(unmanaged: int) -> dict:
-    mode = os.environ.get("MEMMON_GATE", "block-critical")
+    mode = gate_mode()[0]
     if not gate_installed() or mode == "off":
         gate_state = "off"
     elif pause_until():
@@ -2719,8 +3253,16 @@ def protection_block(unmanaged: int) -> dict:
         gate_state = "on"
     summary = (gate_state if gate_state != "on"
                else "partial" if unmanaged else "on")
-    return {"summary": summary, "gate": gate_state, "route": "off",
+    return {"summary": summary, "gate": gate_state, "route": route_status()["state"],
             "unmanaged_heavy": unmanaged}
+
+
+def coverage_lines(protection: dict) -> list:
+    """Truthful coverage (S2.7). It never says "all apps"."""
+    n = protection.get("unmanaged_heavy") or 0
+    return [route_status()["line"],
+            f"{n} heavy process{'es' if n != 1 else ''} not started through memmon run",
+            "Codex, other apps and terminals are covered only when they call memmon run"]
 
 
 def owners_sample(cpu_window: float, source=None, ctx=None, sleep=time.sleep):
@@ -2755,7 +3297,10 @@ def owners_sample(cpu_window: float, source=None, ctx=None, sleep=time.sleep):
 def owners_json(cpu_window: float = 1.0, expand: list | None = None,
                 source=None, ctx=None, system_reader=None) -> dict:
     import memmon_owners
-    ctx = ctx or _owners_ctx()
+    system = system_block(system_reader)
+    runner = runner_snapshot(system)
+    # The partition and runner_jobs see the same v2 rows.
+    ctx = ctx or _owners_ctx(leases=runner.get("jobs"))
     sample, window = owners_sample(cpu_window, source, ctx)
     used_by = None
     if expand:
@@ -2770,7 +3315,7 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     hist = memmon_owners.read_json(OWNERS_HISTORY, {})
     payload = memmon_owners.owners_payload(
         sample, ctx, history=hist, cpu_window_s=window,
-        system=system_block(system_reader),
+        system=system,
         protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
         gate=gate_stats(), used_by=used_by)
     # A machine-wide CPU figure is only a sum when every member was measured;
@@ -2785,7 +3330,17 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     system["cpu_cores"] = round(sum(seen), 3) if complete else None
     if not seen:
         system["cpu_reason"] = sample.cpu_reason or "not measured"
-    payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
+    payload["runner_jobs"] = ctx.leases       # v2 rows, a strict superset of v1
+    payload["runner"] = {k: v for k, v in runner.items() if k != "jobs"}
+    payload["coverage"] = coverage_lines(payload["protection"])
+    import memmon_pressure
+    payload["under_pressure"] = memmon_pressure.under_pressure(
+        system.get("score_level"), system.get("rates"),
+        system.get("pressure_level") or system.get("kernel_level"))
+    payload["pressure_suggestions"] = (
+        pressure_suggestions(sample, ctx, payload)
+        if payload["under_pressure"] and suggestions_enabled() else [])
+    payload["sampler"] = sampler_block()
     return payload
 
 
@@ -2854,7 +3409,8 @@ def owners_sampler_tick(source=None, ctx=None, clock=None, mono=None) -> dict | 
                                           cov]
     mo.write_json_atomic(OWNERS_HISTORY, hist)
     mo.write_json_atomic(CPU_BASELINE, mo.make_baseline(inv, boot, awake))
-    return {"cpu": cpu, "baseline_problem": problem, "owners": len(part.owners)}
+    return {"cpu": cpu, "baseline_problem": problem, "owners": len(part.owners),
+            "inv": inv, "part": part}
 
 
 def owners_text(payload: dict) -> str:
@@ -2872,6 +3428,16 @@ def owners_text(payload: dict) -> str:
                  "memory from top, actions refused")
     L.append(f"system and other users: not itemised "
              f"({payload['hidden_process_count']} processes)")
+    rows = payload.get("pressure_suggestions") or []
+    if rows:
+        L.append("")
+        L.append("Under pressure — heavy work memmon run did not start "
+                 "(stop only with the user's say-so):")
+        for r in rows:
+            how = (f"memmon act {r['stop']} --target <token from owners --json>"
+                   if r.get("stop") else r.get("stop_note") or "no targeted stop")
+            L.append(f"  {suggestion_text(r)}")
+            L.append(f"      {how}")
     return "\n".join(L)
 
 
@@ -2954,16 +3520,417 @@ def reap_cli(argv: list, engine=None) -> int:
     return _apply_exit(out, args.apply)
 
 
+# --------------------------------------------------------------------- usage
+
+USAGE_CACHE = os.path.join(STATE_DIR, "runner", "coord", "usage-cache.json")
+ADMISSION_LOG = os.path.join(STATE_DIR, "runner", "coord", "admission-log.jsonl")
+USAGE_SECTIONS = ("claude", "codex", "browser", "dev", "app", "service", "other")
+# Names in a history row's `apps` that are not apps: a VM is a service, the
+# window server is the system.
+USAGE_VM_NAMES = {"Docker VM", "colima", "lima", "qemu", "Virtualization"}
+USAGE_SYSTEM_NAMES = {"WindowServer", "kernel_task", "launchd"}
+# What a malformed history, gate or admission row can raise; it is skipped.
+BAD_ROW = (TypeError, ValueError, AttributeError, OverflowError, OSError)
+_TS_RE = re.compile(r'"ts":\s*([0-9.]+)')
+
+
+def _day_rows(path: str, start: float):
+    """(ts, row) for every JSON line at or after `start`; a line older than
+    the window is skipped on its ts alone, without being parsed."""
+    try:
+        fh = open(path)
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            try:
+                m = _TS_RE.search(line, 0, 40)
+                if m and float(m.group(1)) < start:
+                    continue
+                row = json.loads(line)
+            except ValueError:
+                continue
+            ts = row.get("ts") if isinstance(row, dict) else None
+            if isinstance(ts, (int, float)) and ts >= start:
+                yield ts, row
+
+
+def usage_section(name: str) -> str:
+    """The section of one name in a history row's `apps`, decided by the
+    same bundle-id sets as the owner list (memmon_owners.category_of)."""
+    import memmon_common
+    import memmon_owners
+    if name in USAGE_VM_NAMES:
+        return "service"
+    if name in USAGE_SYSTEM_NAMES:
+        return "other"
+    bid = memmon_common.NAME_BUNDLE.get(name, "")
+    if bid in memmon_owners.GUI_VM_APPS:
+        return "service"
+    # Every other entry is an app: dev, browser or plain app, never "other".
+    return memmon_owners.category_of("app", "app:" + bid)
+
+
+def _row_sections(row: dict) -> dict | None:
+    """One history row's memory by section. sessions and the Claude runtime
+    pool (overhead) are claude; `apps` names go by usage_section(); worktree
+    builds are other. Codex has no field in a history row, so the caller
+    reports it as not recorded (null), never zero. Orphans are left out:
+    they are mostly the same processes as the worktree builds."""
+    if "sessions" not in row:
+        return None                                  # a partial row
+    if not isinstance(row["sessions"], dict):
+        raise TypeError("sessions is not an object")
+    out = dict.fromkeys(USAGE_SECTIONS, 0)
+    out["claude"] = sum(v for v in row["sessions"].values() if isinstance(v, (int, float)))
+    out["claude"] += row.get("overhead") or 0
+    for name, mem in (row.get("apps") or {}).items():          # a list raises
+        if isinstance(mem, (int, float)):
+            out[usage_section(name)] += mem
+    out["other"] += sum(v for v in (row.get("worktrees") or {}).values()
+                        if isinstance(v, (int, float)))
+    return out
+
+
+def _usage_inputs() -> list:
+    sig = []
+    for path in (HISTORY, GATE_LOG, ADMISSION_LOG):
+        try:
+            st = os.stat(path)
+            sig.append([path, st.st_size, st.st_mtime_ns])
+        except OSError:
+            sig.append([path, None, None])
+    return sig
+
+
+def usage(days: int = 7, now: float | None = None) -> dict:
+    """`memmon usage --json`: one entry per local day, oldest first, from
+    history.jsonl, gate.jsonl and the runner's admission log only. A day
+    without samples is empty (samples 0, nulls), never interpolated."""
+    now = time.time() if now is None else now
+    today = time.localtime(now)
+    start_day = time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1),
+                             0, 0, 0, 0, 0, -1))
+    dates = [time.strftime("%Y-%m-%d", time.localtime(
+        time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1) + i,
+                     12, 0, 0, 0, 0, -1)))) for i in range(days)]
+    # v changes whenever the mapping does, so an old cache is never served.
+    key = {"v": 3, "days": days, "dates": dates, "inputs": _usage_inputs()}
+    ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    cached = _read_row(USAGE_CACHE)
+    if cached and cached.get("key") == key:
+        return cached["value"]
+
+    def day_of(ts):
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+    acc = {d: {"samples": 0, "mem_n": 0, "mem_sum": 0, "mem_peak": None,
+               "mem_estimated": False, "sec_n": 0,
+               "sec": dict.fromkeys(USAGE_SECTIONS, 0), "warned": 0, "stopped": 0,
+               "held": set()} for d in dates}
+    first = last = None
+    for ts, row in _day_rows(HISTORY, start_day):
+        # A malformed row is skipped whole, before anything of it is counted.
+        try:
+            a = acc.get(day_of(ts))
+            sec = _row_sections(row)
+        except BAD_ROW:
+            continue
+        if a is None:
+            continue
+        first = ts if first is None else min(first, ts)
+        last = ts if last is None else max(last, ts)
+        a["samples"] += 1
+        # The strict "used" where the sampler recorded it (S2 rows). A v1 row
+        # has only top's ram_used, which counts file cache and sits near RAM,
+        # so it is never used: its kernel free_pct gives an estimate instead.
+        mem = row.get("used_bytes")
+        if not (isinstance(mem, (int, float)) and mem > 0):
+            free = row.get("free_pct")
+            mem = (int(ram * (1 - free / 100.0))
+                   if isinstance(free, (int, float)) and 0 <= free <= 100 else None)
+            if mem is not None:
+                a["mem_estimated"] = True
+        if isinstance(mem, (int, float)) and mem > 0:
+            a["mem_n"] += 1
+            a["mem_sum"] += mem
+            a["mem_peak"] = mem if a["mem_peak"] is None else max(a["mem_peak"], mem)
+        if sec is not None:
+            a["sec_n"] += 1
+            for k, v in sec.items():
+                a["sec"][k] += v
+    for ts, row in _day_rows(GATE_LOG, start_day):
+        try:
+            a = acc.get(day_of(ts))
+        except BAD_ROW:
+            continue
+        if a is not None and row.get("action") == "warn":
+            a["warned"] += 1
+        elif a is not None and row.get("action") == "block":
+            a["stopped"] += 1
+    # Holds are recorded per run in the admission log, which is trimmed: a
+    # day before its first row is not recorded. Policy cancels are not logged.
+    log_first = None
+    for ts, row in _day_rows(ADMISSION_LOG, start_day):
+        try:
+            a = acc.get(day_of(ts))
+            run = row.get("run_id")
+            if a is not None and row.get("decision") == "hold" and run:
+                if not isinstance(run, str):
+                    raise TypeError("run_id is not a string")
+                a["held"].add(run)
+        except BAD_ROW:
+            continue
+        log_first = ts if log_first is None else min(log_first, ts)
+    log_from = day_of(log_first) if log_first is not None else None
+    series = []
+    for d in dates:
+        a = acc[d]
+        series.append({
+            "date": d, "samples": a["samples"],
+            "mem_peak_bytes": a["mem_peak"],
+            "mem_avg_bytes": a["mem_sum"] // a["mem_n"] if a["mem_n"] else None,
+            "mem_basis": (None if not a["mem_n"] else
+                          "estimated" if a["mem_estimated"] else "measured"),
+            "by_section": ({k: (None if k == "codex" else v // a["sec_n"])
+                            for k, v in a["sec"].items()} if a["sec_n"] else None),
+            "gate": {"warned": a["warned"], "stopped": a["stopped"]},
+            "runner": {"held": len(a["held"]) if log_from is not None and d >= log_from
+                       else None, "cancelled": None}})
+    value = {"schema_version": 1, "days": days,
+             "ram_bytes": ram,
+             "series": series,
+             "coverage": {"from_ts": first, "to_ts": last,
+                          "complete": first is not None and first < start_day + 3600
+                          and all(e["samples"] for e in series)}}
+    try:
+        import memmon_owners
+        memmon_owners.write_json_atomic(USAGE_CACHE, {"key": key, "value": value})
+    except Exception:
+        pass
+    return value
+
+
+def usage_cli(argv: list) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="memmon usage")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--days", type=int, default=7)
+    args = ap.parse_args(argv)
+    out = usage(max(1, min(args.days, 31)))
+    if args.json:
+        print(json.dumps(out))
+        return 0
+    for e in out["series"]:
+        peak = human(e["mem_peak_bytes"]) if e["mem_peak_bytes"] is not None else "—"
+        print(f"{e['date']}  peak {peak:>7}  {e['samples']:>5} samples  "
+              f"warned {e['gate']['warned']}  stopped {e['gate']['stopped']}")
+    return 0
+
+
+# ------------------------------------------------------------------ settings
+
+BOOL_SETTINGS = ("auto_cancel_interruptible", "pressure_suggestions", "notifications")
+SETTING_KEYS = ("gate_mode", "runner_mode", *BOOL_SETTINGS)
+ENV_WARNING = "MEMMON_GATE in the hook environment overrides this setting"
+
+
+def _runner_settings() -> dict:
+    import memmon_runner
+    return memmon_runner.get_settings(STATE_DIR)
+
+
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+
+
+def _hook_env_gate() -> str | None:
+    """MEMMON_GATE from Claude Code's settings.json env block: the hook's
+    environment, which a terminal or MemmonBar does not share. Read only."""
+    try:
+        with open(CLAUDE_SETTINGS) as fh:
+            env = (json.load(fh) or {}).get("env") or {}
+        value = env.get("MEMMON_GATE")
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _last_gate_row() -> dict | None:
+    """The newest gate.jsonl row that records its mode."""
+    try:
+        with open(GATE_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 16384))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("mode"):
+            return row
+    return None
+
+
+def effective_gate_mode() -> tuple:
+    """The gate mode as the hook sees it. This process's own environment is
+    not the hook's, so settings also reads the hook env from settings.json and
+    the mode the gate last recorded: a gate row whose mode came from its
+    environment means MEMMON_GATE is set there. A row from before the gate
+    recorded its source counts only when no config value explains it."""
+    mode, source = gate_mode()
+    if source == "env":
+        return mode, source
+    hook = _hook_env_gate()
+    if hook is not None:
+        return hook, "env"
+    row = _last_gate_row()
+    if row is not None:
+        recorded = row.get("mode_source")
+        if recorded == "env":
+            return row["mode"], "env"
+        if recorded is None and source == "default" and row["mode"] != mode:
+            return row["mode"], "env"
+    return mode, source
+
+
+def settings_payload() -> dict:
+    mode, source = effective_gate_mode()
+    paused = pause_until()
+    out = {"schema_version": 1,
+           "gate_mode": {"value": mode, "source": source, "choices": list(GATE_MODES)},
+           "paused_until": None if not paused else "forever" if paused == float("inf")
+           else paused,
+           **_runner_settings(),
+           "pressure_suggestions": suggestions_enabled(),
+           "notifications": CONFIG.get("notifications", True) is not False,
+           "state_dir": os.path.abspath(STATE_DIR)}
+    if source == "env":
+        out["warning"] = ENV_WARNING
+    return out
+
+
+def _update_config(key: str, value) -> None:
+    """Change one key of config.json atomically and keep every other key.
+    Raises ValueError for a config.json that does not parse: rewriting it
+    would discard what the user wrote."""
+    import fcntl
+    import memmon_owners
+    path = os.path.join(STATE_DIR, "config.json")
+    lock = os.path.join(STATE_DIR, "runner", "coord", "config.lock")
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        # Two sets of different keys must not lose one another's change.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            with open(path) as fh:
+                cfg = json.load(fh)
+        except FileNotFoundError:
+            cfg = {}
+        except ValueError:
+            raise ValueError("config.json is not valid JSON; fix or remove it first")
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json is not a JSON object; fix or remove it first")
+        cfg[key] = value
+        memmon_owners.write_json_atomic(path, cfg)
+    finally:
+        os.close(fd)
+    CONFIG[key] = value
+
+
+def settings_set(key: str, raw: str) -> dict:
+    """Apply one allowlisted setting. Raises KeyError for an unknown key and
+    ValueError for a bad value. Never touches ~/.claude/settings.json."""
+    import memmon_runner
+    if key not in SETTING_KEYS:
+        raise KeyError(key)
+    if key == "gate_mode":
+        if raw not in GATE_MODES:
+            raise ValueError(f"gate_mode must be one of {', '.join(GATE_MODES)}")
+        _update_config("gate_mode", raw)
+    elif key == "runner_mode":
+        if raw not in memmon_runner.MODES:
+            raise ValueError(f"runner_mode must be one of {', '.join(memmon_runner.MODES)}")
+        memmon_runner.write_mode(STATE_DIR, raw)
+    else:
+        if raw not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false")
+        value = raw == "true"
+        if key == "auto_cancel_interruptible":
+            memmon_runner.set_auto_cancel(STATE_DIR, value)
+        else:
+            _update_config(key, value)
+    return settings_payload()
+
+
+def settings_cli(argv: list) -> int:
+    """memmon settings [--json] | memmon settings set KEY VALUE.
+    Exit 0 with the settings JSON, or 2 with {"error", "key"}."""
+    import memmon_runner
+    if argv[:1] == ["set"]:
+        if len(argv) != 3:
+            print(json.dumps({"error": "usage: memmon settings set KEY VALUE",
+                              "key": argv[1] if len(argv) > 1 else None}))
+            return 2
+        try:
+            out = settings_set(argv[1], argv[2])
+        except KeyError:
+            print(json.dumps({"error": f"unknown setting; one of {', '.join(SETTING_KEYS)}",
+                              "key": argv[1]}))
+            return 2
+        except (ValueError, TypeError) as exc:      # the runner's own refusals too
+            print(json.dumps({"error": str(exc), "key": argv[1]}))
+            return 2
+        except OSError as exc:
+            print(json.dumps({"error": f"could not write the setting: {exc}",
+                              "key": argv[1]}))
+            return 2
+        except memmon_runner.LedgerTimeout:
+            # runner.json is written under ledger.lock, which admission holds.
+            print(json.dumps({"error": "runner busy, try again", "key": argv[1]}))
+            return 2
+        print(json.dumps(out))
+        return 0
+    if argv and argv != ["--json"]:
+        print(json.dumps({"error": "usage: memmon settings [--json] | "
+                                   "memmon settings set KEY VALUE", "key": None}))
+        return 2
+    out = settings_payload()
+    if argv == ["--json"]:
+        print(json.dumps(out))
+        return 0
+    g = out["gate_mode"]
+    print(f"gate_mode                  {g['value']} ({g['source']})"
+          + (f"  — {out['warning']}" if out.get("warning") else ""))
+    p = out["paused_until"]
+    print(f"paused_until               {'not paused' if p is None else p}")
+    for k in ("runner_mode", *BOOL_SETTINGS):
+        v = out[k]
+        print(f"{k:<27}{str(v).lower() if isinstance(v, bool) else v}")
+    print(f"state_dir                  {out['state_dir']}")
+    return 0
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
     # Dispatch before scanning flags: a wrapped command may itself use --gate.
-    if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs", "run-mode"):
         from memmon_runner import cli
         return cli(sys.argv[1:], STATE_DIR, lambda: pressure(read_vm(fast=True)))
-    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap"):
-        return {"owners": owners_cli, "act": act_cli,
-                "reap": reap_cli}[sys.argv[1]](sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] in ("route", "route-classify"):
+        import memmon_route
+        return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
+                                split=shell_commands)
+    if len(sys.argv) > 1 and sys.argv[1] == "explain":
+        import memmon_explain
+        return memmon_explain.cli(sys.argv[2:], lambda: owners_json(cpu_window=1.0),
+                                  lambda: (lambda vm: (vm, pressure(vm)))(read_vm(fast=True)))
+    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap", "settings", "usage"):
+        return {"owners": owners_cli, "act": act_cli, "reap": reap_cli,
+                "settings": settings_cli, "usage": usage_cli}[sys.argv[1]](sys.argv[2:])
     # Short-circuit before the parser exists: gate() runs on every Bash tool call
     # and has no use for 24 argument definitions.
     if "--gate" in sys.argv:
@@ -3069,7 +4036,8 @@ def main() -> int:
             print("Nothing outstanding in the last "
                   f"{PENDING_TTL_S // 3600} hours — no command is waiting to be re-run.")
             return 0
-        lvl = pressure(read_vm(fast=True))["level"]
+        cur = pressure(read_vm(fast=True))
+        lvl = cur["level"]
         print(f"{len(pend)} command(s) blocked and not yet re-run:\n")
         for b in pend:
             print(f"  {time.strftime('%H:%M', time.localtime(b['ts']))}  "
@@ -3080,8 +4048,9 @@ def main() -> int:
                 print(f"        in {b['cwd']}")
         print()
         print(f"current pressure: {lvl}  — "
-              + ("safe to re-run these now" if lvl in ("HEALTHY", "WATCH")
-                 else "still under pressure, wait"))
+              + ("safe to re-run these now" if lvl in ("HEALTHY", "WATCH") else
+                 f"not known yet ({cur.get('level_reason')}); check again in a "
+                 "minute" if lvl == "UNKNOWN" else "still under pressure, wait"))
         return 0
     if args.profile:
         prof = load_profile()
@@ -3160,9 +4129,11 @@ def main() -> int:
         room = p.get("headroom_min")
         print(f"{p['level']}  score={p['score']}  "
               f"{' · '.join(p['reasons']) or 'no pressure signals'}"
+              + (f"  ({p['level_reason']})" if p.get("level_reason") else "")
               + (f"  ~{room:.0f} min headroom" if room is not None and room < 120
                  else ""))
-        return 0 if p["level"] in ("HEALTHY", "WATCH") else 1
+        # UNKNOWN exits 0, as the gate allows on it: fail-open.
+        return 0 if p["level"] in ("HEALTHY", "WATCH", "UNKNOWN") else 1
     if args.report:
         print(report(args.days))
         return 0
@@ -3174,32 +4145,20 @@ def main() -> int:
         try:
             with open(SNAPSHOT) as fh:
                 r = json.load(fh)
-            if time.time() - r["ts"] < 120:
-                level = r.get("pressure", "HEALTHY")
-                out = f"{LEVEL_ICON.get(level, '')} {human(r['swap_used'])} swap"
-                if level != "HEALTHY":
-                    out += f" · {level}"
-                if r.get("orphan", 0) > GB:
-                    out += f" · {human(r['orphan'])} reclaimable"
-                print(out)
-                return 0
+            print(cached_statusline(r, time.time()))
+            return 0
         except Exception:
             pass
         print(statusline(collect()))
         return 0
 
+    if args.log:
+        return sampler_run()
+
     snap = collect()
 
     if args.json:
         print(json.dumps({**snap, "schema_version": 2}, indent=1))
-        return 0
-    if args.log:
-        log_sample(snap)
-        try:
-            owners_sampler_tick()
-        except Exception as exc:
-            print(f"owners sample failed: {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
         return 0
     if args.reap or args.reap_spares:
         text, out = (reap_report if args.reap else reap_spares_report)(snap, args.apply)

@@ -1,0 +1,179 @@
+{
+ "_base": "overview.json",
+ "_usage": {
+  "schema_version": 1,
+  "days": 7,
+  "ram_bytes": 51539607552,
+  "series": [
+   {
+    "date": "2026-10-02",
+    "samples": 1440,
+    "mem_peak_bytes": 36721970380,
+    "mem_avg_bytes": 28024661606,
+    "by_section": {
+     "claude": 9771050598,
+     "codex": 1932735283,
+     "browser": 3435973836,
+     "app": 4724464025,
+     "service": 7408818585,
+     "other": 1181116006
+    },
+    "gate": {
+     "warned": 1,
+     "stopped": 0
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "estimated"
+   },
+   {
+    "date": "2026-10-03",
+    "samples": 1440,
+    "mem_peak_bytes": 41768556953,
+    "mem_avg_bytes": 31568009625,
+    "by_section": {
+     "claude": 12240656793,
+     "codex": 2791728742,
+     "browser": 3758096384,
+     "app": 4402341478,
+     "service": 7730941132,
+     "other": 1073741824
+    },
+    "gate": {
+     "warned": 3,
+     "stopped": 1
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "estimated"
+   },
+   {
+    "date": "2026-10-04",
+    "samples": 1440,
+    "mem_peak_bytes": 44775034060,
+    "mem_avg_bytes": 33285996544,
+    "by_section": {
+     "claude": 13743895347,
+     "codex": 3328599654,
+     "browser": 3221225472,
+     "app": 4939212390,
+     "service": 7516192768,
+     "other": 1288490188
+    },
+    "gate": {
+     "warned": 5,
+     "stopped": 2
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "estimated"
+   },
+   {
+    "date": "2026-10-05",
+    "samples": 1440,
+    "mem_peak_bytes": 38654705664,
+    "mem_avg_bytes": 29527900160,
+    "by_section": {
+     "claude": 8804682956,
+     "codex": 1288490188,
+     "browser": 4187593113,
+     "app": 5368709120,
+     "service": 7945689497,
+     "other": 966367641
+    },
+    "gate": {
+     "warned": 0,
+     "stopped": 0
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "measured"
+   },
+   {
+    "date": "2026-10-06",
+    "samples": 1440,
+    "mem_peak_bytes": 47352014438,
+    "mem_avg_bytes": 36292473651,
+    "by_section": {
+     "claude": 15569256448,
+     "codex": 4080218931,
+     "browser": 3650722201,
+     "app": 4509715660,
+     "service": 7516192768,
+     "other": 1395864371
+    },
+    "gate": {
+     "warned": 4,
+     "stopped": 3
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "measured"
+   },
+   {
+    "date": "2026-10-07",
+    "samples": 1440,
+    "mem_peak_bytes": 42412802048,
+    "mem_avg_bytes": 32427003084,
+    "by_section": {
+     "claude": 11703785881,
+     "codex": 2362232012,
+     "browser": 3865470566,
+     "app": 4831838208,
+     "service": 7838315315,
+     "other": 1181116006
+    },
+    "gate": {
+     "warned": 2,
+     "stopped": 0
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "measured"
+   },
+   {
+    "date": "2026-10-08",
+    "samples": 1440,
+    "mem_peak_bytes": 44238163148,
+    "mem_avg_bytes": 33178622361,
+    "by_section": {
+     "claude": 12455405158,
+     "codex": 2254857830,
+     "browser": 3543348019,
+     "app": 5583457484,
+     "service": 7301444403,
+     "other": 1503238553
+    },
+    "gate": {
+     "warned": 1,
+     "stopped": 1
+    },
+    "runner": {
+     "held": null,
+     "cancelled": null
+    },
+    "mem_basis": "measured"
+   }
+  ],
+  "coverage": {
+   "from_ts": 1790845200,
+   "to_ts": 1791450000,
+   "complete": true
+  }
+ },
+ "_view": {
+  "usage": "memory"
+ }
+}

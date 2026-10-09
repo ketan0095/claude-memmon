@@ -1,4 +1,7 @@
-"""Process-level regression tests; isolated state, no real builds or settings."""
+"""Process-level regression tests; isolated state, no real builds or settings.
+
+These are the v1 runner tests, pinned to paused mode: S2's compatibility
+control (B14). Protect-mode behaviour lives in test_admission.py."""
 
 import fcntl
 import json
@@ -19,12 +22,14 @@ class RunnerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.procs = []
+        self.saved_mode, runner.DEFAULT_MODE = runner.DEFAULT_MODE, "paused"
 
     def tearDown(self):
         for proc in self.procs:
             if proc.poll() is None:
                 proc.terminate()
             proc.communicate(timeout=8)
+        runner.DEFAULT_MODE = self.saved_mode
         self.tmp.cleanup()
 
     def launch(self, code="pass", args=(), **kwargs):
@@ -120,7 +125,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(out, "cleared\n")
 
     def test_unknown_or_failed_pressure_never_starts(self):
-        self.finish(self.launch(levels=["UNKNOWN"], timeout=0), 124)
+        # Paused is v1 exactly, where UNKNOWN (no rate baseline) counts as
+        # WATCH and admits (S2.10); protect holds on it (test_admission).
+        out, _ = self.finish(self.launch("print('ran')", levels=["UNKNOWN"], timeout=0))
+        self.assertEqual(out, "ran\n")
         out, _ = self.finish(self.launch("print('must-not-run')", levels=[None]), 125)
         self.assertEqual(out, "")
 
@@ -175,6 +183,7 @@ class RunnerTests(unittest.TestCase):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--worker"]:
         payload = json.loads(sys.argv[2])
+        runner.DEFAULT_MODE = "paused"
         levels = payload.pop("levels", ["HEALTHY"])
 
         def pressure():

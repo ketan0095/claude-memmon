@@ -1,0 +1,14 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "explain": {
+   "exit": 0,
+   "stdout": {
+    "mode": "quiet",
+    "title": "Nothing to do",
+    "chars_sent": 0,
+    "text": "Memory pressure is normal and nothing stands out this week."
+   }
+  }
+ }
+}

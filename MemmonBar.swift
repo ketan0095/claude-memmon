@@ -15,6 +15,7 @@
 
 import Cocoa
 import SwiftUI
+import UserNotifications
 
 // MARK: - units
 
@@ -124,14 +125,25 @@ enum P {
     static let sectionService = token(rgb(0xca8a04), rgb(0xfacc15))
     static let sectionBackground = token(rgb(0x94a3b8), rgb(0x8391a7))
 
-    /// An unknown level is muted, never green: a missing reading is not health.
     static func tint(_ level: String?) -> Color {
-        switch level {
-        case "CRITICAL", "DANGER": return red
-        case "WATCH": return amber
-        case "HEALTHY": return green
-        default: return muted
+        switch levelTone(level) {
+        case .red: return red
+        case .amber: return amber
+        case .green: return green
+        case .muted: return muted
         }
+    }
+}
+
+/// A level's colour role. UNKNOWN, or no level at all, is muted, never
+/// green: a missing reading is not health.
+enum Tone: String { case red, amber, green, muted }
+func levelTone(_ level: String?) -> Tone {
+    switch level {
+    case "CRITICAL", "DANGER": return .red
+    case "WATCH": return .amber
+    case "HEALTHY": return .green
+    default: return .muted
     }
 }
 
@@ -282,10 +294,183 @@ struct GateStats {
 
 // MARK: - owners model (memmon owners --json, schema 2)
 
-/// A `memmon run` lease, waiting or running; the same shape as legacy --json jobs.
+/// A `memmon run` job, as `memmon jobs --json` lists it. Schema 1 rows carry
+/// only the first six fields; every schema 2 field is nil on them, and the
+/// card then says what S1 said.
 struct ManagedJob: Identifiable {
     var id: String, resource: String, label: String, state: String, reason: String
     var elapsed: Int
+    var reservation: Double? = nil, footprint: Double? = nil
+    var estimateBytes: Double? = nil, estimateConfidence: String? = nil, estimateSamples: Int? = nil
+    var queuePosition: Int? = nil, deadlineTs: Double? = nil
+    var interventionCause: String? = nil, interventionSince: Double? = nil
+    var stateChangedTs: Double? = nil, endedBy: String? = nil
+    var interruptible = false
+    var wrapperPid: Int? = nil, childPid: Int? = nil
+
+    static func decode(_ d: [String: Any]) -> ManagedJob {
+        var j = ManagedJob(id: str(d["id"]) ?? UUID().uuidString, resource: str(d["resource"]) ?? "heavy",
+                           label: str(d["label"]) ?? "command", state: str(d["state"]) ?? "unknown",
+                           reason: str(d["reason"]) ?? "", elapsed: int(d["elapsed_seconds"]) ?? 0)
+        j.reservation = num(d["reservation_bytes"]); j.footprint = num(d["footprint_bytes"])
+        if let e = d["estimate"] as? [String: Any] {
+            j.estimateBytes = num(e["bytes"]); j.estimateConfidence = str(e["confidence"])
+            j.estimateSamples = int(e["samples"])
+        }
+        j.queuePosition = int(d["queue_position"]); j.deadlineTs = num(d["deadline_ts"])
+        if let i = d["intervention"] as? [String: Any] {
+            j.interventionCause = str(i["cause"]); j.interventionSince = num(i["since_ts"])
+        }
+        j.stateChangedTs = num(d["state_changed_ts"]); j.endedBy = str(d["ended_by"])
+        j.interruptible = d["interruptible"] as? Bool ?? false
+        j.wrapperPid = int(d["wrapper_pid"]); j.childPid = int(d["child_pid"])
+        return j
+    }
+
+    var waiting: Bool { state == "waiting" }
+    var needsIntervention: Bool { state == "intervention_needed" }
+    var ended: Bool { ["done", "gave_up", "cancelled_by_policy", "stopped_by_user"].contains(state) }
+
+    /// Display order: what needs a person first, then what runs, then the
+    /// queue in ticket order, then records that are about to go.
+    var rank: (Int, Int) {
+        if needsIntervention { return (0, 0) }
+        if waiting { return (2, queuePosition ?? Int.max) }
+        if ended { return (3, 0) }
+        return (1, 0)
+    }
+
+    var stateWord: String {
+        switch state {
+        case "running": return "Running"
+        case "waiting": return "Waiting"
+        case "starting": return "Starting"
+        case "intervention_needed": return "Intervention needed"
+        case "cancelling": return "Cancelling"
+        case "detached": return "Detached"
+        case "done": return "Done"
+        case "gave_up": return "Gave up"
+        case "cancelled_by_policy": return "Cancelled by policy"
+        case "stopped_by_user": return "Stopped"
+        default: return state.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+}
+
+/// memmon's committed-memory budget (S2.2): used plus reserved-but-unused,
+/// against a limit that keeps a headroom fraction of RAM free.
+struct Committed {
+    var used: Double?, slack: Double?, limit: Double?, free: Double?, ram: Double?
+    var headroomFrac: Double?
+    var over: Bool?
+    var reason: String?
+    var committed: Double? { used.flatMap { u in slack.map { u + $0 } } }
+}
+
+struct RunnerState {
+    var mode: String?, modeWarning: String?
+    var committed: Committed?
+    var admissionOpen: Bool?, admissionReason: String?
+    var recoveryRemaining: Double?, hysteresis: Double?
+    var queueLength: Int?, queueMax: Int?
+
+    static let modes = ["protect", "observe", "paused"]
+
+    static func decode(_ r: [String: Any]) -> RunnerState {
+        var s = RunnerState(mode: str(r["mode"]), modeWarning: str(r["mode_warning"]))
+        if let c = r["committed"] as? [String: Any] {
+            s.committed = Committed(used: num(c["used"]), slack: num(c["slack"]), limit: num(c["limit"]),
+                                    free: num(c["free"]), ram: num(c["ram"]),
+                                    headroomFrac: num(c["headroom_frac"]), over: c["over"] as? Bool,
+                                    reason: str(c["reason"]))
+        }
+        if let a = r["admission"] as? [String: Any] {
+            s.admissionOpen = a["open"] as? Bool; s.admissionReason = str(a["reason"])
+            s.recoveryRemaining = num(a["recovery_remaining_s"]); s.hysteresis = num(a["hysteresis_s"])
+        }
+        if let q = r["queue"] as? [String: Any] { s.queueLength = int(q["length"]); s.queueMax = int(q["max"]) }
+        return s
+    }
+
+    /// New heavy work is held for everyone, not just for one job's budget.
+    /// Only protect mode holds; observe and paused admit as v1 does.
+    var hold: String? {
+        guard mode == nil || mode == "protect", admissionOpen == false,
+              let reason = admissionReason else { return nil }
+        if reason.hasPrefix("holding for recovery") { return "recovery" }
+        if reason.hasPrefix("telemetry unavailable") { return "telemetry" }
+        return nil
+    }
+}
+
+/// A sampling gap the sampler found on its next run (S2.10).
+struct SamplingGap {
+    var cause: String
+    var awake: Double?, asleep: Double?
+    var fromTs: Double?, toTs: Double?
+}
+
+struct SamplerInfo {
+    var lastTs: Double?, age: Double?, stale: Bool?
+    var lastGap: SamplingGap?
+    /// The last starved gap, which a later ordinary sleep gap does not
+    /// overwrite. `nil` inside `.some` means the payload says there is none;
+    /// an outer nil is an older payload that only has last_gap.
+    var lastStarvedGap: SamplingGap??
+
+    /// What the 24 h notice reads.
+    var noticeGap: SamplingGap? { lastStarvedGap ?? lastGap }
+}
+
+/// One unmanaged heavy job worth stopping under pressure (S2.11). Its token
+/// exists only in the owners payload it arrived in.
+struct Suggestion: Identifiable {
+    var id: String
+    var ownerId: String
+    var kind: String
+    var task: String, place: String?, label: String
+    var footprint: Double?
+    var growthMBMin: Double?, idle: Double?, age: Double?
+    var historyReason: String?
+    var stop: String?, stopNote: String?
+    var token: String?
+
+    static func decode(_ d: [String: Any]) -> Suggestion? {
+        guard let id = str(d["job_id"]) else { return nil }
+        let task = str(d["task"]) ?? str(d["label"]) ?? "job"
+        return Suggestion(id: id, ownerId: str(d["owner_id"]) ?? "", kind: str(d["kind"]) ?? "other",
+                          task: task, place: str(d["place"]), label: str(d["label"]) ?? task,
+                          footprint: num(d["footprint"]), growthMBMin: num(d["growth_mb_min"]),
+                          idle: num(d["idle_s"]), age: num(d["age_s"]),
+                          historyReason: str(d["history_reason"]),
+                          stop: str(d["stop"]), stopNote: str(d["stop_note"]), token: str(d["token"]))
+    }
+
+    /// "vitest · acme-web".
+    var title: String { place.map { "\(task) · \($0)" } ?? task }
+
+    /// The S1 job row this stop is, so the confirm and its labels are S1's.
+    var asJob: OwnerJob {
+        OwnerJob(id: id, kind: kind, label: task, footprint: footprint, memberCount: nil,
+                 token: token, action: stop, place: place)
+    }
+
+    /// Size first, then the evidence; missing history uses S1's own words.
+    var evidence: String {
+        var parts = [footprint.map(gb) ?? "— not measured"]
+        guard let g = growthMBMin else {
+            parts.append(historyReason ?? "not enough history")
+            return parts.joined(separator: " · ")
+        }
+        if g >= 1 { parts.append(String(format: "growing %.0f MB/min", g)) }
+        if g <= -1 { parts.append(String(format: "shrinking %.0f MB/min", -g)) }
+        if let idle, idle >= 600 {
+            parts.append("idle for \(ageText(idle))")
+        } else if let age {
+            parts.append("running \(ageText(age))")
+        }
+        return parts.joined(separator: " · ")
+    }
 }
 
 struct SystemInfo {
@@ -293,6 +478,11 @@ struct SystemInfo {
     /// What "free" holds: pages nothing uses now, and file cache macOS reclaims.
     var idleBytes: Double? = nil, cacheBytes: Double? = nil
     var pressureLevel: String?, scoreLevel: String?
+    /// Why the level is UNKNOWN or only a lower bound, and whether rates were read.
+    var levelReason: String? = nil, rates: String? = nil
+    /// The kernel's own level when the strict read failed (pressure_level null).
+    var kernelLevel: String? = nil
+    var kernel: String? { pressureLevel ?? kernelLevel }
     var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
     /// Why nothing was measured; set only when cpu_coverage is null.
     var cpuReason: String?
@@ -309,6 +499,8 @@ struct OwnerJob: Identifiable {
     var kind: String, label: String
     var footprint: Double?, memberCount: Int?
     var token: String?, action: String?
+    /// Where an Under pressure job runs (its project or worktree).
+    var place: String? = nil
 
     var isConversation: Bool { kind == "conversation" }
     var rootPid: String? { id.split(separator: ".").first.map(String.init) }
@@ -493,6 +685,16 @@ struct OwnersSnap {
     /// No gate object at all: its state is unknown, which is not "not installed".
     var gateMissing = false
     var runnerJobs: [ManagedJob] = []
+    /// The runner's mode, budget and admission state; nil from a payload
+    /// without them, which then shows the S1 card.
+    var runner: RunnerState?
+    var sampler: SamplerInfo?
+    /// memmon's under_pressure predicate; nil from an older payload.
+    var underPressure: Bool?
+    var suggestions: [Suggestion] = []
+    /// What memmon covers, in its own words: the route line first, then the
+    /// work outside memmon run. Older payloads carry only protection.route.
+    var coverage: [String] = []
     var owners: [Owner] = []
 
     var degraded: Bool { inventory == "degraded" }
@@ -511,11 +713,29 @@ struct OwnersSnap {
         s.inventory = str(j["inventory"]); s.cpuWindow = num(j["cpu_window_s"])
         s.inventoryReason = str(j["inventory_reason"]); s.hiddenProcesses = int(j["hidden_process_count"])
         s.unattributed = j["unattributed"] as? [String: Any]
-        s.runnerJobs = (j["runner_jobs"] as? [[String: Any]] ?? []).map { d in
-            ManagedJob(id: str(d["id"]) ?? UUID().uuidString, resource: str(d["resource"]) ?? "heavy",
-                       label: str(d["label"]) ?? "command", state: str(d["state"]) ?? "unknown",
-                       reason: str(d["reason"]) ?? "", elapsed: int(d["elapsed_seconds"]) ?? 0)
+        let runner = j["runner"] as? [String: Any]
+        let jobRows = j["runner_jobs"] as? [[String: Any]] ?? runner?["jobs"] as? [[String: Any]] ?? []
+        s.runnerJobs = jobRows.map(ManagedJob.decode)
+        var r = runner ?? [:]
+        for (k, top) in [("mode", "runner_mode"), ("committed", "committed"), ("admission", "admission")]
+            where r[k] == nil { r[k] = j[top] }
+        if r["mode"] != nil || r["committed"] != nil || r["admission"] != nil {
+            s.runner = RunnerState.decode(r)
         }
+        if let y = j["sampler"] as? [String: Any] {
+            var info = SamplerInfo(lastTs: num(y["last_ts"]), age: num(y["age_s"]), stale: y["stale"] as? Bool)
+            func gap(_ v: Any?) -> SamplingGap? {
+                guard let g = v as? [String: Any], let cause = str(g["cause"]) else { return nil }
+                return SamplingGap(cause: cause, awake: num(g["awake_s"]), asleep: num(g["asleep_s"]),
+                                   fromTs: num(g["from_ts"]), toTs: num(g["to_ts"]))
+            }
+            info.lastGap = gap(y["last_gap"])
+            if y.keys.contains("last_starved_gap") { info.lastStarvedGap = .some(gap(y["last_starved_gap"])) }
+            s.sampler = info
+        }
+        s.underPressure = j["under_pressure"] as? Bool
+        s.coverage = strs(j["coverage"]) ?? []
+        s.suggestions = (j["pressure_suggestions"] as? [[String: Any]] ?? []).compactMap(Suggestion.decode)
         if let y = j["system"] as? [String: Any] {
             s.system = SystemInfo(ramBytes: num(y["ram_bytes"]), usedBytes: num(y["used_bytes"]),
                                   pressureLevel: str(y["pressure_level"]),
@@ -524,6 +744,8 @@ struct OwnersSnap {
                                   cpuCoverage: num(y["cpu_coverage"]), cpuReason: str(y["cpu_reason"]),
                                   reason: str(y["reason"]))
             s.system.idleBytes = num(y["idle_bytes"]); s.system.cacheBytes = num(y["cache_bytes"])
+            s.system.levelReason = str(y["level_reason"]); s.system.rates = str(y["rates"])
+            s.system.kernelLevel = str(y["kernel_level"])
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -567,6 +789,79 @@ struct OwnersSnap {
         out.append(g)
         return out
     }
+}
+
+extension OwnersSnap {
+    /// The runner's hold, but only while some work is actually waiting: the
+    /// runner reports "holding for recovery" on an idle machine too (a fresh
+    /// boot, or a job that ended on a bad reading), and that is not news.
+    var heldWork: String? {
+        guard let h = runner?.hold else { return nil }
+        let waiting = (runner?.queueLength ?? 0) > 0 || runnerJobs.contains { $0.waiting }
+        return waiting ? h : nil
+    }
+
+    /// The managed-jobs card: with jobs to list, while waiting work is held,
+    /// or when the mode is not protect, so a paused runner is never invisible.
+    var showsManagedJobs: Bool {
+        !runnerJobs.isEmpty || heldWork != nil || (runner?.mode.map { $0 != "protect" } ?? false)
+    }
+
+    /// The under_pressure predicate memmon evaluated; an older payload without
+    /// it falls back to the score level the card was first drawn for.
+    var pressured: Bool {
+        underPressure ?? (system.scoreLevel == "DANGER" || system.scoreLevel == "CRITICAL")
+    }
+
+    /// The Under pressure card's rows: at most three, only while under pressure.
+    var shownSuggestions: [Suggestion] {
+        pressured ? Array(suggestions.prefix(3)) : []
+    }
+
+    /// The suggestion `id` from this payload, if its stop can still be sent:
+    /// listed, with a stop and a token, from a sample at most 120 s old, and
+    /// with process identity available. The token comes only from here.
+    func freshSuggestion(_ id: String, now: Double) -> Suggestion? {
+        guard !degraded, let age = ts.map({ now - $0 }), age >= 0, age <= Model.suggestionTTL,
+              let s = suggestions.first(where: { $0.id == id }), pressured,
+              s.stop != nil, s.token != nil else { return nil }
+        return s
+    }
+
+    /// The S1 stop for a managed job: its top-level `job:` owner, or the
+    /// managed child job of the session it runs in.
+    func stopTarget(_ job: ManagedJob) -> (ConfirmRequest.Kind, Owner)? {
+        guard !degraded else { return nil }
+        if let o = owners.first(where: { $0.id == "job:\(job.id)" }), o.can("stop-managed-job") {
+            return (.job(OwnerJob(id: o.id, kind: "managed", label: o.title, footprint: o.footprint,
+                                  memberCount: o.memberCount, token: o.token, action: "stop-managed-job")), o)
+        }
+        let pids = [job.childPid, job.wrapperPid].compactMap { $0 }.map(String.init)
+        for o in owners {
+            if let j = o.jobs.first(where: { $0.action == "stop-managed-job" && $0.token != nil
+                                         && $0.rootPid.map(pids.contains) == true }) {
+                return (.job(j), o)
+            }
+        }
+        return nil
+    }
+}
+
+/// The health card's sampling-gap notice (S2.10): for 24 h after a gap with
+/// at least 5 min unsampled while awake, until dismissed. Dismissal is keyed
+/// by the gap's end ts, so a later gap shows again. The copy never says why.
+struct GapNotice: Equatable {
+    var key: Double
+    var text: String
+    var sub = "Readings around the gap may be incomplete."
+}
+
+func gapNotice(_ s: OwnersSnap, dismissed: Double?, now: Double) -> GapNotice? {
+    guard let g = s.sampler?.noticeGap, g.cause == "starved", let awake = g.awake, awake >= 300,
+          let end = g.toTs, now - end <= 86_400, dismissed != end else { return nil }
+    let span = g.fromTs.map { " (\(eventClock($0))–\(eventClock(end)))" } ?? ""
+    return GapNotice(key: end, text: "memmon couldn’t sample for \(max(1, Int((awake / 60).rounded()))) min "
+                         + "while the Mac was awake\(span).")
 }
 
 enum SortKey: String, CaseIterable {
@@ -740,6 +1035,16 @@ func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
     return out
 }
 
+/// The ring's headline and its spoken form. A level from instantaneous
+/// signals alone (failed rates) is a lower bound and says so: "≥ Watch".
+func pressureHeadline(_ level: String?, reason: String?) -> (shown: String, spoken: String) {
+    let word = pressureWord(level)
+    guard levelTone(level) != .muted, reason?.hasPrefix("lower bound") == true else {
+        return (word, word.lowercased())
+    }
+    return ("≥ " + word, "at least " + word.lowercased())
+}
+
 /// The pressure word in the ring's centre.
 func pressureWord(_ level: String?) -> String {
     switch level {
@@ -895,6 +1200,712 @@ enum ActionsLock {
     }
 
     static func release(_ fd: Int32) { flock(fd, LOCK_UN); close(fd) }
+}
+
+// MARK: - preferences, notifications and the pressure source
+
+/// Where the app keeps small facts across launches: a dismissed gap notice
+/// and the job states already notified. The app uses UserDefaults; renders,
+/// probes and tests use memory or a file, so they never touch the user's.
+protocol PrefStore: AnyObject {
+    func double(_ key: String) -> Double?
+    func string(_ key: String) -> String?
+    func strings(_ key: String) -> [String]
+    func set(_ value: Any, _ key: String)
+}
+
+final class DefaultsStore: PrefStore {
+    let d = UserDefaults.standard
+    func double(_ key: String) -> Double? { d.object(forKey: key) == nil ? nil : d.double(forKey: key) }
+    func string(_ key: String) -> String? { d.string(forKey: key) }
+    func strings(_ key: String) -> [String] { d.stringArray(forKey: key) ?? [] }
+    func set(_ value: Any, _ key: String) { d.set(value, forKey: key) }
+}
+
+class MemoryStore: PrefStore {
+    var values: [String: Any] = [:]
+    func double(_ key: String) -> Double? { num(values[key]) }
+    func string(_ key: String) -> String? { str(values[key]) }
+    func strings(_ key: String) -> [String] { strs(values[key]) ?? [] }
+    func set(_ value: Any, _ key: String) { values[key] = value }
+}
+
+/// A JSON file, so a probe can stand in for an app restart.
+final class FileStore: MemoryStore {
+    let path: String
+    init(path: String) {
+        self.path = path
+        super.init()
+        if let d = FileManager.default.contents(atPath: path),
+           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] { values = j }
+    }
+    override func set(_ value: Any, _ key: String) {
+        super.set(value, key)
+        if let d = try? JSONSerialization.data(withJSONObject: values) {
+            FileManager.default.createFile(atPath: path, contents: d)
+        }
+    }
+}
+
+/// The popover's appearance (D48). System follows macOS; it is MemmonBar's
+/// own preference, kept in UserDefaults, and never memmon's.
+enum ThemeChoice: String, CaseIterable {
+    case system, light, dark
+    var label: String { rawValue.capitalized }
+    /// The segment's name: System says which look macOS is using now.
+    func label(systemDark: Bool) -> String {
+        self == .system ? "System (\(systemDark ? "Dark" : "Light"))" : label
+    }
+    var appearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+/// macOS's own look, from the global AppleInterfaceStyle default.
+func systemIsDark(_ defaults: UserDefaults = .standard) -> Bool {
+    defaults.string(forKey: "AppleInterfaceStyle") == "Dark"
+}
+
+/// Keeps the System label current: macOS posts this distributed
+/// notification when its look changes. The center is injectable for tests.
+final class SystemLookWatch {
+    static let name = Notification.Name("AppleInterfaceThemeChangedNotification")
+    private var token: NSObjectProtocol?
+    init(center: NotificationCenter = DistributedNotificationCenter.default(),
+         read: @escaping () -> Bool = { systemIsDark() }, onChange: @escaping (Bool) -> Void) {
+        token = center.addObserver(forName: SystemLookWatch.name, object: nil, queue: .main) { _ in onChange(read()) }
+    }
+}
+
+/// Sets the popover's appearance; nil hands it back to the system.
+func applyTheme(_ popover: NSPopover, _ t: ThemeChoice) {
+    popover.appearance = t.appearance
+}
+
+enum PrefKey {
+    static let dismissedGap = "memmon.dismissedGapTs"
+    static let notifiedJobs = "memmon.notifiedJobStates"
+    static let theme = "memmon.theme"
+}
+
+/// `done` reports whether the notification was handed over; only then is it
+/// remembered as sent. It may be called on any thread.
+protocol Notifier {
+    func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void)
+}
+
+/// Which job a clicked notification is about. It carries no token: the stop
+/// a click leads to always comes from the refresh the click starts.
+struct NoticeTarget: Equatable {
+    var runId: String
+    var state: String
+    var label: String
+    var wrapperPid: Int?, childPid: Int?
+
+    static let category = "memmon.intervention"
+
+    init(runId: String, state: String, label: String, wrapperPid: Int? = nil, childPid: Int? = nil) {
+        self.runId = runId; self.state = state; self.label = label
+        self.wrapperPid = wrapperPid; self.childPid = childPid
+    }
+
+    init(_ j: ManagedJob) {
+        self.init(runId: j.id, state: j.state, label: j.label, wrapperPid: j.wrapperPid, childPid: j.childPid)
+    }
+
+    var userInfo: [String: Any] {
+        var d: [String: Any] = ["run_id": runId, "state": state, "label": label]
+        if let wrapperPid { d["wrapper_pid"] = wrapperPid }
+        if let childPid { d["child_pid"] = childPid }
+        return d
+    }
+
+    static func decode(_ d: [AnyHashable: Any]) -> NoticeTarget? {
+        guard let id = d["run_id"] as? String, !id.isEmpty else { return nil }
+        return NoticeTarget(runId: id, state: d["state"] as? String ?? "", label: d["label"] as? String ?? "The job",
+                            wrapperPid: num(d["wrapper_pid"]).map { Int($0) }, childPid: num(d["child_pid"]).map { Int($0) })
+    }
+}
+
+/// UNUserNotificationCenter, which exists only inside an app bundle.
+/// Authorization is asked once, at launch, not in front of the first alert.
+final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate {
+    private let center: UNUserNotificationCenter?
+    /// What a click on one of these notifications opens (D44).
+    var onClick: ((NoticeTarget) -> Void)?
+
+    override init() {
+        center = Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+        super.init()
+        center?.delegate = self
+        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void) {
+        guard let center else { done(false); return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.userInfo = userInfo
+        content.categoryIdentifier = NoticeTarget.category
+        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { done($0 == nil) }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content
+        if info.categoryIdentifier == NoticeTarget.category, let t = NoticeTarget.decode(info.userInfo) {
+            DispatchQueue.main.async { self.onClick?(t) }
+        }
+        completionHandler()
+    }
+}
+
+/// One notification per managed job per state change (S2.5), only for the
+/// states that need a person: intervention needed, or cancelled by policy.
+/// A state is keyed by (job id, state, state_changed_ts), remembered across
+/// launches, so a refresh or a relaunch never repeats one, and a job that
+/// recovers and needs intervention again is a new state change.
+final class InterventionAlerts {
+    let notifier: Notifier
+    let store: PrefStore
+    static let states: Set<String> = ["intervention_needed", "cancelled_by_policy"]
+    static let keep = 200
+
+    /// memmon's notifications setting. While it is off, a new state is
+    /// remembered without a notification, so turning it back on never
+    /// replays old ones.
+    var enabled = true
+
+    init(notifier: Notifier, store: PrefStore) {
+        self.notifier = notifier
+        self.store = store
+    }
+
+    static func key(_ j: ManagedJob) -> String {
+        "\(j.id)|\(j.state)|" + (j.stateChangedTs.map { String(format: "%.3f", $0) } ?? "")
+    }
+
+    static func copy(_ j: ManagedJob) -> (String, String) {
+        if j.state == "cancelled_by_policy" {
+            return ("memmon cancelled \(j.label)",
+                    "Memory stayed critical, so this interruptible job was cancelled by policy.")
+        }
+        let why: String
+        switch j.interventionCause {
+        case "growth":
+            let now = j.footprint.map { " to \(gb($0))" } ?? ""
+            let res = j.reservation.map { ", above its \(gb($0)) reservation" } ?? ", above its reservation"
+            why = "It grew\(now)\(res), while memory is over the limit."
+        case "telemetry": why = "memmon can’t read memory pressure."
+        default: why = "Memory pressure is high."
+        }
+        return ("\(j.label) needs attention", why + " New heavy work is on hold. Open memmon to stop it.")
+    }
+
+    /// Posted but not yet confirmed: not posted again meanwhile.
+    private var inFlight: Set<String> = []
+
+    /// Posts for every new notifiable state in `jobs`; returns what it posted.
+    /// A state is remembered only once its notification was handed over, so
+    /// a failed one is tried again on the next tick. Main thread only.
+    @discardableResult
+    func observe(_ jobs: [ManagedJob]) -> [String] {
+        let seen = Set(store.strings(PrefKey.notifiedJobs))
+        var posted: [String] = []
+        for j in jobs where InterventionAlerts.states.contains(j.state) {
+            let k = InterventionAlerts.key(j)
+            guard !seen.contains(k), !inFlight.contains(k) else { continue }
+            guard enabled else { remember(k); continue }
+            inFlight.insert(k)
+            posted.append(k)
+            let (title, body) = InterventionAlerts.copy(j)
+            notifier.post(id: k, title: title, body: body, userInfo: NoticeTarget(j).userInfo) { ok in
+                let finish = { self.inFlight.remove(k); if ok { self.remember(k) } }
+                if Thread.isMainThread { finish() } else { DispatchQueue.main.async(execute: finish) }
+            }
+        }
+        return posted
+    }
+
+    private func remember(_ k: String) {
+        var seen = store.strings(PrefKey.notifiedJobs)
+        guard !seen.contains(k) else { return }
+        seen.append(k)
+        store.set(Array(seen.suffix(InterventionAlerts.keep)), PrefKey.notifiedJobs)
+    }
+}
+
+/// The runner's own job records, read straight from disk: a directory
+/// listing and a few small files, never a spawn. Only `<32 hex>.json`, at
+/// most 64 of them and 256 KB each, and only while the record's lease is
+/// still locked, which is memmon_runner.jobs()'s own liveness test: a record
+/// left by a dead runner never notifies. Call it off the main thread.
+enum RunnerFiles {
+    static let maxFiles = 64
+    static let maxBytes = 256 * 1024
+}
+
+/// Someone holds the lease: a shared, non-blocking probe fails with
+/// EWOULDBLOCK. The probe is released and closed at once.
+func leaseHeld(_ path: String) -> Bool {
+    let fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    if flock(fd, LOCK_SH | LOCK_NB) == 0 {
+        flock(fd, LOCK_UN)
+        return false
+    }
+    return errno == EWOULDBLOCK
+}
+
+func runnerRows(_ dir: String) -> [ManagedJob] {
+    let fm = FileManager.default
+    let names = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { name in
+        let stem = (name as NSString).deletingPathExtension
+        return name.hasSuffix(".json") && stem.count == 32
+            && stem.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }.sorted().prefix(RunnerFiles.maxFiles)
+    return names.compactMap { name -> ManagedJob? in
+        let path = (dir as NSString).appendingPathComponent(name)
+        let lease = (dir as NSString).appendingPathComponent((name as NSString).deletingPathExtension + ".lease")
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              let size = (attrs[.size] as? NSNumber)?.intValue, size <= RunnerFiles.maxBytes,
+              leaseHeld(lease),
+              let d = fm.contents(atPath: path), d.count <= RunnerFiles.maxBytes,
+              let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return nil }
+        return ManagedJob.decode(j)
+    }
+}
+
+/// The kernel's memory-pressure events while the popover is open (S2.9).
+/// They only refresh what is shown; nothing here admits, holds or stops.
+final class PressureWatch {
+    private var source: DispatchSourceMemoryPressure?
+    private var handler: (() -> Void)?
+    var isActive: Bool { source != nil }
+
+    func start(_ onEvent: @escaping () -> Void) {
+        guard source == nil else { return }
+        let s = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        handler = onEvent
+        s.setEventHandler { [weak self] in self?.handler?() }
+        s.resume()
+        source = s
+    }
+
+    func stop() {
+        source?.cancel()
+        source = nil
+        handler = nil
+    }
+
+    /// What the source's handler does, for the self-test.
+    func fire() { handler?() }
+}
+
+// MARK: - settings (D43)
+
+/// `memmon settings --json` (schema 1): the switches memmon itself honours.
+struct SettingsInfo {
+    var gateMode: String
+    var gateSource: String
+    var gateChoices: [String]
+    var warning: String?
+    var pausedForever = false
+    var pausedUntil: Double?
+    var runnerMode: String?
+    var autoCancel = false
+    var suggestions = true
+    var notifications = true
+    var stateDir: String?
+
+    /// MEMMON_GATE in the hook's environment wins over config.json, so the
+    /// panel must not offer a choice that would not take effect.
+    var gateLocked: Bool { gateSource == "env" }
+    var paused: Bool { pausedForever || (pausedUntil.map { $0 > nowTs() } ?? false) }
+
+    static let envWarning = "MEMMON_GATE in the hook environment overrides this setting"
+
+    static func decode(_ j: [String: Any]) -> SettingsInfo? {
+        guard num(j["schema_version"]) != nil, let g = j["gate_mode"] as? [String: Any],
+              let mode = str(g["value"]) else { return nil }
+        var s = SettingsInfo(gateMode: mode, gateSource: str(g["source"]) ?? "default",
+                             gateChoices: strs(g["choices"]) ?? ["block-critical", "block", "warn", "off"])
+        s.warning = str(j["warning"])
+        if str(j["paused_until"]) == "forever" { s.pausedForever = true } else { s.pausedUntil = num(j["paused_until"]) }
+        s.runnerMode = str(j["runner_mode"])
+        s.autoCancel = j["auto_cancel_interruptible"] as? Bool ?? false
+        s.suggestions = j["pressure_suggestions"] as? Bool ?? true
+        s.notifications = j["notifications"] as? Bool ?? true
+        s.stateDir = str(j["state_dir"])
+        return s
+    }
+
+    /// The gate's choices as the panel names them, with one line each.
+    /// The full name (spoken and in the tooltip), the segment's short label,
+    /// and the one line that explains it.
+    static func gateChoice(_ m: String) -> (label: String, short: String, line: String) {
+        switch m {
+        case "block-critical": return ("Stop at Critical", "Critical", "WATCH or DANGER warns; CRITICAL stops a heavy command before it runs.")
+        case "block": return ("Stop at Danger", "Danger", "WATCH warns; DANGER or CRITICAL stops a heavy command before it runs.")
+        case "warn": return ("Warn only", "Warn", "Every level warns; heavy commands are never stopped.")
+        case "off": return ("Off", "Off", "Heavy commands run with no memory check.")
+        default: return (m, m, "")
+        }
+    }
+
+    static func keyName(_ key: String) -> String {
+        switch key {
+        case "gate_mode": return "command protection"
+        case "runner_mode": return "protection mode"
+        case "auto_cancel_interruptible": return "auto-cancel"
+        case "pressure_suggestions": return "stop suggestions"
+        case "notifications": return "notifications"
+        case "pause": return "the pause"
+        default: return key
+        }
+    }
+}
+
+/// One suggestion from `memmon explain --json` items (D47c). Shown only as
+/// text; nothing in it is run.
+struct ExplainItem: Equatable {
+    var owner: String, action: String, why: String
+
+    static func decode(_ d: [String: Any]) -> ExplainItem? {
+        guard let owner = str(d["owner"]), let action = str(d["action"]) else { return nil }
+        return ExplainItem(owner: owner, action: action, why: str(d["why"]) ?? "")
+    }
+
+    var spoken: String { [owner, action, why].filter { !$0.isEmpty }.joined(separator: ", ") }
+}
+
+/// The reply's lines without blanks or leading list markers ("- ", "• ", "1. ").
+func explainLines(_ text: String) -> [String] {
+    text.split(whereSeparator: \.isNewline).map { raw -> String in
+        var l = raw.trimmingCharacters(in: .whitespaces)
+        for m in ["- ", "• ", "* "] where l.hasPrefix(m) { l = String(l.dropFirst(m.count)) }
+        if let r = l.range(of: #"^\d+[.)] "#, options: .regularExpression) { l.removeSubrange(r) }
+        return l
+    }.filter { !$0.isEmpty }
+}
+
+/// "Container VM: stop it" -> ("Container VM", "stop it"), when the part
+/// before the colon is short enough to be a name.
+func explainLineOwner(_ line: String) -> (String, String)? {
+    guard let r = line.range(of: ": ") else { return nil }
+    let owner = String(line[..<r.lowerBound]), rest = String(line[r.upperBound...])
+    guard !owner.isEmpty, owner.count <= 48, !rest.isEmpty else { return nil }
+    return (owner, rest)
+}
+
+/// A suggestion's bullet: a 6 pt circle.
+struct ExplainBullet: View {
+    var color: Color
+    var body: some View {
+        Circle().fill(color).frame(width: 6, height: 6)
+            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+            .accessibilityHidden(true)
+    }
+}
+
+/// The section of the owner an item names, by the snapshot's own titles
+/// (an owner's title, or one of its job labels); nil when nothing matches.
+func explainSection(_ name: String, _ s: OwnersSnap?) -> OwnerSection? {
+    guard let s else { return nil }
+    let key = name.lowercased()
+    for o in s.rows {
+        if o.title.lowercased() == key || o.jobs.contains(where: { $0.label.lowercased() == key }) {
+            return ownerSection(o)
+        }
+    }
+    return nil
+}
+
+/// `memmon explain --json` (D47): exit 0 with {text, chars_sent, model}, or
+/// exit 2 with {error}. The reply is only ever shown as plain text.
+enum ExplainOutcome {
+    /// `mode` is "now", "patterns" or "quiet"; quiet means memmon answered
+    /// itself and Claude was not asked. Both are absent from older memmon.
+    case reply(text: String, chars: Int?, model: String?, mode: String? = nil, title: String? = nil,
+               items: [ExplainItem] = [])
+    case failed(String)
+
+    static func of(_ r: CLIResult) -> ExplainOutcome {
+        if r.timedOut { return .failed("Claude did not answer within \(Int(Model.explainTimeout)) s.") }
+        if let e = r.launchError { return .failed("Could not ask Claude: \(e).") }
+        let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
+        if r.exit == 0, let j, let t = j["text"] as? String {
+            return .reply(text: t.trimmingCharacters(in: .whitespacesAndNewlines),
+                          chars: int(j["chars_sent"]), model: str(j["model"]),
+                          mode: str(j["mode"]), title: str(j["title"]),
+                          items: (j["items"] as? [[String: Any]] ?? []).compactMap(ExplainItem.decode))
+        }
+        if let e = j.flatMap({ str($0["error"]) }) { return .failed(readable(e)) }
+        return .failed("Could not ask Claude: memmon's answer could not be read.")
+    }
+
+    /// memmon's own error, said plainly: Claude missing, too slow, or failed.
+    static func readable(_ e: String) -> String {
+        if e.hasPrefix("claude not found") {
+            return "Claude Code isn’t installed, or memmon can’t find it (it looks on PATH, ~/.local/bin, /opt/homebrew/bin and /usr/local/bin)."
+        }
+        if e.hasPrefix("claude did not answer") { return "Claude did not answer within \(Int(Model.explainTimeout)) s." }
+        if e.hasPrefix("claude exited") { return "Claude stopped with an error: " + e.replacingOccurrences(of: "claude exited ", with: "exit ") + "." }
+        return "Could not ask Claude: \(e)."
+    }
+}
+
+enum SettingsOutcome {
+    case ok(SettingsInfo)
+    case failed(String)
+
+    /// Exit 0 with the settings JSON is the re-read state. Exit 2 carries
+    /// memmon's own error; anything else is an error too. Nothing is applied
+    /// unless memmon answered with the new state.
+    static func of(_ r: CLIResult, key: String) -> SettingsOutcome {
+        let what = key == "load" ? "Could not read settings" : "Could not change \(SettingsInfo.keyName(key))"
+        if r.timedOut { return .failed("\(what): memmon did not answer within \(String(format: "%g", CLI.ownersTimeout)) s.") }
+        if let e = r.launchError { return .failed("\(what): \(e).") }
+        let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
+        if r.exit == 0, let j, let s = SettingsInfo.decode(j) { return .ok(s) }
+        if let e = j.flatMap({ str($0["error"]) }) { return .failed("\(what): \(e).") }
+        return .failed("\(what): memmon's answer could not be read.")
+    }
+}
+
+/// memmon's notifications switch, read from config.json for the 10 s runner
+/// check. A missing or unreadable file means the default, on; only an
+/// explicit false turns MemmonBar's intervention notices off.
+func notificationsEnabled(configPath: String) -> Bool {
+    guard let d = FileManager.default.contents(atPath: configPath),
+          let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return true }
+    return (j["notifications"] as? Bool) != false
+}
+
+// MARK: - usage history (D45)
+
+/// One day of `memmon usage --json`. A day the sampler never ran has
+/// samples 0 and nulls; nothing is interpolated.
+struct UsageDay: Identifiable {
+    var date: String
+    var samples: Int
+    var peak: Double?, avg: Double?
+    var bySection: [String: Double] = [:]
+    var warned: Int?, stopped: Int?
+    var held: Int?, cancelled: Int?
+    /// "estimated" (from free memory, older history rows) or "measured".
+    var basis: String?
+    var estimated: Bool { basis == "estimated" }
+    var id: String { date }
+    var empty: Bool { samples == 0 }
+
+    /// A full day at one sample a minute is 1440; under a tenth of that the
+    /// day is shown with its count, because it may not be representative.
+    var few: Bool { samples > 0 && samples < 144 }
+
+    /// "Mon" for a "YYYY-MM-DD" date, in a fixed English calendar.
+    var weekday: String {
+        let p = DateFormatter(); p.locale = Locale(identifier: "en_US_POSIX"); p.dateFormat = "yyyy-MM-dd"
+        guard let d = p.date(from: date) else { return date }
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE"
+        return f.string(from: d)
+    }
+}
+
+struct UsageData {
+    var days: [UsageDay]
+    var ram: Double?
+    var complete: Bool?
+
+    /// The sections memmon reports, in ring order, each with the ring's colour.
+    static let sections: [(key: String, name: String)] = [
+        ("claude", "Claude sessions"), ("codex", "Codex"), ("browser", "Browsers"),
+        ("dev", "Terminals & editors"), ("app", "Mac apps"), ("service", "Shared services"), ("other", "Other"),
+    ]
+
+    static func color(_ key: String) -> Color {
+        switch key {
+        case "claude": return P.sectionClaude
+        case "codex": return P.sectionCodex
+        case "browser": return P.sectionBrowser
+        case "app": return P.sectionApp
+        case "service": return P.sectionService
+        case "dev": return P.sectionDev
+        default: return P.system
+        }
+    }
+
+    static func decode(_ j: [String: Any]) -> UsageData? {
+        guard num(j["schema_version"]) != nil, let rows = j["series"] as? [[String: Any]] else { return nil }
+        let days = rows.compactMap { d -> UsageDay? in
+            guard let date = str(d["date"]) else { return nil }
+            var u = UsageDay(date: date, samples: int(d["samples"]) ?? 0)
+            u.peak = num(d["mem_peak_bytes"]); u.avg = num(d["mem_avg_bytes"]); u.basis = str(d["mem_basis"])
+            for (k, v) in d["by_section"] as? [String: Any] ?? [:] { if let b = num(v) { u.bySection[k] = b } }
+            if let g = d["gate"] as? [String: Any] { u.warned = int(g["warned"]); u.stopped = int(g["stopped"]) }
+            if let r = d["runner"] as? [String: Any] { u.held = int(r["held"]); u.cancelled = int(r["cancelled"]) }
+            if u.empty { u.peak = nil; u.avg = nil; u.bySection = [:] }    // a day with no samples has no values
+            return u
+        }
+        return UsageData(days: days, ram: num(j["ram_bytes"]),
+                         complete: (j["coverage"] as? [String: Any])?["complete"] as? Bool)
+    }
+
+    /// The sections with the most memory over the days that have samples.
+    var topSections: [(key: String, name: String, avg: Double)] {
+        let measured = days.filter { !$0.empty }
+        guard !measured.isEmpty else { return [] }
+        return UsageData.sections.compactMap { s -> (String, String, Double)? in
+            let total = measured.reduce(0) { $0 + ($1.bySection[s.key] ?? 0) }
+            return total > 0 ? (s.key, s.name, total / Double(measured.count)) : nil
+        }.sorted { $0.2 > $1.2 }.prefix(3).map { $0 }
+    }
+
+    var runnerRecorded: Bool { days.contains { $0.held != nil || $0.cancelled != nil } }
+
+    /// Today's row, found by its date in the local calendar, never by
+    /// position: a series that ends yesterday has no today.
+    var today: UsageDay? {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        let key = f.string(from: Date(timeIntervalSince1970: nowTs()))
+        return days.first { $0.date == key }
+    }
+}
+
+enum UsageView: String, CaseIterable {
+    case memory, consumers, protection
+    var label: String {
+        switch self {
+        case .memory: return "Memory"
+        case .consumers: return "Top consumers"
+        case .protection: return "Protection"
+        }
+    }
+}
+
+/// One bar as the chart draws and speaks it.
+/// The card's headline: a bold value with a small caption under it. The
+/// sentence `usageBars` builds stays as the spoken summary.
+struct UsageHeadline: Equatable {
+    var value: String
+    var caption: String
+}
+
+/// "≈ 28.8 GB" for a value memory estimated from free memory.
+func usageGB(_ b: Double, estimated: Bool) -> String { (estimated ? "≈ " : "") + gb(b) }
+
+func usageHeadline(_ u: UsageData, _ view: UsageView) -> UsageHeadline {
+    switch view {
+    case .memory:
+        let high = u.days.filter { $0.peak != nil }.max { ($0.peak ?? 0) < ($1.peak ?? 0) }
+        let week = high.map { " · week high " + usageGB($0.peak!, estimated: $0.estimated) } ?? ""
+        guard let t = u.today, let p = t.peak else {
+            return UsageHeadline(value: "—", caption: "no samples today" + week)
+        }
+        return UsageHeadline(value: usageGB(p, estimated: t.estimated), caption: "today’s peak" + week)
+    case .consumers:
+        guard let t = u.today, let top = UsageData.sections
+            .compactMap({ s in t.bySection[s.key].map { (s.name, $0) } }).max(by: { $0.1 < $1.1 }), top.1 > 0 else {
+            return UsageHeadline(value: "—", caption: "no samples today")
+        }
+        return UsageHeadline(value: gb(top.1), caption: "today’s top · \(top.0)")
+    case .protection:
+        let w = u.days.reduce(0) { $0 + ($1.warned ?? 0) }, st = u.days.reduce(0) { $0 + ($1.stopped ?? 0) }
+        return UsageHeadline(value: "\(st + w)", caption: "\(st) stopped · \(w) warned this week")
+    }
+}
+
+/// The y-axis top: GB rounded up to a multiple of 4 (2 below 8 GB), so the
+/// half line is a whole number too; counts rounded up to an even number.
+func usageAxisTop(_ u: UsageData, _ view: UsageView) -> Double {
+    func niceGB(_ b: Double) -> Double {
+        let g = max(b / GB, 1)
+        let step = g > 8 ? 4.0 : 2.0
+        return (g / step).rounded(.up) * step * GB
+    }
+    switch view {
+    case .memory: return niceGB(max(u.days.compactMap { $0.peak }.max() ?? 0, u.ram ?? 0))
+    case .consumers: return niceGB(u.days.map { $0.bySection.values.reduce(0, +) }.max() ?? 0)
+    case .protection:
+        let m = u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0
+        return Double(max(2, m + m % 2))
+    }
+}
+
+func usageAxisLabel(_ v: Double, _ view: UsageView) -> String {
+    if v == 0 { return "0" }
+    return view == .protection ? String(Int(v)) : String(format: "%.0f GB", v / GB)
+}
+
+struct UsageBar {
+    var day: UsageDay
+    var label: String
+    var fraction: Double?       // nil: no samples, drawn as a stub
+    var spoken: String
+}
+
+/// What a bar's shape already shows, said in words for its tooltip and
+/// label: few samples (a faded bar), an estimate (≈), and history that
+/// starts mid-week (the first measured bar when coverage is incomplete).
+func usageDayNotes(_ d: UsageDay, _ u: UsageData, memory: Bool) -> [String] {
+    var out: [String] = []
+    if d.few { out.append("few samples (\(d.samples)), may be low") }
+    if memory && d.estimated { out.append("estimated from free memory") }
+    if u.complete == false, d.date == u.days.first(where: { !$0.empty })?.date {
+        out.append("earlier history incomplete")
+    }
+    return out
+}
+
+/// The bars and the summary sentence for one view. Empty days stay empty.
+func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary: String) {
+    switch view {
+    case .memory:
+        let top = max(u.ram ?? 0, u.days.compactMap { $0.peak }.max() ?? 0, 1)
+        let bars = u.days.map { d -> UsageBar in
+            guard !d.empty, let p = d.peak else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
+            var s = "\(d.weekday), peak \(d.estimated ? "about " : "")\(gb(p))" + (d.avg.map { ", average \(gb($0))" } ?? "")
+            for n in usageDayNotes(d, u, memory: true) { s += ", " + n }
+            return UsageBar(day: d, label: d.weekday, fraction: p / top, spoken: s)
+        }
+        let head = u.today.flatMap { $0.peak }.map { "Today’s peak \(gb($0))" + (u.ram.map { " of \(gb($0))" } ?? "") }
+            ?? "No samples today"
+        let peaks = u.days.compactMap { $0.peak }
+        return (bars, head + (peaks.isEmpty ? "" : "; highest this week \(gb(peaks.max()!))") + ".")
+    case .consumers:
+        let totals = u.days.map { d in d.bySection.values.reduce(0, +) }
+        let top = max(totals.max() ?? 0, 1)
+        let bars = u.days.enumerated().map { k, d -> UsageBar in
+            guard !d.empty, totals[k] > 0 else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
+            let parts = UsageData.sections.compactMap { s in d.bySection[s.key].flatMap { $0 > 0 ? "\(s.name) \(gb($0))" : nil } }
+            return UsageBar(day: d, label: d.weekday, fraction: totals[k] / top,
+                            spoken: "\(d.weekday), " + (parts + usageDayNotes(d, u, memory: false)).joined(separator: ", "))
+        }
+        let names = u.topSections.map { "\($0.name) \(gb($0.avg))" }
+        return (bars, names.isEmpty ? "No samples this week." : "Top consumers on average: " + names.joined(separator: ", ") + ".")
+    case .protection:
+        let top = Double(max(u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0, 1))
+        let bars = u.days.map { d -> UsageBar in
+            let w = d.warned ?? 0, st = d.stopped ?? 0
+            return UsageBar(day: d, label: d.weekday, fraction: Double(w + st) / top,
+                            spoken: "\(d.weekday), \(w) warned, \(st) stopped")
+        }
+        let w = u.days.reduce(0) { $0 + ($1.warned ?? 0) }, st = u.days.reduce(0) { $0 + ($1.stopped ?? 0) }
+        var s = "\(w) warned and \(st) stopped this week"
+        if u.runnerRecorded {
+            s += "; managed jobs held \(u.days.reduce(0) { $0 + ($1.held ?? 0) }), cancelled \(u.days.reduce(0) { $0 + ($1.cancelled ?? 0) })"
+        } else {
+            s += "; managed-job holds and cancels not recorded"
+        }
+        return (bars, s + ".")
+    }
 }
 
 // MARK: - action outcomes
@@ -1409,6 +2420,9 @@ enum Copy {
 struct ConfirmRequest {
     enum Kind {
         case job(OwnerJob)
+        /// A heavy job from the Under pressure card. Its stop is S1's, but its
+        /// token is always re-read from the latest payload before acting.
+        case suggestion(OwnerJob)
         case endSession
         case quitApp
         case stopCommand
@@ -1453,6 +2467,32 @@ final class Model: ObservableObject {
     @Published var tick = 0
 
     var appControl: AppControl = SystemApps()
+    /// Memory for renders and tests; the app swaps in UserDefaults.
+    var prefs: PrefStore = MemoryStore()
+    /// Intervention notifications; none unless the app sets them up.
+    var alerts: InterventionAlerts?
+    /// Memory-pressure events seen while the popover was open.
+    var pressureEvents = 0
+    /// A suggestion's token is used only from a sample at most this old.
+    static let suggestionTTL = 120.0
+
+    /// The Settings panel replaces the list while open.
+    @Published var settingsOpen = false
+    @Published var settings: SettingsInfo?
+    @Published var settingsError: String?
+    /// The setting being changed; every control waits for memmon's answer.
+    @Published var settingsBusy: String?
+
+    /// The "Last 7 days" card: collapsed by default, and history is read
+    /// only once it is opened, never on the refresh path.
+    @Published var usageOpen = false
+    @Published var usageView: UsageView = .memory
+    @Published var usage: UsageData?
+    @Published var usageError: String?
+    @Published var usageLoading = false
+    /// When the cached history was read, on `clock`; it is kept 5 min.
+    var usageFetchedAt: Double?
+    static let usageTTL = 300.0
     /// Off for fixtures: a rendered or audited state must never call memmon.
     /// Confirmed actions are recorded in `actionLog` instead.
     var live = true
@@ -1553,8 +2593,7 @@ final class Model: ObservableObject {
             }
             DispatchQueue.main.async {
                 if let parsed {
-                    self.snap = parsed; self.loadError = nil
-                    self.rebindConfirm(parsed)
+                    self.landed(parsed)
                 } else {
                     // Only while that scan is still running: its reaper may
                     // already have run.
@@ -1569,11 +2608,92 @@ final class Model: ObservableObject {
 
     static let stillSamplingNote = "; it is still sampling"
 
+    /// A fresh owners payload arrived.
+    func landed(_ s: OwnersSnap) {
+        snap = s
+        loadError = nil
+        rebindConfirm(s)
+        alerts?.observe(s.runnerJobs)
+        // A stop being performed, or a partial / Force choice, is never
+        // replaced: the notice waits for the refresh that confirm's close starts.
+        if let t = pendingNotice, !confirmBusy {
+            pendingNotice = nil
+            resolveNotice(t, in: s)
+        }
+    }
+
+    /// A clicked notification waiting for the refresh it started.
+    var pendingNotice: NoticeTarget?
+
+    /// The overlay is past asking: a stop is running, or a partial result
+    /// waits on Force or Leave running.
+    var confirmBusy: Bool {
+        guard let c = confirm else { return false }
+        if case .ask = c.phase { return false }
+        return true
+    }
+
+    /// A click on an intervention notification (D44): wait for a fresh
+    /// payload, then show that job. Nothing is stopped here; at most the
+    /// normal confirm opens, with the token from that payload.
+    func openFromNotification(_ t: NoticeTarget) {
+        guard alerts?.enabled ?? true else { return }
+        settingsOpen = false
+        pendingNotice = t
+        refresh()
+    }
+
+    func resolveNotice(_ t: NoticeTarget, in s: OwnersSnap) {
+        guard let job = s.runnerJobs.first(where: { $0.id == t.runId }) else {
+            banner = t.state == "cancelled_by_policy"
+                ? Banner(tone: .warning, title: "\(t.label) was cancelled by policy",
+                         body: "— memory stayed critical, so this interruptible job was stopped. It has ended.")
+                : Banner(tone: .warning, title: "Nothing done", body: "— \(t.label) is no longer running.")
+            return
+        }
+        let target = s.stopTarget(job)
+        if let owner = target?.1 { expanded = owner.id }
+        guard job.needsIntervention else {
+            banner = job.state == "cancelled_by_policy"
+                ? Banner(tone: .warning, title: "\(job.label) was cancelled by policy",
+                         body: "— memory stayed critical, so this interruptible job was stopped.")
+                : Banner(tone: .success, title: "\(job.label) no longer needs attention",
+                         body: "— it is \(job.stateWord.lowercased()) now.")
+            return
+        }
+        guard let (kind, owner) = target else {
+            banner = Banner(tone: .warning, title: "Nothing done",
+                            body: "— \(job.label) can no longer be stopped from here. Check the list and try again.")
+            return
+        }
+        ask(kind, owner)
+    }
+
     /// A confirm still being asked about follows the fresh list: the same
     /// owner (same root, same instances, same job) gets the new token; one
     /// that changed or left is closed rather than acted on with an old token.
     func rebindConfirm(_ s: OwnersSnap) {
         guard var c = confirm, case .ask = c.phase else { return }
+        if case .suggestion(let j) = c.kind {
+            // Only the fresh payload's row is ever acted on: gone, or a
+            // different stop, closes the confirm instead.
+            guard let fresh = s.shownSuggestions.first(where: { $0.id == j.id }) else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(j.label) is no longer listed under pressure.")
+                return
+            }
+            guard fresh.stop == j.action, fresh.token != nil else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(j.label) changed while this was open. Check the list and try again.")
+                return
+            }
+            c.kind = .suggestion(fresh.asJob)
+            c.owner = s.owners.first { $0.id == fresh.ownerId } ?? c.owner
+            confirm = c
+            return
+        }
         let fresh = s.owners.first { $0.id == c.owner.id }
         func same(_ a: Owner, _ b: Owner) -> Bool {
             a.rootPid == b.rootPid && a.rootStart == b.rootStart
@@ -1624,7 +2744,7 @@ final class Model: ObservableObject {
                                     : "— \(o.title) now hosts agent sessions; quit it from the app itself.")
                 return
             }
-        case .endSession, .stopCommand:
+        case .endSession, .stopCommand, .suggestion:
             break
         }
         c.owner = o
@@ -1651,6 +2771,217 @@ final class Model: ObservableObject {
             _ = CLI.run(args, timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
         }
+    }
+
+    /// Explain (D47): asked only by a click, never on refresh or open.
+    @Published var explainOpen = false
+    @Published var explainBusy = false
+    @Published var explainText: String?
+    @Published var explainError: String?
+    /// The answer's mode and title from memmon; nil from an older memmon.
+    @Published var explainMode: String?
+    @Published var explainTitle: String?
+    /// The answer as owner / action / why rows; empty from an older memmon.
+    @Published var explainItems: [ExplainItem] = []
+    var explainQuiet: Bool { explainMode == "quiet" }
+    /// The card's title once there is an answer.
+    var explainHeading: String { explainTitle ?? "Claude’s suggestions" }
+    /// Each ask is numbered; Cancel moves past it, so a late answer is dropped.
+    var explainSeq = 0
+    /// How long the card waits for Claude.
+    static let explainTimeout = 60.0
+
+    /// The click: `memmon explain --json`, once at a time, bounded to 60 s.
+    func explain() {
+        guard !explainBusy else { return }
+        explainOpen = true
+        explainError = nil
+        explainText = nil
+        explainMode = nil
+        explainTitle = nil
+        explainItems = []
+        let args = ["explain", "--json"]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        explainSeq += 1
+        let seq = explainSeq
+        explainBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = ExplainOutcome.of(CLI.run(args, timeout: Model.explainTimeout))
+            DispatchQueue.main.async {
+                guard seq == self.explainSeq else { return }      // cancelled meanwhile
+                self.applyExplain(outcome)
+            }
+        }
+    }
+
+    /// Stops waiting. memmon's own call to Claude ends by itself within 60 s;
+    /// its answer, if any, is not shown.
+    func cancelExplain() {
+        guard explainBusy else { return }
+        explainSeq += 1
+        explainBusy = false
+        explainError = "Cancelled. Nothing was changed."
+    }
+
+    func applyExplain(_ o: ExplainOutcome) {
+        explainBusy = false
+        switch o {
+        case .reply(let text, _, _, let mode, let title, let items):
+            explainText = text
+            explainItems = items
+            explainMode = mode
+            explainTitle = title
+            explainError = nil
+        case .failed(let e):
+            explainError = e
+        }
+    }
+
+    func dismissExplain() {
+        if explainBusy { cancelExplain() }
+        explainOpen = false
+    }
+
+    /// The stored theme; an unknown or missing value is System.
+    var theme: ThemeChoice { ThemeChoice(rawValue: prefs.string(PrefKey.theme) ?? "") ?? .system }
+    /// Applies a theme to the live popover; unset in renders and probes.
+    var onTheme: ((ThemeChoice) -> Void)?
+
+    /// macOS's look, for the System segment's label. Renders set it from
+    /// --light / --dark, so fixtures stay the same on any Mac.
+    @Published var systemDark = false
+
+    func setTheme(_ t: ThemeChoice) {
+        prefs.set(t.rawValue, PrefKey.theme)
+        objectWillChange.send()
+        onTheme?(t)
+    }
+
+    func toggleUsage() {
+        usageOpen.toggle()
+        if usageOpen { loadUsage() }
+    }
+
+    /// `memmon usage --json`, only while the card is open and the cache is
+    /// older than 5 min (or empty).
+    func loadUsage() {
+        guard usageOpen, !usageLoading else { return }
+        if usage != nil, let at = usageFetchedAt, clock() - at < Model.usageTTL { return }
+        let args = ["usage", "--json"]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        usageLoading = true
+        usageError = nil
+        DispatchQueue.global(qos: .utility).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout)
+            let parsed = r.exit == 0 ? ((try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any])
+                .flatMap(UsageData.decode) : nil
+            DispatchQueue.main.async {
+                self.usageLoading = false
+                if let parsed {
+                    self.usage = parsed
+                    self.usageFetchedAt = self.clock()
+                } else {
+                    self.usageError = r.timedOut ? "memmon did not answer in time" : "memmon could not read the history"
+                }
+            }
+        }
+    }
+
+    func openSettings() {
+        settingsOpen = true
+        settingsError = nil
+        loadSettings()
+    }
+
+    func closeSettings() { settingsOpen = false }
+
+    func loadSettings() { settingsCall(["settings", "--json"], key: "load") }
+
+    /// `memmon settings set <key> <value>`. The panel shows only what memmon
+    /// answers back, never the value it asked for.
+    func changeSetting(_ key: String, _ value: String) {
+        guard settingsBusy == nil else { return }
+        // A gate mode memmon would not honour (MEMMON_GATE wins) is never
+        // written, and neither is one chosen before the source was known.
+        if key == "gate_mode", settings?.gateLocked ?? true { return }
+        settingsCall(["settings", "set", key, value], key: key)
+    }
+
+    func setFlag(_ key: String, _ on: Bool) { changeSetting(key, on ? "true" : "false") }
+
+    /// Pause stays `memmon --off [DURATION]` / `memmon --on`; "forever" is
+    /// --off with no duration, nil is Resume.
+    func pauseProtection(_ duration: String?) {
+        guard settingsBusy == nil else { return }
+        let args = duration == nil ? ["--on"] : duration == "forever" ? ["--off"] : ["--off", duration!]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        settingsBusy = "pause"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async {
+                self.settingsBusy = nil
+                if r.exit != 0 {
+                    self.settingsError = "Could not change the pause: "
+                        + (r.timedOut ? "memmon did not answer." : r.launchError ?? "memmon reported an error.")
+                }
+                self.loadSettings()
+                self.refresh()
+            }
+        }
+    }
+
+    func openDataFolder() {
+        guard let dir = settings?.stateDir else { return }
+        guard live else { actionLog.append("open " + dir); return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: dir, isDirectory: true))
+    }
+
+    /// One argv for both paths, so a fixture logs exactly what memmon gets.
+    private func settingsCall(_ args: [String], key: String) {
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        settingsBusy = key
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = SettingsOutcome.of(CLI.run(args, timeout: CLI.ownersTimeout), key: key)
+            DispatchQueue.main.async {
+                self.settingsBusy = nil
+                self.applySettings(outcome, key: key)
+            }
+        }
+    }
+
+    func applySettings(_ outcome: SettingsOutcome, key: String) {
+        switch outcome {
+        case .ok(let s):
+            settings = s
+            settingsError = nil
+            alerts?.enabled = s.notifications
+            if key != "load" { refresh() }
+        case .failed(let message):
+            settingsError = message
+        }
+    }
+
+    /// `memmon run-mode <mode>`; only the three modes memmon knows.
+    func setRunMode(_ mode: String) {
+        guard RunnerState.modes.contains(mode) else { return }
+        guard live else { actionLog.append("run-mode \(mode)"); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = CLI.run(["run-mode", mode], timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    func dismissGap(_ key: Double) {
+        prefs.set(key, PrefKey.dismissedGap)
+        objectWillChange.send()
+    }
+
+    var dismissedGap: Double? { prefs.double(PrefKey.dismissedGap) }
+
+    /// The kernel reported a pressure change while the popover is open.
+    func pressureChanged() {
+        pressureEvents += 1
+        refresh()
     }
 
     func toggleGate(_ pause: Bool) {
@@ -1686,7 +3017,7 @@ final class Model: ObservableObject {
 
     func subject(_ c: ConfirmRequest) -> (String, String) {
         switch c.kind {
-        case .job(let j):
+        case .job(let j), .suggestion(let j):
             let noun = j.kind == "server" ? "server" : (j.kind == "test" ? "test run" : "build")
             return (j.displayName.components(separatedBy: " · ").first ?? j.label, noun)
         case .endSession: return (c.owner.title, "session")
@@ -1696,6 +3027,23 @@ final class Model: ObservableObject {
 
     func perform() {
         guard var c = confirm else { return }
+        if case .suggestion(let j) = c.kind {
+            // The stop goes out only with the token of the latest refresh,
+            // and only while that sample is at most 120 s old (D3, D4).
+            guard let fresh = snap?.freshSuggestion(j.id, now: nowTs()),
+                  fresh.stop == j.action, let stop = fresh.stop, let tok = fresh.token else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— the list is out of date. Refreshing; check it and try again.",
+                                offersRefresh: true)
+                refresh()
+                return
+            }
+            let args = ["act", stop, "--target", tok]
+            guard live else { actionLog.append(args.joined(separator: " ")); return }
+            run(args, c)
+            return
+        }
         guard live else { actionLog.append("perform"); return }
         switch c.kind {
         case .stopCommand:
@@ -1717,6 +3065,8 @@ final class Model: ObservableObject {
             }
         case .job(let j):
             run(["act", j.stopAction, "--target", j.token ?? ""], c)
+        case .suggestion:
+            break
         case .endSession:
             run(["act", "end-session", "--target", c.owner.token ?? ""], c)
         }
@@ -2614,7 +3964,11 @@ struct ConfirmOverlay: View {
             let r = o.runnerRows
             let m = n + k + r
             let label: String
-            if case .job(let j) = request.kind { label = "\(j.displayName.components(separatedBy: " · ")[0]) in \(owner.title)" } else { label = owner.title }
+            switch request.kind {
+            case .job(let j): label = "\(j.displayName.components(separatedBy: " · ")[0]) in \(owner.title)"
+            case .suggestion(let j): label = j.label
+            default: label = owner.title
+            }
             let exited = o.exited ?? 0
             let them = n == 1 ? "it" : "them"
             return Content(icon: "exclamationmark.triangle", tint: P.amber,
@@ -2650,6 +4004,16 @@ struct ConfirmOverlay: View {
                            actVariant: .secondaryDanger)
         case .ask, .working:
             return askContent
+        }
+    }
+
+    /// "vitest in acme-web · under Claude session “Checkout refactor”".
+    private func suggestionTarget(_ j: OwnerJob) -> String {
+        let head = j.label + (j.place.map { " in \($0)" } ?? "")
+        switch owner.agent {
+        case "claude": return head + " · under Claude session “\(owner.title)”"
+        case "codex": return head + " · under Codex “\(owner.title)”"
+        default: return head
         }
     }
 
@@ -2707,6 +4071,18 @@ struct ConfirmOverlay: View {
                            safeButton: "Cancel", safeSpoken: "Cancel, keep the \(j.kind == "server" ? "server" : "job") running",
                            actButton: j.stopLabel,
                            actSpoken: "\(j.stopLabel): send stop signal to \(j.memberCount.map { plural($0, "process", "processes") } ?? "its processes")")
+        case .suggestion(let j):
+            let name = j.displayName.components(separatedBy: " · ")[0]
+            let keeps = keepsConversation ? "The conversation keeps running."
+                : owner.isUnattributed ? "The process that started it keeps running."
+                : "\(owner.title) keeps running."
+            return Content(icon: "stop.circle", tint: P.red, title: "Stop \(name.lowercased())?",
+                           target: suggestionTarget(j), sub: j.footprint.map { gb($0) + " now" },
+                           message: "It wasn’t started through memmon run, so memmon can’t hold it. Its processes get a polite stop signal first; nothing is force-killed unless you choose it.",
+                           safe: keeps,
+                           safeButton: "Cancel", safeSpoken: "Cancel, keep the \(j.kind == "server" ? "server" : "job") running",
+                           actButton: j.stopLabel,
+                           actSpoken: "\(j.stopLabel): send stop signal to \(name)")
         case .endSession:
             let sub = [owner.memberCount.map { plural($0, "process", "processes") }, size]
                 .compactMap { $0 }.joined(separator: " · ")
@@ -3058,6 +4434,668 @@ struct FooterButton: View {
     }
 }
 
+// MARK: - managed jobs and pressure (S2)
+
+/// The budget line (S2.9): what is committed against the limit, and either
+/// what is still free to admit or by how much the limit is exceeded.
+func budgetLines(_ c: Committed) -> (String, String?) {
+    guard let used = c.used, let slack = c.slack, let limit = c.limit else {
+        return ("Committed memory not available" + (c.reason.map { " · \($0)" } ?? ""), nil)
+    }
+    let committed = used + slack
+    if c.over == true || committed > limit {
+        let frac = c.headroomFrac ?? 0.2
+        let keep = c.ram.map { " (\(gb($0 * frac)))" } ?? ""
+        return ("Committed \(gb(committed)) · over the \(gb(limit)) limit by \(gb(committed - limit))",
+                "The limit keeps \(Int((frac * 100).rounded())) % of memory\(keep) free · that headroom target is not currently met")
+    }
+    return ("Committed \(String(format: "%.1f", committed / GB)) of \(gb(limit)) limit · "
+                + "\(gb(max(c.free ?? limit - committed, 0))) free to admit",
+            "\(gb(used)) in use + \(gb(slack)) reserved but not yet used")
+}
+
+struct BudgetMeter: View {
+    var c: Committed
+    var body: some View {
+        let limit = max(c.limit ?? 1, 1)
+        let total = max(limit, c.committed ?? 0)
+        let over = (c.committed ?? 0) > limit
+        let fill = over ? P.red : P.accent
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(P.track)
+                HStack(spacing: 0) {
+                    Rectangle().fill(fill).frame(width: g.size.width * (c.used ?? 0) / total)
+                    Rectangle().fill(fill.opacity(0.4)).frame(width: g.size.width * (c.slack ?? 0) / total)
+                    Spacer(minLength: 0)
+                }
+                .clipShape(Capsule())
+                if over {
+                    Rectangle().fill(P.text).frame(width: 1.5, height: 10)
+                        .offset(x: g.size.width * limit / total - 0.75)
+                }
+            }
+        }
+        .frame(height: 6)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Committed memory")
+        .accessibilityValue(c.committed.map { "\(gb($0)) of \(gb(limit)) limit" + (over ? ", over the limit" : "") }
+                            ?? "not available")
+    }
+}
+
+/// The runner's mode, drawn as a shielded control so it does not read as a
+/// view filter: it changes what memmon run does on this Mac.
+struct ModeSegmented: View {
+    var mode: String
+    var onSet: (String) -> Void
+
+    private func tint(_ m: String) -> Color { m == "protect" ? P.green : P.amber }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: mode == "protect" ? "checkmark.shield" : "shield")
+                .font(.system(size: 11, weight: .semibold)).foregroundColor(tint(mode))
+                .accessibilityHidden(true)
+            Text("Protection mode").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+            Spacer(minLength: 4)
+            HStack(spacing: 2) {
+                ForEach(RunnerState.modes, id: \.self) { m in
+                    let on = m == mode
+                    Button { if !on { onSet(m) } } label: {
+                        Text(m.capitalized).font(ft(11, on ? .semibold : .regular))
+                            .foregroundColor(on ? tint(m) : P.muted)
+                            .padding(.horizontal, 9).padding(.vertical, 3)
+                            .background(Capsule().fill(on ? tint(m).opacity(0.16) : Color.clear))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(on ? "\(m.capitalized), current protection mode" : "Set protection mode to \(m.capitalized)")
+                    .accessibilityAddTraits(on ? .isSelected : [])
+                }
+            }
+            .padding(2)
+            .background(Capsule().fill(P.soft))
+            .overlay(Capsule().stroke(P.border, lineWidth: 1))
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Protection mode, \(mode)")
+    }
+}
+
+/// New heavy work is held for everyone (S2.4): after a bad reading until
+/// memory has stayed good for the hysteresis window, or while unreadable.
+struct HoldBanner: View {
+    var kind: String
+    var window: Double
+    var remaining: Double?
+
+    var text: String {
+        kind == "telemetry"
+            ? "Holding new heavy work — memmon can’t read memory pressure right now"
+            : "Holding new heavy work — memory must stay at Watch or better for \(Int(window)) s"
+    }
+    var sub: String? {
+        guard kind == "recovery", let r = remaining, r > 0 else { return nil }
+        return "\(Int(r.rounded(.up))) s to go"
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "pause.circle").font(.system(size: 13, weight: .semibold))
+                .foregroundColor(P.amber).padding(.top, 1).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(text).font(ft(12, .medium)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let sub { Text(sub).font(ft(11)).foregroundColor(P.muted).monospacedDigit() }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.amber.opacity(0.14)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(text + (sub.map { ", \($0)" } ?? ""))
+    }
+}
+
+/// What a managed job row says on its second line.
+func managedJobDetail(_ j: ManagedJob, level: String?, holding: Bool, now: Double) -> String {
+    var parts: [String] = []
+    let v1 = j.reservation == nil && j.estimateBytes == nil && j.queuePosition == nil
+        && j.interventionCause == nil
+    if v1 {
+        parts = [j.reason.isEmpty ? j.resource : j.reason, ageText(Double(j.elapsed))]
+    } else if j.needsIntervention {
+        var why: String
+        switch j.interventionCause {
+        case "growth":
+            why = "grew to \(j.footprint.map(gb) ?? "more than reserved")"
+                + (j.reservation.map { ", above its \(gb($0)) reservation" } ?? "")
+            if let level, level == "DANGER" || level == "CRITICAL" { why += "; memory \(level)" }
+        case "telemetry": why = "memory readings keep failing"
+        default: why = "memory \(level.flatMap { $0 == "UNKNOWN" ? nil : $0 } ?? "pressure is high")"
+        }
+        parts = [why]
+        if holding { parts.append("new heavy work is on hold") }
+    } else if j.waiting {
+        if let e = j.estimateBytes {
+            let how: String
+            switch j.estimateConfidence {
+            case "learned": how = j.estimateSamples.map { " (learned from \(plural($0, "run")))" } ?? " (learned)"
+            case "low": how = j.estimateSamples.map { " (from only \(plural($0, "run")))" } ?? " (few runs)"
+            case "reserved": how = " (reserved)"
+            case "unknown": how = " (unknown — default)"
+            default: how = ""
+            }
+            parts.append("needs \(gb(e))\(how)")
+        }
+        if !j.reason.isEmpty { parts.append(j.reason.hasPrefix("holding for recovery") ? "on hold" : j.reason) }
+        if let d = j.deadlineTs, d > now { parts.append("gives up in \(ageText(d - now))") }
+    } else if j.ended {
+        switch j.endedBy {
+        case "policy": parts.append("cancelled by policy")
+        case "user": parts.append("stopped from memmon")
+        default: if !j.reason.isEmpty { parts.append(j.reason) }
+        }
+    } else {
+        let now = j.footprint.map { gb($0) + " now" } ?? "— now"
+        parts.append(j.reservation.map { "\(now) / \(gb($0)) reserved" } ?? now)
+        parts.append(ageText(Double(j.elapsed)))
+    }
+    if j.interruptible { parts.append("interruptible") }
+    return parts.joined(separator: " · ")
+}
+
+struct ManagedJobRow: View {
+    var job: ManagedJob
+    var detail: String
+    var onStop: (() -> Void)?
+
+    private var title: String {
+        if job.waiting, let n = job.queuePosition { return "#\(n) \(job.label)" }
+        return job.label
+    }
+    private var chipTint: Color? {
+        if job.needsIntervention { return P.red }
+        if job.state == "running" { return P.green }
+        if job.state == "cancelled_by_policy" || job.state == "gave_up" { return P.amber }
+        return nil
+    }
+
+    private var text: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Chip(text: job.stateWord, tint: chipTint)
+                Text(title).font(ft(12, .medium)).foregroundColor(P.text).lineLimit(1).truncationMode(.tail)
+            }
+            Text(detail).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Managed job \(title), \(job.stateWord.lowercased()), \(detail)")
+    }
+
+    var body: some View {
+        if job.needsIntervention {
+            // The stop sits under the sentence, so neither has to truncate.
+            VStack(alignment: .leading, spacing: 7) {
+                text
+                HStack {
+                    Spacer(minLength: 0)
+                    if let onStop {
+                        ActionButton(title: "Stop job…", icon: "stop.circle", variant: .secondaryDanger, action: onStop)
+                            .help("Stop job: stops the job and its memmon run wrapper")
+                            .accessibilityLabel("Stop job \(job.label): stops the job and its memmon run wrapper (asks to confirm)")
+                    } else {
+                        Text("No stop listed for it · stop it where it was started")
+                            .font(ft(11)).foregroundColor(P.muted)
+                    }
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 9)
+            .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+            .padding(.vertical, 4)
+        } else {
+            text.padding(.vertical, 7)
+                .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
+        }
+    }
+}
+
+/// One row of the Under pressure card: size first, then the evidence, and
+/// S1's stop or a note saying why there is none.
+struct SuggestionRow: View {
+    var suggestion: Suggestion
+    var owner: Owner?
+    var degraded: Bool
+    var onStop: () -> Void
+
+    var ownerLine: String? {
+        guard let o = owner else { return nil }
+        switch o.agent {
+        case "claude": return "under Claude session “\(o.title)”"
+        case "codex": return "under Codex “\(o.title)”"
+        case "app", "service": return "under \(o.title)"
+        default: return nil
+        }
+    }
+    var canStop: Bool { !degraded && suggestion.stop != nil && suggestion.token != nil }
+    var note: String {
+        if degraded && suggestion.stop != nil { return "stopping is off while process identity is unavailable" }
+        return suggestion.stopNote ?? "stop it where it was started"
+    }
+
+    var body: some View {
+        let job = suggestion.asJob
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(suggestion.title).font(ft(13, .medium)).foregroundColor(P.text).lineLimit(1)
+                Text(suggestion.evidence).font(ft(12)).foregroundColor(P.muted).monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
+                if let ownerLine {
+                    Text(ownerLine).font(ft(11)).foregroundColor(P.muted).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel([suggestion.title, suggestion.evidence, ownerLine].compactMap { $0 }.joined(separator: ", "))
+            if canStop {
+                ActionButton(title: job.stopLabel + "…", icon: "stop.circle", variant: .secondaryDanger, action: onStop)
+                    .accessibilityLabel("\(job.stopLabel): \(suggestion.title) (asks to confirm)")
+            } else {
+                Text(note).font(ft(11)).foregroundColor(P.muted)
+                    .multilineTextAlignment(.trailing).frame(maxWidth: 120, alignment: .trailing)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 9)
+        .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
+    }
+}
+
+/// A small rotating ring drawn in SwiftUI, which renders offscreen (an
+/// AppKit ProgressView does not); still under Reduce Motion.
+struct Spinner: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var spin = false
+    var body: some View {
+        Circle().trim(from: 0, to: 0.72)
+            .stroke(P.accent, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+            .frame(width: 11, height: 11)
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+            }
+            .accessibilityLabel("Working")
+    }
+}
+
+/// A switch drawn in SwiftUI: the native one is an AppKit control that the
+/// offscreen renderer leaves blank.
+struct SwitchToggle: View {
+    var title: String
+    var line: String?
+    var on: Bool
+    var enabled: Bool
+    var onChange: (Bool) -> Void
+
+    var body: some View {
+        Button { if enabled { onChange(!on) } } label: {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(ft(12, .medium)).foregroundColor(P.text)
+                    if let line {
+                        Text(line).font(ft(11)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                ZStack(alignment: on ? .trailing : .leading) {
+                    Capsule().fill(on ? P.accent : P.soft)
+                        .overlay(Capsule().stroke(on ? Color.clear : P.border, lineWidth: 1))
+                    Circle().fill(on ? P.onTint : P.muted.opacity(0.6)).frame(width: 14, height: 14).padding(2)
+                        .shadow(color: .black.opacity(0.15), radius: 1, y: 0.5)
+                }
+                .frame(width: 32, height: 18)
+                .padding(.top, 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.5)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title + (line.map { ". " + $0 } ?? ""))
+        .accessibilityValue(on ? "on" : "off")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// A segmented choice for a setting, in the ModeSegmented shape.
+struct ChoiceSegmented: View {
+    var choices: [(id: String, label: String, short: String, help: String)]
+    var selected: String
+    var enabled: Bool
+    var onSet: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(choices, id: \.id) { c in
+                let on = c.id == selected
+                Button { if enabled && !on { onSet(c.id) } } label: {
+                    Text(c.short).font(ft(11, on ? .semibold : .regular)).lineLimit(1)
+                        .foregroundColor(on ? P.accent : P.muted)
+                        .frame(maxWidth: .infinity).padding(.vertical, 4)
+                        .background(Capsule().fill(on ? P.accent.opacity(0.14) : Color.clear))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(c.help)
+                .accessibilityLabel(on ? "\(c.label), current choice" : "Choose \(c.label)")
+                .accessibilityHint(c.help)
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(Capsule().fill(P.soft))
+        .overlay(Capsule().stroke(P.border, lineWidth: 1))
+        .opacity(enabled ? 1 : 0.5)
+        .disabled(!enabled)
+    }
+}
+
+/// The "Last 7 days" card (D45). Collapsed it is one quiet line; its
+/// sparkline shows only history already read, never a fetch of its own.
+struct UsageCard: View {
+    @ObservedObject var model: Model
+    var animate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var grown = false
+
+    static let chartHeight: CGFloat = 84
+    private var motion: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.16) }
+    private var growth: CGFloat { animate && !reduceMotion && !grown ? 0 : 1 }
+
+    var body: some View {
+        if model.usageOpen { expanded } else { collapsed }
+    }
+
+    private var collapsed: some View {
+        let today = model.usage?.today?.peak
+        return Button { withAnimation(motion) { model.toggleUsage() } } label: {
+            HStack(spacing: 8) {
+                Chevron(open: false)
+                Text("Last 7 days").font(ft(12, .medium)).foregroundColor(P.text)
+                Spacer(minLength: 6)
+                sparkline
+                if let today { Text("today \(gb(today))").font(ft(11)).foregroundColor(P.muted).monospacedDigit() }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panel(10)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Last 7 days" + (model.usage.map { ", " + usageBars($0, .memory).summary } ?? ""))
+        .accessibilityValue("collapsed")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var sparkline: some View {
+        let bars = model.usage.map { usageBars($0, .memory).bars }
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(0..<7, id: \.self) { k in
+                let f = bars.flatMap { k < $0.count ? $0[k].fraction : nil }
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(f == nil ? P.border : P.accent.opacity(0.75))
+                    .frame(width: 3, height: f.map { 3 + 11 * CGFloat($0) } ?? 3)
+            }
+        }
+        .frame(height: 14, alignment: .bottom)
+        .accessibilityHidden(true)
+    }
+
+    private var expanded: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Button { withAnimation(motion) { model.toggleUsage() } } label: {
+                    HStack(spacing: 8) {
+                        Chevron(open: true)
+                        Text("Last 7 days").font(ft(13, .medium)).foregroundColor(P.text)
+                        if model.usageLoading { ProgressView().controlSize(.small) }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Last 7 days")
+                .accessibilityValue("expanded")
+                Spacer(minLength: 8)
+                if let u = model.usage {
+                    let h = usageHeadline(u, model.usageView)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(h.value).font(.system(size: 22, weight: .bold)).foregroundColor(P.text)
+                            .monospacedDigit().lineLimit(1)
+                        Text(h.caption).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(usageBars(u, model.usageView).summary)
+                }
+            }
+            ChoiceSegmented(choices: UsageView.allCases.map { ($0.rawValue, $0.label, $0.label, $0.label) },
+                            selected: model.usageView.rawValue, enabled: true) { v in
+                withAnimation(motion) { model.usageView = UsageView(rawValue: v) ?? .memory }
+            }
+            if let u = model.usage {
+                chart(u)
+            } else if let e = model.usageError {
+                HStack(spacing: 8) {
+                    Text("Could not read the last 7 days: \(e).").font(ft(12)).foregroundColor(P.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    ActionButton(title: "Try again", icon: "arrow.clockwise") { model.loadUsage() }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading the last 7 days…").font(ft(12)).foregroundColor(P.muted)
+                }
+                .frame(maxWidth: .infinity, minHeight: 60)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .panel(12)
+        .onAppear { if animate && !reduceMotion { withAnimation(.easeOut(duration: 0.5)) { grown = true } } }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Last 7 days")
+    }
+
+    /// The right-hand axis gutter.
+    static let gutter: CGFloat = 38
+
+    @ViewBuilder private func chart(_ u: UsageData) -> some View {
+        let view = model.usageView
+        let bars = usageBars(u, view).bars
+        let top = usageAxisTop(u, view)
+        let today = u.today?.date
+        let h = UsageCard.chartHeight
+        ZStack(alignment: .bottomLeading) {
+            // Faint gridlines at 0, half and full, labelled on the right.
+            ForEach([0.0, 0.5, 1.0], id: \.self) { f in
+                HStack(spacing: 6) {
+                    Rectangle().fill(P.border.opacity(f == 0 ? 1 : 0.7)).frame(height: 1)
+                    Text(usageAxisLabel(top * f, view)).font(ft(9)).foregroundColor(P.muted)
+                        .monospacedDigit().frame(width: UsageCard.gutter - 6, alignment: .trailing)
+                }
+                .offset(y: -h * CGFloat(f) + 0.5)
+            }
+            if view == .memory, let ram = u.ram, abs(ram - top) > GB / 2 {
+                HStack(spacing: 6) {
+                    Rectangle().stroke(P.muted.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [3, 3])).frame(height: 1)
+                    Text("RAM").font(ft(9)).foregroundColor(P.muted).frame(width: UsageCard.gutter - 6, alignment: .trailing)
+                }
+                .offset(y: -h * CGFloat(ram / top) + 0.5)
+            }
+            HStack(alignment: .bottom, spacing: 0) {
+                ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
+                    GeometryReader { g in
+                        let w = g.size.width * 0.55
+                        column(bar, u, view, top: top, width: w, isToday: bar.day.date == today)
+                            .frame(width: g.size.width, height: h, alignment: .bottom)
+                    }
+                    .frame(height: h)
+                    .help(bar.spoken)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(bar.spoken)
+                }
+            }
+            .padding(.trailing, UsageCard.gutter)
+        }
+        .frame(height: h)
+        .padding(.top, 6)
+        .animation(reduceMotion || !animate ? nil : .easeOut(duration: 0.3), value: view)
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
+                VStack(spacing: 0) {
+                    Text(bar.label).font(ft(10, bar.day.date == today ? .semibold : .regular))
+                        .foregroundColor(bar.day.date == today ? P.text : P.muted)
+                    if bar.day.empty && view != .protection {
+                        Text("—").font(ft(10)).foregroundColor(P.muted)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.trailing, UsageCard.gutter)
+        .accessibilityHidden(true)
+        legend(u, view)
+    }
+
+    /// A bar's opacity: today in full, other days at 70 %, days with few
+    /// samples at 40 % so they read as uncertain.
+    private func emphasis(_ d: UsageDay, isToday: Bool) -> Double {
+        d.few ? 0.4 : isToday ? 1 : 0.7
+    }
+
+    private func soft(_ c: Color) -> LinearGradient {
+        LinearGradient(colors: [c, c.opacity(0.8)], startPoint: .top, endPoint: .bottom)
+    }
+
+    @ViewBuilder private func column(_ bar: UsageBar, _ u: UsageData, _ view: UsageView,
+                                     top: Double, width: CGFloat, isToday: Bool) -> some View {
+        let h = UsageCard.chartHeight
+        if bar.day.empty && view != .protection {
+            // No samples: an outline stub, never a guessed value.
+            RoundedRectangle(cornerRadius: 2)
+                .stroke(P.muted.opacity(0.55), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                .frame(width: width, height: 6)
+        } else {
+            let op = emphasis(bar.day, isToday: isToday)
+            switch view {
+            case .memory:
+                let height = max(2, h * CGFloat((bar.day.peak ?? 0) / top) * growth)
+                ZStack(alignment: .bottom) {
+                    TopRounded(radius: 4).fill(soft(P.sectionClaude)).frame(width: width, height: height)
+                    if let avg = bar.day.avg {
+                        // The day's average: a thin tick across the bar.
+                        Rectangle().fill(P.text.opacity(0.7)).frame(width: width + 4, height: 2)
+                            .offset(y: -h * CGFloat(avg / top) * growth + 1)
+                    }
+                }
+                .opacity(op)
+            case .consumers:
+                let k = h / CGFloat(top) * growth
+                VStack(spacing: 1) {
+                    ForEach(UsageData.sections.reversed(), id: \.key) { s in
+                        if let v = bar.day.bySection[s.key], v > 0 {
+                            Rectangle().fill(soft(UsageData.color(s.key))).frame(height: max(1, k * CGFloat(v)))
+                        }
+                    }
+                }
+                .frame(width: width)
+                .clipShape(TopRounded(radius: 4))
+                .opacity(op)
+            case .protection:
+                let w = bar.day.warned ?? 0, st = bar.day.stopped ?? 0
+                let k = h / CGFloat(top) * growth
+                if w + st == 0 {
+                    Rectangle().fill(P.border).frame(width: width, height: 1)
+                } else {
+                    VStack(spacing: 1) {
+                        if w > 0 { Rectangle().fill(soft(P.sectionService)).frame(height: k * CGFloat(w)) }
+                        if st > 0 { Rectangle().fill(soft(P.red)).frame(height: k * CGFloat(st)) }
+                    }
+                    .frame(width: width)
+                    .clipShape(TopRounded(radius: 4))
+                    .opacity(op)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func legend(_ u: UsageData, _ view: UsageView) -> some View {
+        HStack(spacing: 12) {
+            switch view {
+            case .memory:
+                legendItem(P.sectionClaude, "Daily peak")
+                legendItem(P.text.opacity(0.7), "Average", tick: true)
+                if let ram = u.ram, abs(ram - usageAxisTop(u, view)) > GB / 2 { legendItem(P.muted, "RAM", dashed: true) }
+            case .consumers:
+                ForEach(u.topSections, id: \.key) { s in
+                    // Three to a line: the legend uses the short name; the
+                    // summary and each bar keep the full one.
+                    legendItem(UsageData.color(s.key), s.key == "dev" ? "Terminals" : s.name)
+                }
+            case .protection:
+                legendItem(P.sectionService, "Warned")
+                legendItem(P.red, "Stopped")
+            }
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        if view == .protection {
+            Text(u.runnerRecorded
+                 ? "Managed jobs: held \(u.days.reduce(0) { $0 + ($1.held ?? 0) }) · cancelled \(u.days.reduce(0) { $0 + ($1.cancelled ?? 0) })"
+                 : "Managed-job holds and cancels: not recorded")
+                .font(ft(11)).foregroundColor(P.muted)
+        }
+    }
+
+    private func legendItem(_ c: Color, _ name: String, tick: Bool = false, dashed: Bool = false) -> some View {
+        HStack(spacing: 5) {
+            if dashed {
+                Rectangle().stroke(c, style: StrokeStyle(lineWidth: 1, dash: [3, 2])).frame(width: 12, height: 1)
+            } else if tick {
+                Rectangle().fill(c).frame(width: 10, height: 2)
+            } else {
+                TopRounded(radius: 2).fill(c).frame(width: 8, height: 9)
+            }
+            Text(name).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
+        }
+    }
+}
+
+/// A bar with rounded top corners and a square base.
+struct TopRounded: Shape {
+    var radius: CGFloat
+    func path(in r: CGRect) -> Path {
+        let c = min(radius, r.width / 2, r.height)
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.minX, y: r.minY + c))
+        p.addQuadCurve(to: CGPoint(x: r.minX + c, y: r.minY), control: CGPoint(x: r.minX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX - c, y: r.minY))
+        p.addQuadCurve(to: CGPoint(x: r.maxX, y: r.minY + c), control: CGPoint(x: r.maxX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+        p.closeSubpath()
+        return p
+    }
+}
+
 struct BodyHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
@@ -3153,7 +5191,7 @@ struct MoodFace: View {
 
 /// What the header's status pill says about the sample on screen.
 struct StatusState: Equatable {
-    enum Kind: String { case live, syncing, sampling, stale }
+    enum Kind: String { case live, syncing, sampling, stale, plain }
     var kind: Kind
     var text: String
     var spoken: String
@@ -3178,6 +5216,14 @@ func statusState(_ s: OwnersSnap?, refreshing: Bool, stillSampling: Bool) -> Sta
     }
     guard let s else { return StatusState(kind: .stale, text: "No sample", spoken: sampled) }
     guard let age = s.age else { return StatusState(kind: .stale, text: "Time unknown", spoken: sampled) }
+    // UNKNOWN already says the reading can't be trusted: the age is plain
+    // and muted, with no live dot, no amber clock and no "stale" on screen.
+    // The spoken label still says stale, so nothing hides it.
+    if s.system.scoreLevel == "UNKNOWN" {
+        return StatusState(kind: .plain, text: "Sampled \(ageText(age)) ago",
+                           spoken: "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader")"
+                               + (s.stale ? ", stale" : "") + ", pressure unknown")
+    }
     if s.stale { return StatusState(kind: .stale, text: "Stale · \(ageText(age))", spoken: sampled) }
     return StatusState(kind: .live, text: "Live · \(ageText(age))", spoken: sampled)
 }
@@ -3193,6 +5239,7 @@ struct StatusPill: View {
         case .live: return P.green
         case .stale: return P.amber
         case .syncing, .sampling: return P.accent
+        case .plain: return P.muted
         }
     }
 
@@ -3218,9 +5265,11 @@ struct StatusPill: View {
                     }
             case .stale:
                 Image(systemName: "clock").font(.system(size: 10, weight: .medium)).foregroundColor(tint)
+            case .plain:
+                EmptyView()
             }
             Text(state.text).font(ft(11, .medium)).lineLimit(1)
-                .foregroundColor(state.kind == .stale ? P.amber : P.text)
+                .foregroundColor(state.kind == .stale ? P.amber : state.kind == .plain ? P.muted : P.text)
         }
         .padding(.horizontal, 9).frame(height: 22)
         .background(Capsule().fill(P.panel.opacity(0.7)))
@@ -3368,13 +5417,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             header.background(GeometryReader { Color.clear.preference(key: ChromeHeightKey.self, value: $0.size.height) })
             Rectangle().fill(P.border).frame(height: 1)
-            if let snap = model.snap {
+            if model.snap != nil || model.settingsOpen {
                 if flattened {
-                    content(snap)
+                    mainBody
                 } else {
                     ScrollViewReader { proxy in
                         ScrollView {
-                            content(snap).background(GeometryReader {
+                            mainBody.background(GeometryReader {
                                 Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height)
                             })
                         }
@@ -3394,6 +5443,15 @@ struct ContentView: View {
         }
         .onPreferenceChange(BodyHeightKey.self) { bodyHeight = $0 }
         .onPreferenceChange(ChromeHeightKey.self) { chromeHeight = $0 }
+    }
+
+    /// The list, or the Settings panel in its place.
+    @ViewBuilder private var mainBody: some View {
+        if model.settingsOpen {
+            settingsPanel
+        } else if let snap = model.snap {
+            content(snap)
+        }
     }
 
     private var loading: some View {
@@ -3431,9 +5489,281 @@ struct ContentView: View {
             StatusPill(state: statusState(model.snap, refreshing: model.refreshing,
                                           stillSampling: model.stillSampling))
                 .id(model.tick)
+            ActionButton(title: "Settings", icon: model.settingsOpen ? "xmark" : "gearshape", variant: .icon) {
+                withAnimation(motion(0.12)) {
+                    if model.settingsOpen { model.closeSettings() } else { model.openSettings() }
+                }
+            }
+            .help(model.settingsOpen ? "Close settings" : "Settings")
+            .accessibilityLabel(model.settingsOpen ? "Close settings" : "Settings")
         }
         .padding(.horizontal, 16).padding(.top, 13).padding(.bottom, 12)
         .background(LinearGradient(colors: [P.headerTop, P.headerBottom], startPoint: .top, endPoint: .bottom))
+    }
+
+    // MARK: explain (D47)
+
+    /// Claude's reply, shown as plain text (Text(verbatim:)): nothing in it
+    /// is formatted, linked or run.
+    private var explainCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).foregroundColor(P.accent)
+                    .accessibilityHidden(true)
+                Text(model.explainText == nil ? "Ask Claude what to do" : model.explainHeading)
+                    .font(ft(13, .medium)).accessibilityAddTraits(.isHeader)
+                if model.explainBusy { Spinner() }
+                Spacer()
+                ActionButton(title: "Close", icon: "xmark", variant: .icon) {
+                    withAnimation(motion(0.12)) { model.dismissExplain() }
+                }
+                .accessibilityLabel("Close Ask Claude")
+            }
+            if model.explainBusy {
+                HStack(spacing: 8) {
+                    Text("Asking Claude… up to \(Int(Model.explainTimeout)) s.").font(ft(12)).foregroundColor(P.muted)
+                    Spacer()
+                    ActionButton(title: "Cancel") { model.cancelExplain() }
+                        .accessibilityLabel("Cancel asking Claude")
+                }
+            }
+            if let e = model.explainError {
+                Text(verbatim: e).font(ft(12)).foregroundColor(e.hasPrefix("Cancelled") ? P.muted : P.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let t = model.explainText {
+                HStack(alignment: .top, spacing: 7) {
+                    if model.explainQuiet {
+                        // memmon's own all-clear: Claude was not asked.
+                        Image(systemName: "checkmark.circle").font(.system(size: 13, weight: .medium))
+                            .foregroundColor(P.green).padding(.top, 1).accessibilityHidden(true)
+                    }
+                    if model.explainQuiet {
+                        Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    } else if model.explainItems.isEmpty {
+                        explainLineList(t)
+                    } else {
+                        explainItemList(model.explainItems)
+                    }
+                }
+                HStack(alignment: .top, spacing: 8) {
+                    if !model.explainQuiet {
+                        Text("From Claude. memmon never acts on it.")
+                            .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    ActionButton(title: "Ask again", variant: .link) { model.explain() }
+                }
+            } else if model.explainError != nil && !model.explainBusy {
+                HStack { Spacer(); ActionButton(title: "Try again", variant: .link) { model.explain() } }
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Ask Claude")
+    }
+
+    /// One row per item: the owner (with its section's dot), what to do,
+    /// and why. Plain text throughout.
+    private func explainItemList(_ items: [ExplainItem]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(items.enumerated()), id: \.offset) { k, item in
+                if k > 0 { Rectangle().fill(P.border).frame(height: 1) }
+                let sec = explainSection(item.owner, model.snap)
+                // The action and why sit under the name, not under the bullet.
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    ExplainBullet(color: sec.map(P.section) ?? P.muted)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(verbatim: item.owner).font(ft(12, .semibold)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(verbatim: item.action).font(ft(12)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if !item.why.isEmpty {
+                            Text(verbatim: item.why).font(ft(11)).foregroundColor(P.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(item.spoken)
+            }
+        }
+    }
+
+    /// An older memmon's plain reply: one muted bullet per line, never one
+    /// paragraph. A line that reads "owner: rest" shows the owner in semibold.
+    private func explainLineList(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(explainLines(text).enumerated()), id: \.offset) { _, line in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    ExplainBullet(color: P.muted)
+                    Group {
+                        if let (owner, rest) = explainLineOwner(line) {
+                            Text(verbatim: owner).fontWeight(.semibold) + Text(verbatim: ": " + rest)
+                        } else {
+                            Text(verbatim: line)
+                        }
+                    }
+                    .font(ft(12)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Read from the Text itself, so what is spoken is what is shown.
+                .accessibilityElement(children: .combine)
+            }
+        }
+    }
+
+    // MARK: settings (D43)
+
+    private func settingsCard<C: View>(_ title: String, _ icon: String, @ViewBuilder _ body: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 12, weight: .medium)).foregroundColor(P.muted)
+                    .accessibilityHidden(true)
+                Text(title).font(ft(13, .medium)).foregroundColor(P.text).accessibilityAddTraits(.isHeader)
+            }
+            body()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel(12)
+    }
+
+    private var settingsPanel: some View {
+        let busy = model.settingsBusy != nil
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Settings").font(ft(15, .semibold)).accessibilityAddTraits(.isHeader)
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                // Closing is the header's × (or Esc), so there is one way, not two.
+            }
+            .padding(.horizontal, 4)
+            if let e = model.settingsError {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "xmark.octagon").font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(P.red).padding(.top, 1).accessibilityHidden(true)
+                    Text(e).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ActionButton(title: "Dismiss", icon: "xmark", variant: .icon) { model.settingsError = nil }
+                        .accessibilityLabel("Dismiss the settings error")
+                        .padding(.top, -3)
+                }
+                .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Settings error: " + e)
+            }
+            if let st = model.settings {
+                settingsCards(st, busy: busy)
+            } else if model.settingsError == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading settings…").font(ft(12)).foregroundColor(P.muted)
+                }
+                .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ActionButton(title: "Try again", icon: "arrow.clockwise") { model.loadSettings() }
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 12)
+        .onExitCommand { withAnimation(motion(0.12)) { model.closeSettings() } }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings")
+    }
+
+    @ViewBuilder private func settingsCards(_ st: SettingsInfo, busy: Bool) -> some View {
+        let gate = SettingsInfo.gateChoice(st.gateMode)
+        settingsCard("Command protection", "shield") {
+            HStack(spacing: 8) {
+                Text("Stop heavy commands at").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                ChoiceSegmented(choices: st.gateChoices.map { m in
+                    let c = SettingsInfo.gateChoice(m)
+                    return (m, c.label, c.short, c.label + ": " + c.line)
+                }, selected: st.gateMode, enabled: !busy && !st.gateLocked) { model.changeSetting("gate_mode", $0) }
+            }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Gate mode, \(gate.label)" + (st.gateLocked ? ", locked: " + (st.warning ?? SettingsInfo.envWarning) : ""))
+            Text(gate.line).font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+            if st.gateLocked {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "lock").font(.system(size: 11, weight: .semibold)).padding(.top, 1)
+                    Text(st.warning ?? SettingsInfo.envWarning).font(ft(11))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundColor(P.amber)
+                .accessibilityElement(children: .combine)
+            }
+            Rectangle().fill(P.border).frame(height: 1)
+            Text(st.pausedForever ? "Paused until you resume · every command runs without a memory check"
+                 : st.paused ? "Paused until \(eventTime(st.pausedUntil ?? 0)) · every command runs without a memory check"
+                 : "Not paused")
+                .font(ft(11)).foregroundColor(st.paused ? P.amber : P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach([("1 h", "1h"), ("8 h", "8h"), ("Until resumed", "forever")], id: \.1) { label, d in
+                    ActionButton(title: label) { model.pauseProtection(d) }
+                        .accessibilityLabel(d == "forever" ? "Pause command protection until resumed"
+                                                           : "Pause command protection for \(label)")
+                }
+                Spacer(minLength: 0)
+                if st.paused {
+                    ActionButton(title: "Resume", icon: "play.fill", variant: .primary) { model.pauseProtection(nil) }
+                        .accessibilityLabel("Resume command protection")
+                }
+            }
+            .disabled(busy).opacity(busy ? 0.5 : 1)
+        }
+        settingsCard("Managed jobs", "list.bullet.rectangle") {
+            if let mode = st.runnerMode {
+                ModeSegmented(mode: mode) { model.changeSetting("runner_mode", $0) }
+                    .disabled(busy).opacity(busy ? 0.5 : 1)
+            }
+            SwitchToggle(title: "Auto-cancel interruptible jobs under CRITICAL",
+                         line: "memmon stops jobs started with --interruptible after 10 s at CRITICAL",
+                         on: st.autoCancel, enabled: !busy) { model.setFlag("auto_cancel_interruptible", $0) }
+        }
+        settingsCard("Under pressure", "exclamationmark.triangle") {
+            SwitchToggle(title: "Suggest stops under pressure",
+                         line: "Lists heavy jobs memmon can’t hold. memmon never stops them on its own.",
+                         on: st.suggestions, enabled: !busy) { model.setFlag("pressure_suggestions", $0) }
+            SwitchToggle(title: "Notifications",
+                         line: "Sampling gaps, stop suggestions and managed jobs that need you",
+                         on: st.notifications, enabled: !busy) { model.setFlag("notifications", $0) }
+        }
+        settingsCard("Appearance", "circle.lefthalf.filled") {
+            HStack(spacing: 8) {
+                Text("Theme").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                ChoiceSegmented(choices: ThemeChoice.allCases.map {
+                    let l = $0.label(systemDark: model.systemDark); return ($0.rawValue, l, l, l)
+                },
+                                selected: model.theme.rawValue, enabled: true) { v in
+                    model.setTheme(ThemeChoice(rawValue: v) ?? .system)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Theme, \(model.theme.label(systemDark: model.systemDark))")
+            }
+        }
+        if let dir = st.stateDir {
+            HStack(spacing: 8) {
+                ActionButton(title: "Open data folder", icon: "folder") { model.openDataFolder() }
+                    .accessibilityLabel("Open data folder")
+                Text((dir as NSString).abbreviatingWithTildeInPath)
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            .padding(.horizontal, 4)
+        }
     }
 
     private func content(_ s: OwnersSnap) -> some View {
@@ -3455,6 +5785,13 @@ struct ContentView: View {
                     .padding(.horizontal, 12).padding(.bottom, 10)
                     .transition(.opacity)
             }
+            if model.explainOpen {
+                explainCard.padding(.horizontal, 12).padding(.bottom, 12)
+            }
+            if !s.shownSuggestions.isEmpty {
+                underPressure(s).padding(.horizontal, 12).padding(.bottom, 12)
+            }
+            UsageCard(model: model, animate: !flattened).padding(.horizontal, 12).padding(.bottom, 12)
             toolbar.padding(.horizontal, 16).padding(.bottom, 8)
             HStack {
                 Text("Task / app")
@@ -3470,8 +5807,12 @@ struct ContentView: View {
                 Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
                     .padding(.horizontal, 18).padding(.bottom, 8)
             }
-            if !s.runnerJobs.isEmpty {
-                managedJobs(s.runnerJobs).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
+            if let r = s.runner, let hold = s.heldWork {
+                HoldBanner(kind: hold, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining)
+                    .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
+            }
+            if s.showsManagedJobs {
+                managedJobs(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
             }
             gateSection(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 10)
         }
@@ -3489,6 +5830,7 @@ struct ContentView: View {
         let sys = s.system
         let level = sys.scoreLevel
         let tint = P.tint(level)
+        let headline = pressureHeadline(level, reason: sys.levelReason)
         let segments = ringSegments(s.rows, used: sys.usedBytes)
         let used = sys.usedBytes, ram = sys.ramBytes
         // A partial sum would understate the machine, so memmon sends a CPU
@@ -3503,11 +5845,11 @@ struct ContentView: View {
             .sorted { $0.bytes > $1.bytes }.prefix(4))
             + segments.filter { $0.kind == .system }
         let spokenMemory: String = {
-            guard let used else { return "Memory in use not available, pressure \(pressureWord(level).lowercased())" }
+            guard let used else { return "Memory in use not available, pressure \(headline.spoken)" }
             var head = "Memory " + String(format: "%.1f", used / GB)
             head += ram.map { String(format: " of %.0f GB in use", $0 / GB) } ?? " GB in use"
             if over { head += ", over the limit" }
-            head += ", pressure \(pressureWord(level).lowercased())"
+            head += ", pressure \(headline.spoken)"
             let parts = segments.map { "\($0.name) \($0.spoken)" } + (free.map { ["free \(gb($0))"] } ?? [])
             return head + "; " + parts.joined(separator: ", ")
         }()
@@ -3526,10 +5868,16 @@ struct ContentView: View {
                         }
                         Text(used == nil ? "not available" : ram.map { String(format: "in use of %.0f", $0 / GB) } ?? "in use")
                             .font(ft(10)).foregroundColor(P.muted)
-                        Text(pressureWord(level)).font(ft(10, .semibold)).foregroundColor(tint)
-                            .padding(.horizontal, 7).padding(.vertical, 1)
-                            .background(Capsule().fill(tint.opacity(0.14)))
-                            .padding(.top, 2)
+                        HStack(spacing: 3) {
+                            if levelTone(level) == .muted {
+                                Image(systemName: "questionmark.circle").font(.system(size: 9, weight: .semibold))
+                            }
+                            Text(headline.shown).font(ft(10, .semibold))
+                        }
+                        .foregroundColor(tint)
+                        .padding(.horizontal, 7).padding(.vertical, 1)
+                        .background(Capsule().fill(tint.opacity(0.14)))
+                        .padding(.top, 2)
                     }
                     .monospacedDigit()
                 }
@@ -3572,11 +5920,24 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             // Plain words on the card; the raw score and kernel level are for hover.
-            Text("\(cpuNow.map { String(format: "CPU %.1f of %.0f cores busy", $0, ncpu) } ?? cpuMissing)"
-                 + (sys.reason.map { " · memory reading failed: \($0)" } ?? ""))
+            Text(healthLine(s, cpuNow: cpuNow, cpuMissing: cpuMissing, ncpu: ncpu))
                 .font(ft(11)).foregroundColor(P.muted).monospacedDigit()
                 .fixedSize(horizontal: false, vertical: true)
-                .help("Pressure score \(level ?? "unavailable") · macOS memory pressure \(sys.pressureLevel ?? "unavailable")")
+                .help("Pressure score \(level ?? "unavailable")"
+                      + (sys.levelReason.map { " (\($0))" } ?? "")
+                      + " · macOS memory pressure \(sys.kernel ?? "unavailable")")
+            if let notice = gapNotice(s, dismissed: model.dismissedGap, now: nowTs()) {
+                gapNoticeRow(notice)
+            }
+            if !model.explainOpen {
+                HStack {
+                    Spacer()
+                    ActionButton(title: "Ask Claude what to do", icon: "sparkles", variant: .link) { model.explain() }
+                        .help("Sends a short summary, with no paths, PIDs or tokens, to Claude. Nothing is done with the answer.")
+                        .accessibilityLabel("Ask Claude what to do about memory")
+                }
+                .padding(.top, -4).padding(.bottom, -6)
+            }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
         .panel(13)
@@ -3591,6 +5952,37 @@ struct ContentView: View {
         }
         return ([("Empty now", gb(idle)), ("Cache macOS can reclaim", gb(cache))],
                 "\(gb(idle)) empty right now and \(gb(cache)) of file cache macOS reclaims when an app needs it.")
+    }
+
+    private func healthLine(_ s: OwnersSnap, cpuNow: Double?, cpuMissing: String, ncpu: Double) -> String {
+        let sys = s.system
+        let cpu: String = cpuNow.map { String(format: "CPU %.1f of %.0f cores busy", $0, ncpu) } ?? cpuMissing
+        // When memmon's own read failed, the kernel's level is the only one left: say it.
+        let kernel: String = sys.pressureLevel == nil ? (sys.kernelLevel.map { " · macOS reports \($0) pressure" } ?? "") : ""
+        return cpu + kernel + (sys.reason.map { " · memory reading failed: \($0)" } ?? "")
+    }
+
+    private func gapNoticeRow(_ n: GapNotice) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rectangle().fill(P.border).frame(height: 1).padding(.bottom, 9)
+            HStack(alignment: .top, spacing: 7) {
+                Image(systemName: "clock").font(.system(size: 12, weight: .medium))
+                    .foregroundColor(P.amber).padding(.top, 1).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(n.text).font(ft(12)).foregroundColor(P.text)
+                    Text(n.sub).font(ft(12)).foregroundColor(P.muted)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(n.text + " " + n.sub)
+                Spacer(minLength: 2)
+                ActionButton(title: "Dismiss", icon: "xmark", variant: .icon) {
+                    withAnimation(motion(0.12)) { model.dismissGap(n.key) }
+                }
+                .accessibilityLabel("Dismiss the sampling gap notice")
+                .padding(.top, -3)
+            }
+        }
     }
 
     @ViewBuilder private func legendRow(_ seg: RingSegment, _ s: OwnersSnap) -> some View {
@@ -3626,6 +6018,8 @@ struct ContentView: View {
             default: return ("Protection unknown", "Protection status unknown", P.muted)
             }
         }()
+        // The route state is "on"/"off"; its sentence is coverage[0].
+        let lines = !s.coverage.isEmpty ? s.coverage : (p?.route.map { ["Route \($0)"] } ?? [])
         return HStack(spacing: 5) {
             Image(systemName: p?.summary == "on" ? "checkmark.shield" : "shield")
                 .font(.system(size: 11, weight: .semibold))
@@ -3636,9 +6030,10 @@ struct ContentView: View {
         .background(Capsule().fill(tint.opacity(0.13)))
         .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
         .fixedSize()
-        .help(full)
+        .help(([full] + lines).joined(separator: "\n"))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(full)
+        .accessibilityValue(lines.joined(separator: ". "))
     }
 
     private func degradedBanner(_ reason: String?) -> some View {
@@ -3751,8 +6146,11 @@ struct ContentView: View {
 
     // MARK: managed jobs (memmon run)
 
-    private func managedJobs(_ jobs: [ManagedJob]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func managedJobs(_ s: OwnersSnap) -> some View {
+        let r = s.runner
+        let jobs = s.runnerJobs.sorted { $0.rank < $1.rank }
+        let holding = s.heldWork != nil || (r?.committed?.over == true && (r?.mode ?? "protect") == "protect")
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "list.bullet.rectangle").font(.system(size: 13, weight: .medium))
                     .foregroundColor(P.muted).accessibilityHidden(true)
@@ -3760,26 +6158,79 @@ struct ContentView: View {
                 Spacer()
                 Text("memmon run").font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
             }
-            .padding(.bottom, 4)
-            ForEach(jobs) { job in
-                let line = "\(job.label) · \(job.state) · \(ageText(Double(job.elapsed)))"
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(line).font(ft(12, .medium)).foregroundColor(P.text)
-                    Text(job.reason.isEmpty ? job.resource : "\(job.resource) — \(job.reason)")
-                        .font(ft(11)).foregroundColor(P.muted)
-                        .fixedSize(horizontal: false, vertical: true)
+            if let mode = r?.mode {
+                ModeSegmented(mode: mode) { m in model.setRunMode(m) }
+                if let w = r?.modeWarning {
+                    Text(w).font(ft(11)).foregroundColor(P.amber).fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.vertical, 7)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
+                if mode != "protect" {
+                    Text(mode == "observe" ? "Observe · jobs start as before; memmon only logs what it would hold"
+                                           : "Paused · jobs start as before, with no budget or hold")
+                        .font(ft(11)).foregroundColor(P.amber).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let c = r?.committed {
+                let (head, sub) = budgetLines(c)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(head).font(ft(12, .medium)).foregroundColor(c.over == true ? P.red : P.text)
+                        .monospacedDigit().fixedSize(horizontal: false, vertical: true)
+                    if c.committed != nil { BudgetMeter(c: c) }
+                    if let sub {
+                        Text(sub).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Managed job \(line), \(job.resource)" + (job.reason.isEmpty ? "" : ", \(job.reason)"))
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(jobs) { job in
+                    let target = job.needsIntervention ? s.stopTarget(job) : nil
+                    ManagedJobRow(job: job,
+                                  detail: managedJobDetail(job, level: s.system.scoreLevel, holding: holding, now: nowTs()),
+                                  onStop: target.map { t in { withAnimation(motion(0.12)) { model.ask(t.0, t.1) } } })
+                }
             }
         }
-        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 4)
+        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 8)
         .panel(12)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Managed jobs")
+    }
+
+    // MARK: under pressure (unmanaged heavy work)
+
+    private func underPressure(_ s: OwnersSnap) -> some View {
+        let level = s.system.scoreLevel
+        let word = level == "DANGER" || level == "CRITICAL" ? level!
+            : s.system.kernel.map { "kernel \($0)" } ?? "readings unavailable"
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle").font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(P.red).accessibilityHidden(true)
+                Text("Under pressure · \(word)").font(ft(13, .medium)).foregroundColor(P.text)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+            }
+            Text("These jobs weren’t started through \(Text("memmon run").font(.system(size: 11, design: .monospaced))), so memmon can’t hold them. Stop one to free memory.")
+                .font(ft(12)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 2)
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(s.shownSuggestions) { sg in
+                    let owner = s.owners.first { $0.id == sg.ownerId }
+                    SuggestionRow(suggestion: sg, owner: owner, degraded: s.degraded) {
+                        let o = owner ?? Owner(id: sg.ownerId, kind: "unknown", agent: "unknown", title: sg.task)
+                        withAnimation(motion(0.12)) { model.ask(.suggestion(sg.asJob), o) }
+                    }
+                }
+            }
+            Text("memmon never stops these on its own.").font(ft(11)).foregroundColor(P.muted)
+                .padding(.top, 2)
+        }
+        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 9)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Under pressure, \(word)")
     }
 
     // MARK: gate (retained)
@@ -3856,6 +6307,10 @@ struct ContentView: View {
         }
         guard let level = s.system.scoreLevel else {
             return ("Memory level is unknown right now; a retry may be stopped again.", P.amber)
+        }
+        if level == "UNKNOWN" {
+            // The gate allows silently on UNKNOWN (fail-open), so a retry runs.
+            return ("Memory level is unknown right now; a retry runs without a memory check.", P.amber)
         }
         if level == "HEALTHY" {
             return ("Memory is HEALTHY now — waiting commands can be retried.", P.green)
@@ -4095,17 +6550,50 @@ func configurePopover(_ popover: NSPopover, model: Model, onQuit: @escaping () -
     return host
 }
 
+/// What opening and closing the popover starts and stops, shared by the app
+/// and the self-test: the sync, the freshness ticker and the kernel's
+/// memory-pressure source, which runs only while the popover is open.
+func popoverOpened(_ model: Model, _ watch: PressureWatch) {
+    model.popoverShown = true
+    model.refresh()          // sync on open — the only expensive work
+    // An open "Last 7 days" card re-reads history once its 5 min cache has
+    // expired; a collapsed one never does.
+    model.loadUsage()
+    model.startTicking()
+    watch.start { [weak model] in model?.pressureChanged() }
+}
+
+func popoverHidden(_ model: Model, _ watch: PressureWatch) {
+    watch.stop()
+    model.stopTicking()
+    model.popoverClosed()
+}
+
 final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let popover = NSPopover()
     let model = Model()
     let cache = NSString(string: "~/.claude/memmon/latest.json").expandingTildeInPath
+    let runnerDir = NSString(string: "~/.claude/memmon/runner").expandingTildeInPath
+    let configPath = NSString(string: "~/.claude/memmon/config.json").expandingTildeInPath
+    let pressureWatch = PressureWatch()
+    var lookWatch: SystemLookWatch?
+    /// One runner read at a time; a slow disk skips a tick instead of piling up.
+    var readingRunner = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
         model.popoverShown = false
+        model.prefs = DefaultsStore()
+        let notifier = SystemNotifier()
+        notifier.onClick = { [weak self] t in self?.openNotice(t) }
+        model.alerts = InterventionAlerts(notifier: notifier, store: model.prefs)
 
         configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
+        applyTheme(popover, model.theme)
+        model.onTheme = { [weak self] t in self.map { applyTheme($0.popover, t) } }
+        model.systemDark = systemIsDark()
+        lookWatch = SystemLookWatch { [weak self] dark in self?.model.systemDark = dark }
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -4117,6 +6605,38 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
             self.updateTitleFromCache()
         }
+        // A job that needs intervention is noticed with the popover closed:
+        // the runner's own small records, read every 10 s, never a spawn.
+        Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
+            guard !self.readingRunner, self.model.alerts != nil else { return }
+            self.readingRunner = true
+            let dir = self.runnerDir, config = self.configPath
+            DispatchQueue.global(qos: .utility).async {
+                let rows = runnerRows(dir)
+                let on = notificationsEnabled(configPath: config)
+                DispatchQueue.main.async {
+                    self.readingRunner = false
+                    self.model.alerts?.enabled = on
+                    self.model.alerts?.observe(rows)
+                }
+            }
+        }
+    }
+
+    /// Shows the popover for a clicked notification; the refresh it starts
+    /// decides what opens.
+    func openNotice(_ t: NoticeTarget) {
+        guard model.alerts?.enabled ?? false else { return }
+        if popover.isShown {
+            model.openFromNotification(t)
+        } else if let b = statusItem.button {
+            NSApp.activate(ignoringOtherApps: true)
+            model.pendingNotice = t
+            model.popoverShown = true
+            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            model.settingsOpen = false
+            popoverOpened(model, pressureWatch)
+        }
     }
 
     @objc func toggle() {
@@ -4126,14 +6646,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSApp.activate(ignoringOtherApps: true)
             model.popoverShown = true
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
-            model.refresh()          // sync on open — the only expensive work
-            model.startTicking()
+            popoverOpened(model, pressureWatch)
         }
     }
 
     func popoverDidClose(_ note: Notification) {
-        model.stopTicking()
-        model.popoverClosed()
+        popoverHidden(model, pressureWatch)
         updateTitleFromCache()
     }
 
@@ -4182,7 +6700,20 @@ struct RenderOptions {
     /// Sections opened (or closed, with a "-" prefix) and sections showing every row.
     var sections: [String] = []
     var showAll: [String] = []
+    /// A suggestion (job_id) whose stop is being confirmed.
+    var confirmSuggestion: String?
+    /// The gap notice key already dismissed.
+    var dismissedGap: Double?
+    /// The Settings panel is open, showing `_settings`, after an optional
+    /// `settings_set` outcome ({key, exit, stdout}).
+    var settings = false
+    /// `_usage` history: "memory" / "consumers" / "protection" opens the card
+    /// on that view; "collapsed" leaves it closed with the history cached.
+    var usage: String?
 }
+
+/// The fixture's own `_view`, for view state richer than RenderOptions holds.
+var fixtureView: [String: Any] = [:]
 
 /// A fixture may name a `_base` fixture whose keys it overrides, and carries
 /// its own view state in `_view`; command-line flags win over both.
@@ -4220,6 +6751,11 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.sections = (view["sections"] as? [String] ?? [])
         + (argValue("--sections")?.split(separator: ",").map(String.init) ?? [])
     o.showAll = view["show_all"] as? [String] ?? []
+    o.confirmSuggestion = argValue("--confirm-suggestion") ?? str(view["confirm_suggestion"])
+    o.dismissedGap = argValue("--dismissed-gap").flatMap(Double.init) ?? num(view["dismissed_gap"])
+    o.settings = ARGS.contains("--settings") || (view["settings"] as? Bool ?? false)
+    o.usage = argValue("--usage") ?? str(view["usage"])
+    fixtureView = view
     return o
 }
 
@@ -4230,6 +6766,7 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     guard let snap = OwnersSnap.decode(json) else { fail("fixture is not an owners payload (schema 2)") }
     let m = Model()
     m.live = false
+    m.systemDark = o.dark
     m.snap = snap
     m.sort = o.sort
     m.expanded = o.select
@@ -4244,6 +6781,43 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     for name in o.showAll {
         guard let sec = OwnerSection(rawValue: name) else { fail("unknown section \(name)") }
         m.showAll.insert(sec)
+    }
+    if let d = o.dismissedGap { m.prefs.set(d, PrefKey.dismissedGap) }
+    if let e = fixtureView["explain"] as? [String: Any] {
+        // An Explain card: busy, or the outcome of one `memmon explain --json`.
+        m.explainOpen = true
+        if e["busy"] as? Bool == true {
+            m.explainBusy = true
+        } else if e["exit"] != nil {
+            var r = CLIResult(exit: int(e["exit"]).map { Int32($0) }, stdout: Data())
+            if let obj = e["stdout"], JSONSerialization.isValidJSONObject(obj) {
+                r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+            }
+            m.applyExplain(ExplainOutcome.of(r))
+        }
+    }
+    if let v = o.usage {
+        m.usage = (json["_usage"] as? [String: Any]).flatMap(UsageData.decode)
+        m.usageFetchedAt = m.clock()
+        if let view = UsageView(rawValue: v) { m.usageView = view; m.usageOpen = true }
+        else if v != "collapsed" { fail("unknown usage view \(v)") }
+    }
+    if o.settings {
+        m.settingsOpen = true
+        m.settings = (json["_settings"] as? [String: Any]).flatMap(SettingsInfo.decode)
+        if let set = fixtureView["settings_set"] as? [String: Any] {
+            var r = CLIResult(exit: int(set["exit"]).map { Int32($0) }, stdout: Data())
+            if let obj = set["stdout"], JSONSerialization.isValidJSONObject(obj) {
+                r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+            }
+            m.applySettings(SettingsOutcome.of(r, key: str(set["key"]) ?? "load"), key: "load")
+        }
+    }
+    if let id = o.confirmSuggestion {
+        guard let sg = snap.suggestions.first(where: { $0.id == id }) else { fail("no suggestion \(id) in the fixture") }
+        m.ask(.suggestion(sg.asJob), snap.owners.first { $0.id == sg.ownerId }
+              ?? Owner(id: sg.ownerId, kind: "unknown", agent: "unknown", title: sg.task))
+        return m
     }
     guard let action = o.confirm else {
         if o.outcome != nil { fail("--outcome needs --confirm") }
@@ -4669,6 +7243,208 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 report["after"] = freshness()
                 report["ticks"] = model.tick
                 model.stopTicking()
+            case "suggest":
+                // Confirm a suggestion's stop, optionally after a refresh
+                // (`--next`) and with the sample aged by `--age` seconds.
+                if let next = argValue("--next") {
+                    let (j, _) = loadFixture(next)
+                    guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                    model.snap = s
+                    // `--no-rebind` leaves the confirm as it was, so only
+                    // perform's own re-read of the payload stands between it
+                    // and an old token.
+                    if !ARGS.contains("--no-rebind") { model.rebindConfirm(s) }
+                }
+                if let age = argValue("--age").flatMap(Double.init), let ts = model.snap?.ts {
+                    clockOverride = ts + age
+                }
+                report["phase_before"] = phase(model)
+                model.perform()
+                spin(0.2)
+                report["phase"] = phase(model)
+                report["actions"] = model.actionLog
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+            case "pressure-watch":
+                let watch = PressureWatch()
+                report["active_before"] = watch.isActive
+                popoverOpened(model, watch)
+                report["active_open"] = watch.isActive
+                watch.fire(); watch.fire()
+                report["events_open"] = model.pressureEvents
+                popoverHidden(model, watch)
+                report["active_closed"] = watch.isActive
+                watch.fire()
+                report["events_closed"] = model.pressureEvents
+                report["scans"] = model.scansStarted
+            case "gap-dismiss":
+                guard let s = model.snap else { fail("no snapshot") }
+                let before = gapNotice(s, dismissed: model.dismissedGap, now: nowTs())
+                report["before"] = before?.text ?? NSNull()
+                if let k = before?.key { model.dismissGap(k) }
+                report["after"] = gapNotice(s, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
+                if let next = argValue("--next") {
+                    let (j, _) = loadFixture(next)
+                    guard let n = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                    report["next"] = gapNotice(n, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
+                }
+                report["stored"] = model.dismissedGap ?? NSNull()
+            case "explain":
+                // Steps against a stub memmon: refresh, popover, click.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    switch step {
+                    case "refresh": model.refresh()
+                    case "popover":
+                        let w = PressureWatch(); popoverOpened(model, w); popoverHidden(model, w)
+                    case "click": model.explain()
+                    case "click-twice": model.explain(); model.explain()
+                    case "click-nowait": model.explain(); spin(0.3); continue
+                    case "cancel": model.cancelExplain()
+                    case "wait": spin(2.0)
+                    default: fail("unknown explain step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && (model.explainBusy || model.refreshing) { spin(0.05) }
+                }
+                report["open"] = model.explainOpen
+                report["text"] = model.explainText ?? NSNull()
+                report["heading"] = model.explainText == nil ? NSNull() : model.explainHeading
+                report["quiet"] = model.explainQuiet
+                report["items"] = model.explainItems.map {
+                    ["owner": $0.owner, "section": explainSection($0.owner, model.snap)?.rawValue ?? NSNull()] as [String: Any]
+                }
+                report["error"] = model.explainError ?? NSNull()
+                report["actions"] = model.actionLog
+            case "usage":
+                // `--do` steps against a stub memmon (`--script`): refresh,
+                // expand, collapse, age:<s> (moves the cache clock), view:<v>.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                var offset = 0.0
+                let base = model.clock
+                model.clock = { base() + offset }
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    let parts = step.split(separator: ":", maxSplits: 1).map(String.init)
+                    switch parts[0] {
+                    case "refresh": model.refresh()
+                    case "expand": if !model.usageOpen { model.toggleUsage() }
+                    case "popover":
+                        let w = PressureWatch()
+                        popoverOpened(model, w)
+                        popoverHidden(model, w)
+                    case "collapse": if model.usageOpen { model.toggleUsage() }
+                    case "age": offset += Double(parts[1]) ?? 0
+                    case "view": model.usageView = UsageView(rawValue: parts[1]) ?? .memory
+                    default: fail("unknown usage step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && (model.usageLoading || model.refreshing) { spin(0.05) }
+                }
+                report["open"] = model.usageOpen
+                report["loaded"] = model.usage != nil
+                report["error"] = model.usageError ?? NSNull()
+                report["actions"] = model.actionLog
+            case "notice-click":
+                // A click on a notification for `--run-id`, then the refresh
+                // it starts lands with `--next` (default: the same payload).
+                guard let rid = argValue("--run-id") else { fail("notice-click needs --run-id") }
+                let t = NoticeTarget(runId: rid, state: argValue("--state") ?? "intervention_needed",
+                                     label: argValue("--label") ?? "The job")
+                if ARGS.contains("--notifications-off") {
+                    // memmon's notifications setting is off: a click is ignored.
+                    final class Off: Notifier {
+                        func post(id: String, title: String, body: String, userInfo: [String: Any],
+                                  done: @escaping (Bool) -> Void) { done(true) }
+                    }
+                    let a = InterventionAlerts(notifier: Off(), store: MemoryStore())
+                    a.enabled = false
+                    model.alerts = a
+                }
+                model.openFromNotification(t)
+                report["pending"] = model.pendingNotice != nil
+                var landing = model.snap!
+                if let next = argValue("--next") {
+                    let (j, _) = loadFixture(next)
+                    guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                    landing = s
+                }
+                if let busy = argValue("--busy") {
+                    // A confirm already past asking when the click's refresh lands.
+                    guard let o = landing.owners.first else { fail("no owner to confirm") }
+                    model.ask(.endSession, o)
+                    model.confirm?.phase = busy == "partial"
+                        ? .partial(ActOutcome(result: "partial", forceToken: "tok-force")) : .working
+                    model.landed(landing)
+                    report["kept_phase"] = phase(model)
+                    report["still_pending"] = model.pendingNotice != nil
+                    report["kept_owner"] = model.confirm?.owner.id ?? NSNull()
+                    // That confirm closes; its refresh lands.
+                    model.confirm = nil
+                }
+                model.landed(landing)
+                if ARGS.contains("--confirm-click") { model.perform() }
+                spin(0.2)
+                report["selected"] = model.expanded ?? NSNull()
+                report["phase"] = phase(model)
+                if case .job(let jb)? = model.confirm?.kind {
+                    report["confirm_action"] = jb.stopAction
+                    report["confirm_token"] = jb.token ?? NSNull()
+                }
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+                report["actions"] = model.actionLog
+            case "settings":
+                // Drive the panel's controls in order (`--do a,b`), in fixture
+                // mode or, with `--script`, against a stub memmon.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                final class Count: Notifier {
+                    var n = 0
+                    func post(id: String, title: String, body: String, userInfo: [String: Any],
+                              done: @escaping (Bool) -> Void) { n += 1; done(true) }
+                }
+                let posts = Count()
+                model.alerts = InterventionAlerts(notifier: posts, store: MemoryStore())
+                var jobSeq = 0
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    let parts = step.split(separator: ":", maxSplits: 1).map(String.init)
+                    let v = parts.count > 1 ? parts[1] : ""
+                    switch parts[0] {
+                    case "open": model.openSettings()
+                    case "close": model.closeSettings()
+                    case "gate": model.changeSetting("gate_mode", v)
+                    case "runner": model.changeSetting("runner_mode", v)
+                    case "auto": model.setFlag("auto_cancel_interruptible", v == "on")
+                    case "suggest": model.setFlag("pressure_suggestions", v == "on")
+                    case "notify": model.setFlag("notifications", v == "on")
+                    case "pause": model.pauseProtection(v)
+                    case "resume": model.pauseProtection(nil)
+                    case "folder": model.openDataFolder()
+                    case "intervene":
+                        // A new job needing intervention reaches the alerts.
+                        jobSeq += 1
+                        model.alerts?.observe([ManagedJob(id: String(format: "%032x", jobSeq), resource: "heavy",
+                                                          label: "Search index rebuild", state: "intervention_needed",
+                                                          reason: "", elapsed: 1)])
+                    default: fail("unknown settings step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && model.settingsBusy != nil { spin(0.05) }
+                }
+                report["actions"] = model.actionLog
+                report["open"] = model.settingsOpen
+                report["error"] = model.settingsError ?? NSNull()
+                report["gate_mode"] = model.settings?.gateMode ?? NSNull()
+                report["locked"] = model.settings?.gateLocked ?? NSNull()
+                report["notifications"] = model.settings?.notifications ?? NSNull()
+                report["alerts_enabled"] = model.alerts?.enabled ?? NSNull()
+                report["posted"] = posts.n
+            case "run-mode":
+                guard let mode = argValue("--mode") else { fail("run-mode needs --mode") }
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                model.setRunMode(mode)
+                spin(1.5)
+                report["actions"] = model.actionLog
             default:
                 fail("unknown check \(check)")
             }
@@ -5002,7 +7778,53 @@ if ARGS.contains("--sections-probe") {
     let st = statusState(m.snap, refreshing: ARGS.contains("--refreshing"),
                          stillSampling: ARGS.contains("--sampling"))
     let reduce = ARGS.contains("--reduce-motion")
+    let snapS2 = m.snap!
+    let level = snapS2.system.scoreLevel
+    let notice = gapNotice(snapS2, dismissed: m.dismissedGap, now: nowTs())
+    let suggestions: [[String: Any]] = snapS2.shownSuggestions.map { sg in
+        let row = SuggestionRow(suggestion: sg, owner: snapS2.owners.first { $0.id == sg.ownerId },
+                                degraded: snapS2.degraded, onStop: {})
+        return ["id": sg.id, "title": sg.title, "evidence": sg.evidence, "owner_line": row.ownerLine ?? NSNull(),
+                "can_stop": row.canStop, "button": row.canStop ? sg.asJob.stopLabel + "…" : NSNull(),
+                "note": row.canStop ? NSNull() : row.note]
+    }
+    let holding = snapS2.heldWork != nil
+    let managed: [[String: Any]] = snapS2.runnerJobs.sorted { $0.rank < $1.rank }.map { j in
+        ["id": j.id, "state": j.stateWord,
+         "detail": managedJobDetail(j, level: level, holding: holding || snapS2.runner?.committed?.over == true, now: nowTs()),
+         "stop": snapS2.stopTarget(j) != nil]
+    }
+    let budget: Any = snapS2.runner?.committed.map { c -> [Any] in
+        let (h, sub) = budgetLines(c); return [h, sub ?? NSNull()]
+    } ?? NSNull()
+    let hold: Any = snapS2.runner.flatMap { r in
+        snapS2.heldWork.map { HoldBanner(kind: $0, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining).text }
+    } ?? NSNull()
+    let usage: Any = m.usage.map { u -> [String: Any] in
+        var views: [String: Any] = [:]
+        for v in UsageView.allCases {
+            let (bars, summary) = usageBars(u, v)
+            let hl = usageHeadline(u, v)
+            views[v.rawValue] = ["summary": summary, "value": hl.value, "caption": hl.caption,
+                                 "axis": [0.0, 0.5, 1.0].map { usageAxisLabel(usageAxisTop(u, v) * $0, v) },
+                                 "bars": bars.map { ["label": $0.label, "fraction": $0.fraction.map { $0 as Any } ?? NSNull(),
+                                                     "spoken": $0.spoken, "empty": $0.day.empty, "few": $0.day.few] }]
+        }
+        return ["views": views, "top": u.topSections.map { $0.key }, "runner_recorded": u.runnerRecorded,
+                "open": m.usageOpen]
+    } ?? NSNull()
+    let s2: [String: Any] = [
+        "usage": usage,
+        "pressure": ["word": pressureWord(level), "tone": levelTone(level).rawValue,
+                     "headline": pressureHeadline(level, reason: snapS2.system.levelReason).shown,
+                     "glyph": levelTone(level) == .muted],
+        "gap_notice": notice.map { $0.text + " " + $0.sub } ?? NSNull(),
+        "under_pressure_card": !snapS2.shownSuggestions.isEmpty,
+        "suggestions": suggestions, "managed": managed, "budget": budget, "hold": hold,
+        "mode": snapS2.runner?.mode ?? NSNull(), "card": snapS2.showsManagedJobs,
+    ]
     let data = try! JSONSerialization.data(withJSONObject: [
+        "s2": s2,
         "sections": out, "small": small, "ring": ring, "used": used ?? NSNull(),
         "scroll_target": m.scrollTarget?.rawValue ?? NSNull(), "actions": m.actionLog,
         "status": ["kind": st.kind.rawValue, "text": st.text, "spoken": st.spoken],
@@ -5011,6 +7833,75 @@ if ARGS.contains("--sections-probe") {
                    "pulse": dotPulses(reduceMotion: reduce)],
     ], options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--notify-probe") {
+    // Feeds successive job lists through the intervention alerts with a
+    // recording notifier; `--store` persists the dedupe state in a file, as
+    // UserDefaults would across launches. Nothing is ever posted for real.
+    guard let path = argValue("--sequence"), let d = FileManager.default.contents(atPath: path),
+          let seq = (try? JSONSerialization.jsonObject(with: d)) as? [[[String: Any]]] else {
+        fail("usage: --notify-probe --sequence <json list of job lists> [--store <file>]")
+    }
+    // `--fail-adds N`: the first N hand-overs fail, as a refused add would.
+    final class Recorder: Notifier {
+        var posted: [[String: Any]] = []
+        var failures = 0
+        func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void) {
+            posted.append(["id": id, "title": title, "body": body, "user_info": userInfo])
+            if failures > 0 { failures -= 1; done(false) } else { done(true) }
+        }
+    }
+    let rec = Recorder()
+    rec.failures = argValue("--fail-adds").flatMap(Int.init) ?? 0
+    let store: PrefStore = argValue("--store").map { FileStore(path: $0) } ?? MemoryStore()
+    let alerts = InterventionAlerts(notifier: rec, store: store)
+    if let cfg = argValue("--config") { alerts.enabled = notificationsEnabled(configPath: cfg) }
+    let rounds = seq.map { alerts.observe($0.map(ManagedJob.decode)) }
+    if let dir = argValue("--runner-dir") { _ = alerts.observe(runnerRows(dir)) }
+    let data = try! JSONSerialization.data(withJSONObject: ["rounds": rounds, "posted": rec.posted,
+                                                            "remembered": store.strings(PrefKey.notifiedJobs)],
+                                           options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--explain-line-probe") {
+    let l = argValue("--line") ?? ""
+    let o = explainLineOwner(l)
+    print(String(data: try! JSONSerialization.data(withJSONObject: ["owner": o.map { $0.0 as Any } ?? NSNull(), "rest": o.map { $0.1 as Any } ?? NSNull()],
+                                                    options: [.sortedKeys]), encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--theme-probe") {
+    // Stores a theme through the Settings path into a file-backed store (as
+    // UserDefaults would hold it) and applies it to a real popover.
+    _ = NSApplication.shared
+    guard let path = argValue("--store") else { fail("usage: --theme-probe --store <file> [--set <theme>]") }
+    let m = Model()
+    m.prefs = FileStore(path: path)
+    let pop = NSPopover()
+    applyTheme(pop, m.theme)
+    m.onTheme = { applyTheme(pop, $0) }
+    var out: [String: Any] = ["before": m.theme.rawValue, "before_appearance": pop.appearance?.name.rawValue ?? NSNull()]
+    if let v = argValue("--set") { m.setTheme(ThemeChoice(rawValue: v) ?? .system) }
+    out["theme"] = m.theme.rawValue
+    out["stored"] = m.prefs.string(PrefKey.theme) ?? NSNull()
+    out["appearance"] = pop.appearance?.name.rawValue ?? NSNull()
+    // The System label follows macOS's look: a local center stands in for
+    // the distributed one, so nothing is posted system-wide.
+    var dark = argValue("--system-style") == "Dark"
+    let center = NotificationCenter()
+    m.systemDark = dark
+    let watch = SystemLookWatch(center: center, read: { dark }) { m.systemDark = $0 }
+    out["system_label"] = ThemeChoice.system.label(systemDark: m.systemDark)
+    if let flip = argValue("--flip-to") {
+        dark = flip == "Dark"
+        center.post(name: SystemLookWatch.name, object: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        out["system_label_after"] = ThemeChoice.system.label(systemDark: m.systemDark)
+    }
+    _ = watch
+    print(String(data: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), encoding: .utf8)!)
     exit(0)
 }
 if ARGS.contains("--clock-probe") {
@@ -5025,7 +7916,7 @@ if ARGS.contains("--constants") {
     var copy: [String: String] = [:]
     for r in reasons { copy[r] = Copy.refusal(r, noun: "build", forcing: false).0 }
     let out: [String: Any] = ["act_timeout": CLI.actTimeout, "owners_timeout": CLI.ownersTimeout,
-                              "force_ttl": Model.forceTTL, "refusals": copy]
+                              "force_ttl": Model.forceTTL, "explain_timeout": Model.explainTimeout, "refusals": copy]
     let data = try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
     exit(0)

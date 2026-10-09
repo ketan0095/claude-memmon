@@ -24,7 +24,7 @@ Four independent pieces. All are optional except the CLI.
 | Piece | What it does | Flag |
 |---|---|---|
 | CLI | `memmon` — live dashboard + one-shot queries | *(always)* |
-| Sampler | launchd job, 1 sample/min, history for `--report` | `--sampler` |
+| Sampler | launchd job, 1 sample/min at Standard priority, history for `--report` | `--sampler` |
 | Menu bar | `MemmonBar.app` — status dot + popover, at login | `--menubar` |
 | Gate | `PreToolUse` hook so Claude sessions back off under memory pressure | `--gate` |
 
@@ -100,9 +100,18 @@ Once `--gate` is installed, before any Bash command in any session:
 - Heavy (typecheck / build / test / install / docker / dev server) → reads memory
   pressure in ~70 ms and either stays silent, injects an advisory into the
   session's context, or refuses the command.
+- Pressure UNKNOWN (no valid rate baseline yet) → allowed silently, logged as
+  UNKNOWN, nothing injected. The gate fails open; it never guesses HEALTHY.
+- Under pressure, the advisory also names the largest heavy job `memmon run`
+  did not start, addressed to the human: *"Ask the user before stopping it; do
+  not stop it yourself."* Follow that. The gate's decision is unchanged.
 
-`MEMMON_GATE` controls it: `block-critical` (default — refuses only at CRITICAL),
-`block` (also at DANGER), `warn` (never refuses), `off`.
+The mode is `block-critical` (default — refuses only at CRITICAL), `block`
+(also at DANGER), `warn` (never refuses) or `off`. Set it with
+`memmon settings set gate_mode <mode>` (stored in `~/.claude/memmon/config.json`,
+picked up by running sessions on their next heavy command) or in the menu bar's
+Settings. `MEMMON_GATE` in the hook's environment still overrides it, and
+`memmon settings --json` warns when it does. Ask the user before changing it.
 
 It **fails open on everything**. Malformed input, missing files, any exception →
 exit 0, and the failure is recorded so a silently-broken gate is visible in
@@ -118,15 +127,36 @@ typechecks and tests that should share one machine-wide slot. Claude, Codex and
 terminal commands use the same runner. `memmon jobs` explains who is running or
 waiting; the menu-bar dashboard shows those jobs too.
 
-Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit 124
-means the command never started. Do not replace this with a `pgrep` waiting loop,
-wrap the same command twice, or wrap an entire multi-hour agent session. Only
-wrapped jobs coordinate; existing jobs and other resource governors remain
-independent. A runner slot is not a worktree lock or permission to edit files.
+Wrap repo-wide test, build and typecheck runs this way. That is what puts them
+under admission and monitoring; anything started directly is only ever listed
+under pressure, never stopped by memmon.
 
-The runner starts only at HEALTHY/WATCH pressure, independent of the Bash gate
-mode or pause switch. It preserves output and exit status. Use it for foreground,
-non-interactive commands, not dev servers, daemon launchers or interactive shells.
+The default mode is `protect`: a job waits for a ticket, then starts when its
+estimate (4 GB until memmon has seen its peak; `--reserve GB` overrides) fits
+the committed-memory budget of 80 % of RAM and memory has stayed at Watch or
+better for 30 s. `memmon run-mode paused` restores the old behaviour (start at
+HEALTHY or WATCH), `observe` admits the old way and logs what protect would have
+held. Without MemmonBar, the stderr `memmon:` line and `memmon jobs` are the
+only signals that a running job needs attention. Nothing is cancelled by policy
+unless the job was started with `--interruptible` and auto-cancel is on.
+
+Waiting is bounded (600 seconds by default, `--timeout` overrides it). Exit
+codes: the child's own; 2 nested runner; 75 cancelled by policy (trust the
+stderr line, a child can exit 75 too); 124 gave up waiting or the queue is full
+(32); 125 telemetry unavailable at the deadline or the runner unavailable;
+126/127 launch failure; 128+signal cancelled. Exit 124 or 125 means the command
+never started. Do not replace this with a `pgrep` waiting loop, wrap the same
+command twice, or wrap an entire multi-hour agent session. Only wrapped jobs
+coordinate; existing jobs and other resource governors remain independent. A
+runner slot is not a worktree lock or permission to edit files.
+
+Use it for foreground, non-interactive commands, not dev servers, daemon
+launchers or interactive shells.
+
+`memmon route on` (wrapping Claude's heavy Bash commands automatically) refuses
+for now: the launcher cannot yet be shown to tell a Bash tool call from a
+status-line command. Do not work around it; use `memmon run` explicitly.
+`memmon route off` always works.
 
 ## Showing it in the terminal
 
@@ -146,6 +176,13 @@ pass a `force` token without that confirmation.
 
 For an always-visible readout, add `memmon --statusline` to a Claude Code
 statusline command or shell prompt. It reads the cached sample and never blocks.
+It prints `memmon: pressure unknown` when the last reading had no valid rates,
+and `memmon: no sample for N min` when the sampler has not run for over 3 min.
+
+Under DANGER or CRITICAL, `memmon owners` adds an *Under pressure* section: the
+largest heavy jobs that `memmon run` did not start. "Idle" and "growing" there
+are labels, not permission. Stopping one is the same confirmed `act` step as
+above: show the row to the human and act only on their say-so.
 
 ## Configuration (usually unnecessary)
 
@@ -177,7 +214,9 @@ that directory too for a clean slate.
 | `swiftc not found` | Xcode CLT missing — `xcode-select --install` |
 | Two menu-bar icons | Old instance still exiting; it resolves, re-run install if not |
 | `--report` says no history | `--sampler` not installed |
-| Gate seems inert | Check `memmon --gate-log`; `MEMMON_GATE=off` disables it |
+| `--pressure` says UNKNOWN | no rate baseline: the sampler is not installed or has not run in the last 5 min. A fresh process has nothing to compare against; `memmon` (live) has one after its first refresh |
+| Status line says "no sample for N min" | the sampler did not run; `launchctl list \| grep memmon` |
+| Gate seems inert | Check `memmon --gate-log` and `memmon settings --json` (gate_mode `off`, or `MEMMON_GATE=off` in the hook env, disables it) |
 
 Do not report the install as done until `memmon --once` renders and, if you
 installed it, `pgrep -f MemmonBar` returns exactly one pid.

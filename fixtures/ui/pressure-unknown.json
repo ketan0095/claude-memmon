@@ -1,0 +1,23 @@
+{
+ "_base": "overview.json",
+ "ts": 1791449640.0,
+ "source": "sampler",
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": null,
+  "pressure_level": "normal",
+  "score_level": "UNKNOWN",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": null,
+  "level_reason": "no rate baseline",
+  "rates": "unavailable",
+  "cpu_reason": "warming up"
+ },
+ "sampler": {
+  "last_ts": 1791449640.0,
+  "age_s": 360,
+  "stale": true,
+  "last_gap": null
+ }
+}

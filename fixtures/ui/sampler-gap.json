@@ -1,0 +1,25 @@
+{
+ "_base": "overview.json",
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 29420525978,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.817
+ },
+ "sampler": {
+  "last_ts": 1791449998.0,
+  "age_s": 2,
+  "stale": false,
+  "last_gap": {
+   "cause": "starved",
+   "gap_s": 1290.0,
+   "asleep_s": 30.0,
+   "awake_s": 1260.0,
+   "from_ts": 1791448110.0,
+   "to_ts": 1791449400.0
+  }
+ }
+}

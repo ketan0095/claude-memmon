@@ -1,0 +1,32 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "explain": {
+   "exit": 0,
+   "stdout": {
+    "mode": "now",
+    "title": "Free memory now",
+    "model": "claude-haiku-5-5",
+    "chars_sent": 640,
+    "text": "Checkout refactor: Let its typecheck finish before starting another build.\nVM · colima: Stop it from its app if no session needs it.\nExample Browser: Close the tabs you aren't using.",
+    "items": [
+     {
+      "owner": "Checkout refactor",
+      "action": "Let its typecheck finish before starting another build.",
+      "why": "It holds 8.9 GB while building."
+     },
+     {
+      "owner": "VM · colima",
+      "action": "Stop it from its app if no session needs it.",
+      "why": "6.5 GB, idle for the last hour."
+     },
+     {
+      "owner": "Example Browser",
+      "action": "Close the tabs you aren't using.",
+      "why": ""
+     }
+    ]
+   }
+  }
+ }
+}
