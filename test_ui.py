@@ -511,8 +511,10 @@ class AccessibilityTests(unittest.TestCase):
         self.assertEqual(owner["value"], "collapsed")
         self.assertIn("ownership confidence: inferred",
                       next(l for l in found if l.startswith("Billing API tests,")))
-        for sort in ("Sort by Memory", "Sort by CPU", "Sort by Growth"):
+        for sort in ("Sort by Memory", "Sort by CPU"):
             self.assertIn(sort, found)
+        # Growth needs ten unbroken minutes of history; it is not a sort.
+        self.assertNotIn("Sort by Growth", found)
         self.assertIn("Pause command protection", found)
 
     def test_unavailable_values_are_spoken_as_unavailable_never_zero(self):
@@ -777,9 +779,11 @@ class AccessibilityTests(unittest.TestCase):
         pointer = next(l for l in shared if l.startswith(title + ","))
         self.assertIn("Codex thread · 1 process", pointer)
         self.assertIn("ownership confidence: shared", pointer)
+        # A saved "growth" sort from an older build falls back to memory.
         growth = labels(a11y("growth-sort.json", *AGENTS))
         unattributed = next(l for l in growth if l.startswith("Unattributed,"))
-        self.assertIn("growth not available, not enough history, 1.8 GB", unattributed)
+        self.assertTrue(unattributed.endswith("1.8 GB, CPU not available, not measured"), unattributed)
+        self.assertFalse(any("growth not available" in l for l in growth))
 
     def test_degraded_inventory_offers_no_stop_buttons(self):
         found = labels(a11y("degraded.json"))

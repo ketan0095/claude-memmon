@@ -570,20 +570,20 @@ struct OwnersSnap {
 }
 
 enum SortKey: String, CaseIterable {
-    case memory, cpu, growth
+    // Growth is not a sort: it needs ten minutes of unbroken history, so the
+    // column was mostly empty. It is shown where it is known instead.
+    case memory, cpu
     var label: String { rawValue == "cpu" ? "CPU" : rawValue.capitalized }
     var columnHeader: String {
         switch self {
         case .memory: return "Memory"
         case .cpu: return "CPU cores"
-        case .growth: return "Growth per 10 min"
         }
     }
     func metric(_ o: Owner) -> Double? {
         switch self {
         case .memory: return o.footprint
         case .cpu: return o.cpu
-        case .growth: return o.growth
         }
     }
 }
@@ -2065,14 +2065,12 @@ struct UsageColumn: View {
     private var memText: String { owner.footprint.map(gb) ?? "— \(memReason)" }
     private var memReason: String { owner.footprintReason ?? "not measured" }
     private var cpuReason: String { owner.cpuReason ?? "warming up" }
-    private var growthReason: String { owner.growthReason ?? "not enough history" }
-
     /// Nothing about the owner could be measured: one state, not two reasons.
     private var unmeasured: Bool { owner.footprint == nil && owner.cpu == nil }
 
     var lines: (String, String, String?) {
         // Same slots as any other row: the missing figures, then one reason.
-        if unmeasured && sort != .growth {
+        if unmeasured {
             return ("—", sort == .cpu ? "— GB" : "— cores", "memory and CPU \(memReason)")
         }
         switch sort {
@@ -2083,9 +2081,6 @@ struct UsageColumn: View {
         case .cpu:
             if let c = owner.cpu { return (coresText(c), memText, nil) }
             return ("—", memText, "CPU \(cpuReason)")
-        case .growth:
-            if let g = owner.growth { return (growthText(g), memText, nil) }
-            return ("—", memText, growthReason)
         }
     }
 
@@ -2093,13 +2088,10 @@ struct UsageColumn: View {
         let mem = owner.footprint.map { $0 < 0.05 * GB ? "less than 0.1 GB" : gb($0) }
             ?? "memory not available, \(memReason)"
         let cpu = owner.cpu.map(coresText) ?? "CPU not available, \(cpuReason)"
-        let growth = owner.growth.map { "growth \(growthText($0)) per 10 minutes" }
-            ?? "growth not available, \(growthReason)"
-        if unmeasured && sort != .growth { return "memory and CPU not available, \(memReason)" }
+        if unmeasured { return "memory and CPU not available, \(memReason)" }
         switch sort {
         case .memory: return "\(mem), \(cpu)"
         case .cpu: return "\(cpu), \(mem)"
-        case .growth: return "\(growth), \(mem)"
         }
     }
 
@@ -2140,27 +2132,27 @@ struct OwnerRow: View {
         let metric = tiny ? "< 0.1 GB" : usage.lines.0
         Button(action: onTap) {
             HStack(spacing: 8) {
-                OwnerIcon(owner: owner, selected: expanded, size: 22)
+                OwnerIcon(owner: owner, selected: expanded, size: 18)
                 // The status truncates, but only while some of it still fits:
                 // a lone "…" says nothing, so then the title shows alone.
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
-                        Text(owner.title).font(ft(13, .medium)).foregroundColor(P.text)
+                        Text(owner.title).font(ft(12)).foregroundColor(P.text)
                             .lineLimit(1).fixedSize()
-                        Text(status).font(ft(12)).foregroundColor(P.muted)
+                        Text(status).font(ft(11)).foregroundColor(P.muted)
                             .lineLimit(1).truncationMode(.tail)
                             .frame(minWidth: 60, idealWidth: 60, maxWidth: .infinity, alignment: .leading)
                     }
-                    Text(owner.title).font(ft(13, .medium)).foregroundColor(P.text)
+                    Text(owner.title).font(ft(12)).foregroundColor(P.text)
                         .lineLimit(1).truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Spacer(minLength: 6)
-                Text(metric).font(ft(13, .medium)).monospacedDigit()
+                Text(metric).font(ft(12)).monospacedDigit()
                     .foregroundColor(metric == "—" ? P.muted : P.text)
                     .lineLimit(1).fixedSize()
             }
-            .padding(.horizontal, 8).padding(.vertical, 6)
+            .padding(.horizontal, 8).padding(.vertical, 5)
             .background(RoundedRectangle(cornerRadius: 8).fill(expanded ? P.selected : Color.clear))
             .contentShape(Rectangle())
         }
@@ -2188,10 +2180,6 @@ func sectionMetric(_ rows: [Owner], _ sort: SortKey) -> String? {
         let known = rows.compactMap { $0.cpu }
         guard !known.isEmpty else { return nil }
         return (known.count < rows.count ? "≥ " : "") + coresText(known.reduce(0, +))
-    case .growth:
-        let known = rows.compactMap { $0.growth }
-        guard !known.isEmpty, known.count == rows.count else { return nil }
-        return growthText(known.reduce(0, +)) + " / 10 min"
     }
 }
 
@@ -2212,15 +2200,18 @@ struct SectionHeader: View {
                     .rotationEffect(.degrees(open ? 90 : 0))
                     .frame(width: 12)
                 Circle().fill(P.section(section)).frame(width: 7, height: 7)
-                Text(section.title).font(ft(12, .semibold)).foregroundColor(P.text).lineLimit(1)
+                Text(section.title).font(ft(13, .semibold)).foregroundColor(P.text).lineLimit(1)
                 Text("· " + count.shown).font(ft(12)).foregroundColor(P.muted)
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 6)
                 if let total {
-                    Text(total).font(ft(12)).foregroundColor(P.muted).monospacedDigit().fixedSize()
+                    Text(total).font(ft(13, .semibold)).foregroundColor(P.text).monospacedDigit().fixedSize()
                 }
             }
-            .padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 4)
+            .padding(.horizontal, 8).padding(.vertical, 7)
+            // A tinted band, so a header never reads as one more row.
+            .background(RoundedRectangle(cornerRadius: 8).fill(P.section(section).opacity(open ? 0.14 : 0.08)))
+            .padding(.top, 6)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -3673,7 +3664,11 @@ struct ContentView: View {
                 .id("section-" + sec.rawValue)
                 if open {
                     let (shown, hidden) = model.visible(sec, rows)
-                    ownerRows(shown, s)
+                    VStack(alignment: .leading, spacing: 0) { ownerRows(shown, s) }
+                        .padding(.leading, 20).padding(.top, 3)
+                        .overlay(Rectangle().fill(P.section(sec).opacity(0.5)).frame(width: 2)
+                                    .padding(.leading, 13).padding(.vertical, 6),
+                                 alignment: .leading)
                     if hidden > 0 {
                         Button { withAnimation(motion(0.16)) { _ = model.showAll.insert(sec) } } label: {
                             Text("Show \(hidden) more").font(ft(12)).foregroundColor(P.accent)
