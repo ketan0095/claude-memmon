@@ -97,7 +97,7 @@ PY
          "$DEST_DIR/memmon_runner.py" "$DEST_DIR/memmon_procs.py" \
          "$DEST_DIR/memmon_owners.py" "$DEST_DIR/memmon_act.py" \
          "$DEST_DIR/memmon_common.py" "$DEST_DIR/memmon_pressure.py" \
-         "$DEST_DIR/memmon_telemetry.py" "$DEST_DIR/memmon_route.py" \
+         "$DEST_DIR/memmon_telemetry.py" "$DEST_DIR/memmon_route.py" "$DEST_DIR/memmon_explain.py" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
   exit 0
@@ -124,7 +124,7 @@ mkdir -p "$DEST_DIR" "$BIN_DIR"
 # deleted, and the monitor has to keep working after that.
 # Publish the dependency before the entrypoint, without exposing partial files
 # to an already-running sampler or another CLI invocation during an upgrade.
-for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry memmon_route; do
+for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry memmon_route memmon_explain; do
   cp "$SRC_DIR/$mod.py" "$DEST_DIR/.$mod.py.$$"
   mv -f "$DEST_DIR/.$mod.py.$$" "$DEST_DIR/$mod.py"
 done

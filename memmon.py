@@ -3908,6 +3908,10 @@ def main() -> int:
         import memmon_route
         return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
                                 split=shell_commands)
+    if len(sys.argv) > 1 and sys.argv[1] == "explain":
+        import memmon_explain
+        return memmon_explain.cli(sys.argv[2:], lambda: owners_json(cpu_window=1.0),
+                                  lambda: (lambda vm: (vm, pressure(vm)))(read_vm(fast=True)))
     if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap", "settings", "usage"):
         return {"owners": owners_cli, "act": act_cli, "reap": reap_cli,
                 "settings": settings_cli, "usage": usage_cli}[sys.argv[1]](sys.argv[2:])
