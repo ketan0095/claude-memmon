@@ -2147,6 +2147,15 @@ class NotificationClickTests(unittest.TestCase):
         self.assertEqual((r["phase"], r["actions"]), ("closed", []))
         self.assertTrue(r["banner"].startswith("Search index rebuild was cancelled by policy"))
 
+    def test_a_busy_confirm_is_never_replaced_by_a_click(self):
+        for busy in ("working", "partial"):
+            r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--busy", busy)
+            self.assertEqual((r["kept_phase"], r["still_pending"]), (busy, True), busy)
+            self.assertNotEqual(r["kept_owner"], "job:" + INDEX_RUN)
+            # Once that confirm has closed, the next refresh opens the notice's confirm.
+            self.assertEqual((r["phase"], r["confirm_token"]), ("ask", "tok-fixture-managed-index-fresh"), busy)
+            self.assertEqual(r["actions"], [])
+
     def test_notifications_carry_the_job_but_no_token(self):
         with tempfile.TemporaryDirectory() as d:
             seq = Path(d) / "seq.json"
@@ -2204,6 +2213,40 @@ class UsageCardTests(StubCase):
         self.assertNotIn("Codex", u["views"]["consumers"]["bars"][6]["spoken"])
         self.assertFalse(u["runner_recorded"])
         self.assertIn("not recorded", u["views"]["protection"]["summary"])
+
+    def test_dev_as_the_largest_section_leads_the_legend(self):
+        u = self.probe("usage-consumers-dev.json")
+        self.assertEqual(u["top"], ["dev", "claude", "service"])
+        self.assertTrue(u["views"]["consumers"]["summary"].startswith(
+            "Top consumers on average: Terminals & editors 14.7 GB"))
+        self.assertIn("Terminals & editors 15.9 GB", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertIn("Terminals & editors", " ".join(said("usage-consumers-dev.json")))
+
+    def test_today_is_found_by_date_not_position(self):
+        # The fixtures' _now is 09:00 UTC on their last date, the same local
+        # date from UTC-9 to UTC+14.
+        p = payload("usage-memory.json")
+        import datetime
+        for d in p["_usage"]["series"]:
+            d["date"] = (datetime.date.fromisoformat(d["date"]) - datetime.timedelta(days=1)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]
+        self.assertTrue(u["views"]["memory"]["summary"].startswith("No samples today"), u["views"]["memory"]["summary"])
+        self.assertTrue(self.probe("usage-memory.json")["views"]["memory"]["summary"].startswith("Today’s peak 41.2 GB"))
+
+    def test_an_open_card_rereads_expired_history_when_the_popover_opens(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,age:100,popover,age:201,popover,popover")
+        self.assertEqual(self.calls(calls).count("usage"), 2)
+
+    def test_a_collapsed_card_never_reads_when_the_popover_opens(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,collapse,age:400,popover,popover")
+        self.assertEqual(self.calls(calls).count("usage"), 1)
 
     def test_a_day_with_no_samples_drops_any_values_it_carries(self):
         p = payload("usage-empty-days.json")

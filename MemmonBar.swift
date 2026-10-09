@@ -1634,6 +1634,14 @@ struct UsageData {
     }
 
     var runnerRecorded: Bool { days.contains { $0.held != nil || $0.cancelled != nil } }
+
+    /// Today's row, found by its date in the local calendar, never by
+    /// position: a series that ends yesterday has no today.
+    var today: UsageDay? {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        let key = f.string(from: Date(timeIntervalSince1970: nowTs()))
+        return days.first { $0.date == key }
+    }
 }
 
 enum UsageView: String, CaseIterable {
@@ -1666,8 +1674,7 @@ func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary:
             if d.few { s += ", only \(plural(d.samples, "sample"))" }
             return UsageBar(day: d, label: d.weekday, fraction: p / top, spoken: s)
         }
-        let today = u.days.last
-        let head = today.flatMap { $0.peak }.map { "Today’s peak \(gb($0))" + (u.ram.map { " of \(gb($0))" } ?? "") }
+        let head = u.today.flatMap { $0.peak }.map { "Today’s peak \(gb($0))" + (u.ram.map { " of \(gb($0))" } ?? "") }
             ?? "No samples today"
         let peaks = u.days.compactMap { $0.peak }
         return (bars, head + (peaks.isEmpty ? "" : "; highest this week \(gb(peaks.max()!))") + ".")
@@ -2406,7 +2413,9 @@ final class Model: ObservableObject {
         loadError = nil
         rebindConfirm(s)
         alerts?.observe(s.runnerJobs)
-        if let t = pendingNotice {
+        // A stop being performed, or a partial / Force choice, is never
+        // replaced: the notice waits for the refresh that confirm's close starts.
+        if let t = pendingNotice, !confirmBusy {
             pendingNotice = nil
             resolveNotice(t, in: s)
         }
@@ -2414,6 +2423,14 @@ final class Model: ObservableObject {
 
     /// A clicked notification waiting for the refresh it started.
     var pendingNotice: NoticeTarget?
+
+    /// The overlay is past asking: a stop is running, or a partial result
+    /// waits on Force or Leave running.
+    var confirmBusy: Bool {
+        guard let c = confirm else { return false }
+        if case .ask = c.phase { return false }
+        return true
+    }
 
     /// A click on an intervention notification (D44): wait for a fresh
     /// payload, then show that job. Nothing is stopped here; at most the
@@ -4505,7 +4522,7 @@ struct UsageCard: View {
     }
 
     private var collapsed: some View {
-        let today = model.usage?.days.last?.peak
+        let today = model.usage?.today?.peak
         return Button { withAnimation(motion) { model.toggleUsage() } } label: {
             HStack(spacing: 8) {
                 Chevron(open: false)
@@ -4668,7 +4685,11 @@ struct UsageCard: View {
                 legendItem(P.text, "Average", dot: true)
                 if u.ram != nil { legendItem(P.muted, "RAM", dashed: true) }
             case .consumers:
-                ForEach(u.topSections, id: \.key) { s in legendItem(UsageData.color(s.key), s.name) }
+                ForEach(u.topSections, id: \.key) { s in
+                    // Three to a line: the legend uses the short name; the
+                    // summary and each bar keep the full one.
+                    legendItem(UsageData.color(s.key), s.key == "dev" ? "Terminals" : s.name)
+                }
             case .protection:
                 legendItem(P.amber, "Warned")
                 legendItem(P.red, "Stopped")
@@ -6027,6 +6048,9 @@ func configurePopover(_ popover: NSPopover, model: Model, onQuit: @escaping () -
 func popoverOpened(_ model: Model, _ watch: PressureWatch) {
     model.popoverShown = true
     model.refresh()          // sync on open — the only expensive work
+    // An open "Last 7 days" card re-reads history once its 5 min cache has
+    // expired; a collapsed one never does.
+    model.loadUsage()
     model.startTicking()
     watch.start { [weak model] in model?.pressureChanged() }
 }
@@ -6749,6 +6773,10 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     switch parts[0] {
                     case "refresh": model.refresh()
                     case "expand": if !model.usageOpen { model.toggleUsage() }
+                    case "popover":
+                        let w = PressureWatch()
+                        popoverOpened(model, w)
+                        popoverHidden(model, w)
                     case "collapse": if model.usageOpen { model.toggleUsage() }
                     case "age": offset += Double(parts[1]) ?? 0
                     case "view": model.usageView = UsageView(rawValue: parts[1]) ?? .memory
@@ -6775,6 +6803,19 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     let (j, _) = loadFixture(next)
                     guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
                     landing = s
+                }
+                if let busy = argValue("--busy") {
+                    // A confirm already past asking when the click's refresh lands.
+                    guard let o = landing.owners.first else { fail("no owner to confirm") }
+                    model.ask(.endSession, o)
+                    model.confirm?.phase = busy == "partial"
+                        ? .partial(ActOutcome(result: "partial", forceToken: "tok-force")) : .working
+                    model.landed(landing)
+                    report["kept_phase"] = phase(model)
+                    report["still_pending"] = model.pendingNotice != nil
+                    report["kept_owner"] = model.confirm?.owner.id ?? NSNull()
+                    // That confirm closes; its refresh lands.
+                    model.confirm = nil
                 }
                 model.landed(landing)
                 if ARGS.contains("--confirm-click") { model.perform() }
