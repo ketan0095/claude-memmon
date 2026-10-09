@@ -847,13 +847,15 @@ Python starts, so lifting the cap genuinely lifts it. Useful for an overnight ru
 where you want the machine at maximum and no interference — `--off 8h` means you
 cannot forget to turn it back on.
 
-`MEMMON_GATE` also selects a mode — `block-critical` (default), `block` (also at
-DANGER), `warn` (never blocks), `off` — but **do not rely on it as a kill
-switch.** It is read inside Python, so `MEMMON_GATE=off` still pays the full
-~57 ms per command before deciding to do nothing, and exporting it in your shell
-does not reach a hook spawned by an already-running Claude Code. To change the
-mode reliably, set it in the `env` block of `~/.claude/settings.json`. To switch
-the gate off, use `memmon --off`.
+The gate has four modes — `block-critical` (default), `block` (also at
+DANGER), `warn` (never blocks), `off`. Set the mode with
+`memmon settings set gate_mode warn` (or the menu bar's Settings): it lives in
+`~/.claude/memmon/config.json` and takes effect on the next heavy command in
+every session, running or not. `MEMMON_GATE` in the hook's environment still
+overrides it, and `memmon settings --json` says so with a warning. **Do not
+rely on either as a kill switch**: the mode is read inside Python, after a
+heavy command has already started it. To switch the gate off, use
+`memmon --off`.
 
 **Turning it off for a run.** `memmon --off 8h` pauses the gate entirely and it
 resumes on its own, so an overnight job with the cap deliberately lifted needs no
@@ -873,6 +875,29 @@ lifting the cap really does lift it.
 Real example from the day it was built: a session received a DANGER advisory
 (paging 111 MB/s), and 48 seconds later killed its own dev server to protect a
 test run.
+
+## Settings
+
+`memmon settings` shows the few switches people actually change, and the menu
+bar's gear button shows the same panel. Nothing here touches
+`~/.claude/settings.json`.
+
+```bash
+memmon settings --json                         # every setting, with its source
+memmon settings set gate_mode warn             # block-critical | block | warn | off
+memmon settings set runner_mode observe        # protect | observe | paused (same as run-mode)
+memmon settings set auto_cancel_interruptible true
+memmon settings set pressure_suggestions false # the Under pressure list and its notices
+memmon settings set notifications false        # memmon's macOS notifications
+```
+
+A set prints the settings after the change and exits 0. An unknown key or a
+bad value exits 2 with `{"error": …, "key": …}` and changes nothing. Writes go
+through a temp file and keep every other key in `config.json` (the runner's two
+settings live in `runner/coord/runner.json`). `gate_mode` reports where its
+value came from: `env` when `MEMMON_GATE` is set in the hook's environment
+(which then wins), `config`, or `default`. Pausing stays `memmon --off
+[DURATION]` and `memmon --on`.
 
 ## Configuration
 

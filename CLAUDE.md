@@ -106,8 +106,12 @@ Once `--gate` is installed, before any Bash command in any session:
   did not start, addressed to the human: *"Ask the user before stopping it; do
   not stop it yourself."* Follow that. The gate's decision is unchanged.
 
-`MEMMON_GATE` controls it: `block-critical` (default — refuses only at CRITICAL),
-`block` (also at DANGER), `warn` (never refuses), `off`.
+The mode is `block-critical` (default — refuses only at CRITICAL), `block`
+(also at DANGER), `warn` (never refuses) or `off`. Set it with
+`memmon settings set gate_mode <mode>` (stored in `~/.claude/memmon/config.json`,
+picked up by running sessions on their next heavy command) or in the menu bar's
+Settings. `MEMMON_GATE` in the hook's environment still overrides it, and
+`memmon settings --json` warns when it does. Ask the user before changing it.
 
 It **fails open on everything**. Malformed input, missing files, any exception →
 exit 0, and the failure is recorded so a silently-broken gate is visible in
@@ -212,7 +216,7 @@ that directory too for a clean slate.
 | `--report` says no history | `--sampler` not installed |
 | `--pressure` says UNKNOWN | no rate baseline: the sampler is not installed or has not run in the last 5 min. A fresh process has nothing to compare against; `memmon` (live) has one after its first refresh |
 | Status line says "no sample for N min" | the sampler did not run; `launchctl list \| grep memmon` |
-| Gate seems inert | Check `memmon --gate-log`; `MEMMON_GATE=off` disables it |
+| Gate seems inert | Check `memmon --gate-log` and `memmon settings --json` (gate_mode `off`, or `MEMMON_GATE=off` in the hook env, disables it) |
 
 Do not report the install as done until `memmon --once` renders and, if you
 installed it, `pgrep -f MemmonBar` returns exactly one pid.
