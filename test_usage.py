@@ -94,6 +94,34 @@ class UsageTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(memmon.usage_section(name), want)
 
+    def test_history_records_browsers_and_editors(self):
+        cases = [
+            ("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework"
+             ".framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/"
+             "MacOS/Google Chrome Helper (Renderer) --type=renderer", "Google Chrome", "browser"),
+            ("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+             "Google Chrome Canary", "browser"),
+            ("/Applications/Ghostty.app/Contents/MacOS/ghostty", "Ghostty", "dev"),
+            ("/Applications/iTerm.app/Contents/MacOS/iTerm2", "iTerm2", "dev"),
+            ("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+             "Terminal", "dev"),
+            ("/Applications/Xcode.app/Contents/MacOS/Xcode", "Xcode", "dev"),
+            ("/Applications/Firefox.app/Contents/MacOS/plugin-container.app/Contents/MacOS/"
+             "plugin-container", "Firefox", "browser"),
+            ("/Applications/OrbStack.app/Contents/MacOS/OrbStack", "OrbStack", "service"),
+            ("/Applications/Slack.app/Contents/MacOS/Slack", "Slack", "app"),
+            ("/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon",
+             "WindowServer", "other"),
+        ]
+        for cmd, name, section in cases:
+            with self.subTest(name=name):
+                self.assertEqual(memmon.app_group(cmd), name)
+                self.assertEqual(memmon.usage_section(name), section)
+        # Developer tools that merely live inside Xcode.app are not Xcode.
+        self.assertEqual(memmon.app_group("/Applications/Xcode.app/Contents/Developer/usr/"
+                                          "bin/git status"), "")
+        self.assertEqual(memmon.usage_section("SomeNewApp"), "app")
+
     def test_name_table_covers_every_categorised_bundle(self):
         # One table: every bundle id the owner list categorises has a name.
         import memmon_common

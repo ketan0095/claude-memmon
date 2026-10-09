@@ -1215,6 +1215,19 @@ def app_group(cmd: str) -> str:
         ("Code Helper", "VS Code"), ("Spotify", "Spotify"),
         ("Notion", "Notion"), ("zoom.us", "Zoom"), ("Obsidian", "Obsidian"),
         ("WindowServer", "WindowServer"), ("Figma", "Figma"),
+        # Browsers, terminals and editors, by their bundle's path, so a
+        # helper (Google Chrome Helper (Renderer), …) groups under its app.
+        # Names are memmon_common.APP_NAMES display names. Canary before Chrome.
+        ("Google Chrome Canary", "Google Chrome Canary"),
+        ("Google Chrome", "Google Chrome"), ("Safari.app", "Safari"),
+        ("Arc.app", "Arc"), ("Firefox.app", "Firefox"),
+        ("Microsoft Edge", "Microsoft Edge"), ("Ghostty.app", "Ghostty"),
+        ("iTerm.app", "iTerm2"), ("Terminal.app", "Terminal"), ("Warp.app", "Warp"),
+        ("Zed.app", "Zed"),
+        # Not Xcode.app/Contents/Developer: git, clang and swift run from there.
+        ("Xcode.app/Contents/MacOS", "Xcode"),
+        ("Xcode.app/Contents/SharedFrameworks", "Xcode"),
+        ("OrbStack", "OrbStack"),
     ):
         if needle in cmd:
             return name
