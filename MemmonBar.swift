@@ -1252,23 +1252,73 @@ enum PrefKey {
 /// `done` reports whether the notification was handed over; only then is it
 /// remembered as sent. It may be called on any thread.
 protocol Notifier {
-    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void)
+    func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void)
+}
+
+/// Which job a clicked notification is about. It carries no token: the stop
+/// a click leads to always comes from the refresh the click starts.
+struct NoticeTarget: Equatable {
+    var runId: String
+    var state: String
+    var label: String
+    var wrapperPid: Int?, childPid: Int?
+
+    static let category = "memmon.intervention"
+
+    init(runId: String, state: String, label: String, wrapperPid: Int? = nil, childPid: Int? = nil) {
+        self.runId = runId; self.state = state; self.label = label
+        self.wrapperPid = wrapperPid; self.childPid = childPid
+    }
+
+    init(_ j: ManagedJob) {
+        self.init(runId: j.id, state: j.state, label: j.label, wrapperPid: j.wrapperPid, childPid: j.childPid)
+    }
+
+    var userInfo: [String: Any] {
+        var d: [String: Any] = ["run_id": runId, "state": state, "label": label]
+        if let wrapperPid { d["wrapper_pid"] = wrapperPid }
+        if let childPid { d["child_pid"] = childPid }
+        return d
+    }
+
+    static func decode(_ d: [AnyHashable: Any]) -> NoticeTarget? {
+        guard let id = d["run_id"] as? String, !id.isEmpty else { return nil }
+        return NoticeTarget(runId: id, state: d["state"] as? String ?? "", label: d["label"] as? String ?? "The job",
+                            wrapperPid: num(d["wrapper_pid"]).map { Int($0) }, childPid: num(d["child_pid"]).map { Int($0) })
+    }
 }
 
 /// UNUserNotificationCenter, which exists only inside an app bundle.
 /// Authorization is asked once, at launch, not in front of the first alert.
-final class SystemNotifier: Notifier {
+final class SystemNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate {
     private let center: UNUserNotificationCenter?
-    init() {
+    /// What a click on one of these notifications opens (D44).
+    var onClick: ((NoticeTarget) -> Void)?
+
+    override init() {
         center = Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+        super.init()
+        center?.delegate = self
         center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
-    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) {
+
+    func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void) {
         guard let center else { done(false); return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        content.userInfo = userInfo
+        content.categoryIdentifier = NoticeTarget.category
         center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { done($0 == nil) }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content
+        if info.categoryIdentifier == NoticeTarget.category, let t = NoticeTarget.decode(info.userInfo) {
+            DispatchQueue.main.async { self.onClick?(t) }
+        }
+        completionHandler()
     }
 }
 
@@ -1331,7 +1381,7 @@ final class InterventionAlerts {
             inFlight.insert(k)
             posted.append(k)
             let (title, body) = InterventionAlerts.copy(j)
-            notifier.post(id: k, title: title, body: body) { ok in
+            notifier.post(id: k, title: title, body: body, userInfo: NoticeTarget(j).userInfo) { ok in
                 let finish = { self.inFlight.remove(k); if ok { self.remember(k) } }
                 if Thread.isMainThread { finish() } else { DispatchQueue.main.async(execute: finish) }
             }
@@ -2181,9 +2231,7 @@ final class Model: ObservableObject {
             }
             DispatchQueue.main.async {
                 if let parsed {
-                    self.snap = parsed; self.loadError = nil
-                    self.rebindConfirm(parsed)
-                    self.alerts?.observe(parsed.runnerJobs)
+                    self.landed(parsed)
                 } else {
                     // Only while that scan is still running: its reaper may
                     // already have run.
@@ -2197,6 +2245,57 @@ final class Model: ObservableObject {
     }
 
     static let stillSamplingNote = "; it is still sampling"
+
+    /// A fresh owners payload arrived.
+    func landed(_ s: OwnersSnap) {
+        snap = s
+        loadError = nil
+        rebindConfirm(s)
+        alerts?.observe(s.runnerJobs)
+        if let t = pendingNotice {
+            pendingNotice = nil
+            resolveNotice(t, in: s)
+        }
+    }
+
+    /// A clicked notification waiting for the refresh it started.
+    var pendingNotice: NoticeTarget?
+
+    /// A click on an intervention notification (D44): wait for a fresh
+    /// payload, then show that job. Nothing is stopped here; at most the
+    /// normal confirm opens, with the token from that payload.
+    func openFromNotification(_ t: NoticeTarget) {
+        guard alerts?.enabled ?? true else { return }
+        settingsOpen = false
+        pendingNotice = t
+        refresh()
+    }
+
+    func resolveNotice(_ t: NoticeTarget, in s: OwnersSnap) {
+        guard let job = s.runnerJobs.first(where: { $0.id == t.runId }) else {
+            banner = t.state == "cancelled_by_policy"
+                ? Banner(tone: .warning, title: "\(t.label) was cancelled by policy",
+                         body: "— memory stayed critical, so this interruptible job was stopped. It has ended.")
+                : Banner(tone: .warning, title: "Nothing done", body: "— \(t.label) is no longer running.")
+            return
+        }
+        let target = s.stopTarget(job)
+        if let owner = target?.1 { expanded = owner.id }
+        guard job.needsIntervention else {
+            banner = job.state == "cancelled_by_policy"
+                ? Banner(tone: .warning, title: "\(job.label) was cancelled by policy",
+                         body: "— memory stayed critical, so this interruptible job was stopped.")
+                : Banner(tone: .success, title: "\(job.label) no longer needs attention",
+                         body: "— it is \(job.stateWord.lowercased()) now.")
+            return
+        }
+        guard let (kind, owner) = target else {
+            banner = Banner(tone: .warning, title: "Nothing done",
+                            body: "— \(job.label) can no longer be stopped from here. Check the list and try again.")
+            return
+        }
+        ask(kind, owner)
+    }
 
     /// A confirm still being asked about follows the fresh list: the same
     /// owner (same root, same instances, same job) gets the new token; one
@@ -5543,7 +5642,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.setActivationPolicy(.accessory)
         model.popoverShown = false
         model.prefs = DefaultsStore()
-        model.alerts = InterventionAlerts(notifier: SystemNotifier(), store: model.prefs)
+        let notifier = SystemNotifier()
+        notifier.onClick = { [weak self] t in self?.openNotice(t) }
+        model.alerts = InterventionAlerts(notifier: notifier, store: model.prefs)
 
         configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
         popover.behavior = .transient
@@ -5572,6 +5673,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.model.alerts?.observe(rows)
                 }
             }
+        }
+    }
+
+    /// Shows the popover for a clicked notification; the refresh it starts
+    /// decides what opens.
+    func openNotice(_ t: NoticeTarget) {
+        guard model.alerts?.enabled ?? false else { return }
+        if popover.isShown {
+            model.openFromNotification(t)
+        } else if let b = statusItem.button {
+            NSApp.activate(ignoringOtherApps: true)
+            model.pendingNotice = t
+            model.popoverShown = true
+            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            model.settingsOpen = false
+            popoverOpened(model, pressureWatch)
         }
     }
 
@@ -6200,13 +6317,39 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     report["next"] = gapNotice(n, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
                 }
                 report["stored"] = model.dismissedGap ?? NSNull()
+            case "notice-click":
+                // A click on a notification for `--run-id`, then the refresh
+                // it starts lands with `--next` (default: the same payload).
+                guard let rid = argValue("--run-id") else { fail("notice-click needs --run-id") }
+                let t = NoticeTarget(runId: rid, state: argValue("--state") ?? "intervention_needed",
+                                     label: argValue("--label") ?? "The job")
+                model.openFromNotification(t)
+                report["pending"] = model.pendingNotice != nil
+                var landing = model.snap!
+                if let next = argValue("--next") {
+                    let (j, _) = loadFixture(next)
+                    guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                    landing = s
+                }
+                model.landed(landing)
+                if ARGS.contains("--confirm-click") { model.perform() }
+                spin(0.2)
+                report["selected"] = model.expanded ?? NSNull()
+                report["phase"] = phase(model)
+                if case .job(let jb)? = model.confirm?.kind {
+                    report["confirm_action"] = jb.stopAction
+                    report["confirm_token"] = jb.token ?? NSNull()
+                }
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+                report["actions"] = model.actionLog
             case "settings":
                 // Drive the panel's controls in order (`--do a,b`), in fixture
                 // mode or, with `--script`, against a stub memmon.
                 if let script = argValue("--script") { CLI.script = script; model.live = true }
                 final class Count: Notifier {
                     var n = 0
-                    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) { n += 1; done(true) }
+                    func post(id: String, title: String, body: String, userInfo: [String: Any],
+                              done: @escaping (Bool) -> Void) { n += 1; done(true) }
                 }
                 let posts = Count()
                 model.alerts = InterventionAlerts(notifier: posts, store: MemoryStore())
@@ -6637,10 +6780,10 @@ if ARGS.contains("--notify-probe") {
     }
     // `--fail-adds N`: the first N hand-overs fail, as a refused add would.
     final class Recorder: Notifier {
-        var posted: [[String: String]] = []
+        var posted: [[String: Any]] = []
         var failures = 0
-        func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) {
-            posted.append(["id": id, "title": title, "body": body])
+        func post(id: String, title: String, body: String, userInfo: [String: Any], done: @escaping (Bool) -> Void) {
+            posted.append(["id": id, "title": title, "body": body, "user_info": userInfo])
             if failures > 0 { failures -= 1; done(false) } else { done(true) }
         }
     }

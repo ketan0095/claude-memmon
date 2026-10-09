@@ -2098,3 +2098,60 @@ class SettingsPanelTests(StubCase):
         self.assertIn("Settings", said("overview.json"))                # the header's gear
         self.assertIn("Settings error: Could not change protection mode: runner_mode must be one of "
                       "protect, observe, paused.", said("settings-error.json"))
+
+
+INDEX_RUN = "3f0c2a9e5b7d4c1a8e6f2b0d9c4a7e15"
+
+
+class NotificationClickTests(unittest.TestCase):
+    """D44: a click on an intervention notification opens the normal confirm,
+    with the token from the refresh the click starts, and never stops."""
+
+    def click(self, *extra):
+        return host("notice-click", FIXTURES / "managed-jobs-intervention.json", "--run-id", INDEX_RUN,
+                    "--label", "Search index rebuild", *extra)
+
+    def test_click_selects_the_job_and_opens_its_stop_confirm(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"))
+        self.assertEqual(r["selected"], "job:" + INDEX_RUN)
+        self.assertEqual((r["phase"], r["confirm_action"]), ("ask", "stop-managed-job"))
+        self.assertEqual(r["actions"], [])            # nothing is stopped by the click
+
+    def test_the_confirm_carries_the_fresh_token(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"))
+        self.assertEqual(r["confirm_token"], "tok-fixture-managed-index-fresh")
+
+    def test_the_confirm_is_built_from_the_fresh_payload_not_the_old_one(self):
+        # The job's owner restarted under a new identity: a confirm opened on
+        # the old payload would be closed as "changed"; the fresh one opens.
+        r = self.click("--next", str(FIXTURES / "next" / "notice-restarted.json"))
+        self.assertEqual((r["phase"], r["confirm_token"]), ("ask", "tok-fixture-managed-index-restarted"))
+        self.assertIsNone(r["banner"])
+
+    def test_only_the_confirm_click_stops(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-fresh.json"), "--confirm-click")
+        self.assertEqual(r["actions"], ["perform"])
+
+    def test_a_job_that_is_gone_says_so(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-gone.json"))
+        self.assertEqual((r["phase"], r["actions"]), ("closed", []))
+        self.assertEqual(r["banner"], "Nothing done — Search index rebuild is no longer running.")
+
+    def test_a_job_that_recovered_is_selected_without_a_confirm(self):
+        r = self.click("--next", str(FIXTURES / "next" / "notice-recovered.json"))
+        self.assertEqual((r["phase"], r["selected"]), ("closed", "job:" + INDEX_RUN))
+        self.assertIn("no longer needs attention", r["banner"])
+
+    def test_a_policy_cancel_shows_its_outcome_and_no_confirm(self):
+        r = self.click("--state", "cancelled_by_policy", "--next", str(FIXTURES / "next" / "notice-gone.json"))
+        self.assertEqual((r["phase"], r["actions"]), ("closed", []))
+        self.assertTrue(r["banner"].startswith("Search index rebuild was cancelled by policy"))
+
+    def test_notifications_carry_the_job_but_no_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            seq = Path(d) / "seq.json"
+            seq.write_text(json.dumps([[job(wrapper_pid=48500, child_pid=48501)]]))
+            r = run_json("--notify-probe", "--sequence", str(seq))
+        info = r["posted"][0]["user_info"]
+        self.assertEqual(info, {"run_id": "a" * 32, "state": "intervention_needed",
+                                "label": "Search index rebuild", "wrapper_pid": 48500, "child_pid": 48501})
