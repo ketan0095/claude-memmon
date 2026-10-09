@@ -2885,7 +2885,13 @@ func levelPhrase(_ level: String) -> String {
 struct GateEventCard: View {
     var event: GateEvent
     var animation: Animation?
-    @State private var expanded = false
+    @State private var expanded: Bool
+
+    init(event: GateEvent, animation: Animation?, startExpanded: Bool = false) {
+        self.event = event
+        self.animation = animation
+        _expanded = State(initialValue: startExpanded)
+    }
     @State private var fullCommand = false
 
     private var stopped: Bool { event.action == "block" }
@@ -2900,20 +2906,31 @@ struct GateEventCard: View {
     private var summary: String {
         (stopped ? "Held back \(kind.what)" : "Ran \(kind.what)") + " while memory was \(memory)"
     }
-    /// The whole story in one sentence.
+    /// What happened, for VoiceOver; the card itself shows it as tags.
     private var story: String {
         stopped
-            ? "memmon stopped \(kind.what) in \(sessionLabel) before it started, because memory was \(memory)."
-            : "memmon warned \(sessionLabel) that \(kind.what) was starting while memory was \(memory). The command still ran."
+            ? "Held back \(kind.what) before it started; memory was \(memory)."
+            : "\(capitalised(kind.what)) started while memory was \(memory); it still ran."
     }
     private var nextStep: String {
         if stopped {
             return event.retryStatus == "waiting"
-                ? "It is waiting in the blocked list above. Retry it once memory is back to normal."
-                : "Nothing is waiting: it was retried, dismissed or expired."
+                ? "Waiting in the blocked list. Retry once memory is normal."
+                : "Nothing waiting: retried, dismissed or expired."
         }
-        return "Nothing to do. If memory keeps climbing, stop an idle session to make room."
+        return "Nothing needed. If memory keeps climbing, stop an idle session."
     }
+    /// "a type check" → "Type check".
+    private var kindTag: String {
+        let w = kind.what
+        let bare = w.hasPrefix("an ") ? String(w.dropFirst(3)) : w.hasPrefix("a ") ? String(w.dropFirst(2)) : w
+        return capitalised(bare)
+    }
+    private var memoryLine: String {
+        capitalised(event.reasons.isEmpty ? memory : event.reasons.joined(separator: " · "))
+            + " at " + eventTime(event.ts)
+    }
+    private func capitalised(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: expanded ? 8 : 2) {
@@ -2926,26 +2943,32 @@ struct GateEventCard: View {
                 Text(relative(event.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
             if expanded {
-                Text(story).font(ft(12)).foregroundColor(P.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                eventDetail("Why it counts as heavy", kind.why)
-                eventDetail("Memory at \(eventClock(event.ts))",
-                            "\(memory.prefix(1).uppercased() + memory.dropFirst())"
-                            + (event.reasons.isEmpty ? "" : ": " + event.reasons.joined(separator: ", ")))
-                eventDetail("What to do", nextStep)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Command").font(ft(10, .medium)).foregroundColor(P.muted)
-                    Text(fullCommand ? event.commandDisplay : (event.commandShort ?? event.commandDisplay))
-                        .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
-                        .lineLimit(fullCommand ? nil : 1).truncationMode(.middle)
-                        .fixedSize(horizontal: false, vertical: fullCommand)
-                        .textSelection(.enabled)
-                    if event.commandShort != nil && event.commandShort != event.commandDisplay {
-                        Button(fullCommand ? "Show less" : "Show full command") { fullCommand.toggle() }
-                            .buttonStyle(.plain).font(ft(10, .medium)).foregroundColor(P.accent)
+                // What happened, as tags: the kind of command, how memory was, the outcome.
+                HStack(spacing: 5) {
+                    eventTag(kindTag, P.muted)
+                    eventTag("Memory " + memory, tint)
+                    eventTag(stopped ? "Held back" : "Ran anyway", stopped ? P.red : P.muted)
+                }
+                .padding(.leading, 12)
+                VStack(alignment: .leading, spacing: 5) {
+                    eventRow("Why") { eventValue(kind.why) }
+                    eventRow("Memory") { eventValue(memoryLine) }
+                    eventRow("Next") { eventValue(nextStep) }
+                    eventRow("Command") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(fullCommand ? event.commandDisplay : (event.commandShort ?? event.commandDisplay))
+                                .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                                .lineLimit(fullCommand ? nil : 1).truncationMode(.middle)
+                                .fixedSize(horizontal: false, vertical: fullCommand)
+                                .textSelection(.enabled)
+                            if event.commandShort != nil && event.commandShort != event.commandDisplay {
+                                Button(fullCommand ? "Show less" : "Show full command") { fullCommand.toggle() }
+                                    .buttonStyle(.plain).font(ft(10, .medium)).foregroundColor(P.accent)
+                            }
+                        }
                     }
                 }
-                Text(eventTime(event.ts)).font(ft(10)).foregroundColor(P.muted)
+                .padding(.leading, 12)
             } else {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(summary)
@@ -2964,17 +2987,28 @@ struct GateEventCard: View {
         .onTapGesture { withAnimation(animation) { expanded.toggle() } }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(stopped ? "Stopped" : "Warned"), \(sessionLabel), \(relative(event.ts)): \(story) "
+            + (expanded ? "Why: \(kind.why) Memory: \(memoryLine). Next: \(nextStep) " : "")
             + "Command: \(event.commandDisplay).")
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isButton)
     }
 
-    private func eventDetail(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(ft(10, .medium)).foregroundColor(P.muted)
-            Text(value).font(ft(11)).foregroundColor(P.text)
-                .fixedSize(horizontal: false, vertical: true)
+    private func eventTag(_ text: String, _ color: Color) -> some View {
+        Text(text).font(ft(10, .medium)).foregroundColor(color).lineLimit(1)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(color.opacity(0.13)))
+    }
+
+    /// A short label on the left, its value beside it.
+    private func eventRow<V: View>(_ label: String, @ViewBuilder _ value: () -> V) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).font(ft(11)).foregroundColor(P.muted).frame(width: 60, alignment: .leading)
+            value()
         }
+    }
+
+    private func eventValue(_ s: String) -> some View {
+        Text(s).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -3287,6 +3321,8 @@ struct ContentView: View {
     /// Renders drop the scroll container and take their natural height.
     var flattened = false
     var previewOpenGate = false
+    /// Renders only: gate events start expanded.
+    var previewOpenEvents = false
 
     static let width: CGFloat = 380
     static let maxHeight: CGFloat = 620
@@ -3997,14 +4033,14 @@ struct ContentView: View {
         let rest = (resolvedStops + recentWarnings).sorted { $0.ts > $1.ts }
         return VStack(alignment: .leading, spacing: 5) {
             Text("Recent").font(ft(11, .medium)).foregroundColor(P.muted)
-            ForEach(pendingStops) { GateEventCard(event: $0, animation: motion(0.16)) }
+            ForEach(pendingStops) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
             ForEach(g.pending.filter { !$0.eventRetained }) { MissingGateEventCard(item: $0) }
             if showAllStops {
                 LazyVStack(spacing: 5) {
-                    ForEach(rest) { GateEventCard(event: $0, animation: motion(0.16)) }
+                    ForEach(rest) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
                 }
             } else {
-                ForEach(Array(rest.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16)) }
+                ForEach(Array(rest.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
             }
             if rest.count > 3 {
                 Button(showAllStops ? "Show only the 3 most recent" : "Show all \(rest.count)") {
@@ -4140,6 +4176,7 @@ struct RenderOptions {
     var sort: SortKey = .memory
     var techOpen = false
     var openGate = false
+    var openEvents = false
     /// The outcome lands while the popover is closed.
     var popoverClosed = false
     /// Sections opened (or closed, with a "-" prefix) and sections showing every row.
@@ -4176,6 +4213,7 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.sort = SortKey(rawValue: argValue("--sort") ?? str(view["sort"]) ?? "memory") ?? .memory
     o.techOpen = ARGS.contains("--tech-open") || (view["tech_open"] as? Bool ?? false)
     o.openGate = ARGS.contains("--open-gate") || (view["open_gate"] as? Bool ?? false)
+    o.openEvents = view["open_events"] as? Bool ?? false
     o.dark = ARGS.contains("--dark")
     o.popoverClosed = view["popover_closed"] as? Bool ?? false
     // `--sections a,b` opens sections on top of the fixture's own view.
@@ -4282,7 +4320,8 @@ func outcomeResult(_ path: String) -> CLIResult {
 
 @MainActor
 func fixtureRoot(_ model: Model, _ o: RenderOptions) -> some View {
-    ContentView(model: model, onQuit: {}, flattened: true, previewOpenGate: o.openGate)
+    ContentView(model: model, onQuit: {}, flattened: true, previewOpenGate: o.openGate,
+                previewOpenEvents: o.openEvents)
         .environment(\.colorScheme, o.dark ? .dark : .light)
 }
 

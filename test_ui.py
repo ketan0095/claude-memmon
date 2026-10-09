@@ -1094,10 +1094,10 @@ class HeaderAndRingTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertTrue(events[0].startswith("Stopped, Checkout refactor"))
         # Plain words: who, what kind of command, how memory was, what happened.
-        self.assertIn("memmon stopped a type check in Checkout refactor before it started, "
-                      "because memory was critical.", events[0])
-        self.assertIn("memmon warned Billing API tests that a test run was starting while memory "
-                      "was getting tight. The command still ran.", events[1])
+        self.assertIn("Held back a type check before it started; memory was critical.", events[0])
+        self.assertIn("A test run started while memory was getting tight; it still ran.", events[1])
+        # The card names what happened; it does not narrate itself.
+        self.assertFalse(any("memmon stopped" in e or "memmon warned" in e for e in events))
         self.assertIn("Command: pnpm typecheck", events[0])
         self.assertTrue(any(s.startswith("Retained activity since") for s in spoken))
 
@@ -1134,6 +1134,17 @@ class HeaderAndRingTests(unittest.TestCase):
             levels = sorted(lum(t["tokens"][k][theme]) for k in ("section.background", "system", "track"))
             # Background, System & other and the free track must not blend.
             self.assertGreater(min(b - a for a, b in zip(levels, levels[1:])), 0.08, theme)
+
+    def test_an_open_gate_event_reads_as_short_labelled_rows(self):
+        events = [l for l in labels(a11y("gate-events-open.json")) if l.startswith(("Stopped, ", "Warned, "))]
+        self.assertEqual(len(events), 2)
+        stop = events[0]
+        self.assertIn("Held back a type check before it started; memory was critical.", stop)
+        self.assertIn("Why: Type checkers like tsc", stop)
+        self.assertIn("Memory: Swap growing", stop)
+        self.assertIn("Next: Waiting in the blocked list. Retry once memory is normal.", stop)
+        self.assertIn("Next: Nothing needed. If memory keeps climbing, stop an idle session.", events[1])
+        self.assertFalse(any("memmon " in e for e in events), events)
 
     def test_free_row_toggles_its_split(self):
         self.assertEqual(run_json("--palette-probe")["free_toggle"], [True, False])

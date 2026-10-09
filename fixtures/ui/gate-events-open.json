@@ -1,0 +1,7 @@
+{
+ "_base": "gate-open.json",
+ "_view": {
+  "open_gate": true,
+  "open_events": true
+ }
+}
