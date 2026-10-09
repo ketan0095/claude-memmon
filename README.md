@@ -342,6 +342,7 @@ memmon                 live dashboard (repaints in place, alternate screen)
 memmon --once          one snapshot
 memmon --pressure      crash-risk verdict only (fast, no top); UNKNOWN exits 0
 memmon --report        per-app / per-worktree averages from history
+memmon usage --json    the last 7 days by day (the menu bar's "Last 7 days" card)
 memmon --blocked       commands the gate refused in the last 2 hours that nobody has re-run
 memmon --dismiss-blocked ID   stop listing one of them (the menu bar's Dismiss)
 memmon --gate-log      gate impact: what was evaluated, advised, blocked
@@ -875,6 +876,22 @@ lifting the cap really does lift it.
 Real example from the day it was built: a session received a DANGER advisory
 (paging 111 MB/s), and 48 seconds later killed its own dev server to protect a
 test run.
+
+## Last 7 days
+
+`memmon usage --json [--days 7]` summarises each local day from the existing
+`history.jsonl`, `gate.jsonl` and the runner's admission log. There's no rollup
+file, only a cache in `runner/coord/usage-cache.json` keyed by those files'
+size and mtime. Each day has its sample count, peak and average memory (the
+strict "used" figure where the sampler recorded it, else `top`'s), memory by
+section, gate warnings and stops, and runner holds. A day with no samples is
+empty, never interpolated. Sections come only from what a history row
+records: Claude sessions and Claude's runtime pool are `claude`; the apps
+history names go to `browser` (Brave), `service` (Docker, Docker VM) or `app`
+(Slack, Cursor, VS Code, Spotify, Notion, Zoom, Obsidian, Figma); worktree
+builds and any other name are `other`. Codex and policy cancels are not in
+history, so they are `null` ("not recorded"), as are runner holds for days
+older than the admission log.
 
 ## Settings
 

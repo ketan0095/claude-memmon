@@ -2007,6 +2007,9 @@ def _s2_fields(p: dict, rec: dict, vm: dict) -> dict:
                p.get("level"), p.get("rates"), p.get("kernel_level"))}
     if rec.get("gap"):
         out["gap"] = rec["gap"]
+    if rec.get("used_bytes") is not None:
+        # The strict reader's "used" (the health card's basis), for usage.
+        out["used_bytes"] = rec["used_bytes"]
     return out
 
 
@@ -3504,6 +3507,169 @@ def reap_cli(argv: list, engine=None) -> int:
     return _apply_exit(out, args.apply)
 
 
+# --------------------------------------------------------------------- usage
+
+USAGE_CACHE = os.path.join(STATE_DIR, "runner", "coord", "usage-cache.json")
+ADMISSION_LOG = os.path.join(STATE_DIR, "runner", "coord", "admission-log.jsonl")
+USAGE_SECTIONS = ("claude", "codex", "browser", "app", "service", "other")
+# History rows only know app_group()'s names. These are the honest calls;
+# any name not listed here is "other", never guessed.
+USAGE_APP_SECTION = {"Brave": "browser", "Docker": "service", "Docker VM": "service",
+                     "Slack": "app", "Cursor": "app", "VS Code": "app", "Spotify": "app",
+                     "Notion": "app", "Zoom": "app", "Obsidian": "app", "Figma": "app"}
+_TS_RE = re.compile(r'"ts":\s*([0-9.]+)')
+
+
+def _day_rows(path: str, start: float):
+    """(ts, row) for every JSON line at or after `start`; a line older than
+    the window is skipped on its ts alone, without being parsed."""
+    try:
+        fh = open(path)
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            m = _TS_RE.search(line, 0, 40)
+            if m and float(m.group(1)) < start:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            ts = row.get("ts") if isinstance(row, dict) else None
+            if isinstance(ts, (int, float)) and ts >= start:
+                yield ts, row
+
+
+def _row_sections(row: dict) -> dict | None:
+    """One history row's memory by section. sessions and the Claude runtime
+    pool (overhead) are claude; app_group names go by USAGE_APP_SECTION;
+    worktree builds and unlisted names are other. Codex has no field in a
+    history row, so it is not recorded (null), not zero. Orphans are left
+    out: they are mostly the same processes as the worktree builds."""
+    if not isinstance(row.get("sessions"), dict):
+        return None                                  # a partial row
+    out = dict.fromkeys(USAGE_SECTIONS, 0)
+    out["claude"] = sum(v for v in row["sessions"].values() if isinstance(v, (int, float)))
+    out["claude"] += row.get("overhead") or 0
+    for name, mem in (row.get("apps") or {}).items():
+        if isinstance(mem, (int, float)):
+            out[USAGE_APP_SECTION.get(name, "other")] += mem
+    out["other"] += sum(v for v in (row.get("worktrees") or {}).values()
+                        if isinstance(v, (int, float)))
+    return out
+
+
+def _usage_inputs() -> list:
+    sig = []
+    for path in (HISTORY, GATE_LOG, ADMISSION_LOG):
+        try:
+            st = os.stat(path)
+            sig.append([path, st.st_size, st.st_mtime_ns])
+        except OSError:
+            sig.append([path, None, None])
+    return sig
+
+
+def usage(days: int = 7, now: float | None = None) -> dict:
+    """`memmon usage --json`: one entry per local day, oldest first, from
+    history.jsonl, gate.jsonl and the runner's admission log only. A day
+    without samples is empty (samples 0, nulls), never interpolated."""
+    now = time.time() if now is None else now
+    today = time.localtime(now)
+    start_day = time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1),
+                             0, 0, 0, 0, 0, -1))
+    dates = [time.strftime("%Y-%m-%d", time.localtime(
+        time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1) + i,
+                     12, 0, 0, 0, 0, -1)))) for i in range(days)]
+    key = {"days": days, "dates": dates, "inputs": _usage_inputs()}
+    cached = _read_row(USAGE_CACHE)
+    if cached and cached.get("key") == key:
+        return cached["value"]
+
+    def day_of(ts):
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+    acc = {d: {"samples": 0, "mem_n": 0, "mem_sum": 0, "mem_peak": None, "sec_n": 0,
+               "sec": dict.fromkeys(USAGE_SECTIONS, 0), "warned": 0, "stopped": 0,
+               "held": set()} for d in dates}
+    first = last = None
+    for ts, row in _day_rows(HISTORY, start_day):
+        a = acc.get(day_of(ts))
+        if a is None:
+            continue
+        first = ts if first is None else min(first, ts)
+        last = ts if last is None else max(last, ts)
+        a["samples"] += 1
+        # The strict "used" where the sampler recorded it (S2 rows); v1 rows
+        # only have top's figure, which counts cache and sits near RAM.
+        mem = row.get("used_bytes", row.get("ram_used"))
+        if isinstance(mem, (int, float)) and mem > 0:
+            a["mem_n"] += 1
+            a["mem_sum"] += mem
+            a["mem_peak"] = mem if a["mem_peak"] is None else max(a["mem_peak"], mem)
+        sec = _row_sections(row)
+        if sec is not None:
+            a["sec_n"] += 1
+            for k, v in sec.items():
+                a["sec"][k] += v
+    for ts, row in _day_rows(GATE_LOG, start_day):
+        a = acc.get(day_of(ts))
+        if a is not None and row.get("action") == "warn":
+            a["warned"] += 1
+        elif a is not None and row.get("action") == "block":
+            a["stopped"] += 1
+    # Holds are recorded per run in the admission log, which is trimmed: a
+    # day before its first row is not recorded. Policy cancels are not logged.
+    log_first = None
+    for ts, row in _day_rows(ADMISSION_LOG, start_day):
+        log_first = ts if log_first is None else min(log_first, ts)
+        a = acc.get(day_of(ts))
+        if a is not None and row.get("decision") == "hold" and row.get("run_id"):
+            a["held"].add(row["run_id"])
+    log_from = day_of(log_first) if log_first is not None else None
+    series = []
+    for d in dates:
+        a = acc[d]
+        series.append({
+            "date": d, "samples": a["samples"],
+            "mem_peak_bytes": a["mem_peak"],
+            "mem_avg_bytes": a["mem_sum"] // a["mem_n"] if a["mem_n"] else None,
+            "by_section": ({k: (None if k == "codex" else v // a["sec_n"])
+                            for k, v in a["sec"].items()} if a["sec_n"] else None),
+            "gate": {"warned": a["warned"], "stopped": a["stopped"]},
+            "runner": {"held": len(a["held"]) if log_from is not None and d >= log_from
+                       else None, "cancelled": None}})
+    value = {"schema_version": 1, "days": days,
+             "ram_bytes": os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+             "series": series,
+             "coverage": {"from_ts": first, "to_ts": last,
+                          "complete": first is not None and first < start_day + 3600
+                          and all(e["samples"] for e in series)}}
+    try:
+        import memmon_owners
+        memmon_owners.write_json_atomic(USAGE_CACHE, {"key": key, "value": value})
+    except Exception:
+        pass
+    return value
+
+
+def usage_cli(argv: list) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="memmon usage")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--days", type=int, default=7)
+    args = ap.parse_args(argv)
+    out = usage(max(1, min(args.days, 31)))
+    if args.json:
+        print(json.dumps(out))
+        return 0
+    for e in out["series"]:
+        peak = human(e["mem_peak_bytes"]) if e["mem_peak_bytes"] is not None else "—"
+        print(f"{e['date']}  peak {peak:>7}  {e['samples']:>5} samples  "
+              f"warned {e['gate']['warned']}  stopped {e['gate']['stopped']}")
+    return 0
+
+
 # ------------------------------------------------------------------ settings
 
 BOOL_SETTINGS = ("auto_cancel_interruptible", "pressure_suggestions", "notifications")
@@ -3627,9 +3793,9 @@ def main() -> int:
         import memmon_route
         return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
                                 split=shell_commands)
-    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap", "settings"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap", "settings", "usage"):
         return {"owners": owners_cli, "act": act_cli, "reap": reap_cli,
-                "settings": settings_cli}[sys.argv[1]](sys.argv[2:])
+                "settings": settings_cli, "usage": usage_cli}[sys.argv[1]](sys.argv[2:])
     # Short-circuit before the parser exists: gate() runs on every Bash tool call
     # and has no use for 24 argument definitions.
     if "--gate" in sys.argv:
