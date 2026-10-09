@@ -209,12 +209,38 @@ def read_mode(state_dir) -> tuple:
 
 
 def write_mode(state_dir, mode=None, auto_cancel=None):
+    """Update runner.json under ledger.lock, atomically, keeping any keys this
+    version does not know about."""
+    if mode is not None and mode not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}")
+    if auto_cancel is not None and not isinstance(auto_cancel, bool):
+        raise TypeError("auto_cancel_interruptible must be true or false")
     p = Paths(state_dir)
     p.make()
-    cur, _, auto = read_mode(state_dir)
-    _write(p.mode, {"mode": mode or cur,
-                    "auto_cancel_interruptible": auto if auto_cancel is None else auto_cancel,
-                    "updated_at": round(time.time(), 3)})
+    clock = telemetry.SYSTEM_CLOCK
+    with ledger(p, clock, clock.mono() + 5.0):
+        cur, _, auto = read_mode(state_dir)
+        data = _read_json(p.mode)
+        data = dict(data) if isinstance(data, dict) else {}
+        data.update(mode=mode or cur,
+                    auto_cancel_interruptible=auto if auto_cancel is None else auto_cancel,
+                    updated_at=round(time.time(), 3))
+        _write(p.mode, data)
+
+
+def get_settings(state_dir) -> dict:
+    """The runner's two settings for `memmon settings`, as the runner reads them."""
+    mode, _, auto = read_mode(state_dir)
+    return {"runner_mode": mode, "auto_cancel_interruptible": auto}
+
+
+def set_auto_cancel(state_dir, value) -> dict:
+    """Turn auto-cancel of --interruptible jobs on or off. Only a real bool
+    is accepted; the runner honours it on its next tick, as before."""
+    if not isinstance(value, bool):
+        raise TypeError("auto_cancel_interruptible must be true or false")
+    write_mode(state_dir, auto_cancel=value)
+    return get_settings(state_dir)
 
 
 def headroom_frac(state_dir) -> float:

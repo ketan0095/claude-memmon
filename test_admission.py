@@ -670,6 +670,32 @@ class EstimateTests(Base):
         self.assertNotIn("shared", keys)
         self.assertIn("k200", keys)
 
+    def test_settings_helpers_round_trip_and_keep_other_keys(self):
+        """D43: get_settings / set_auto_cancel for `memmon settings`."""
+        self.assertEqual(runner.get_settings(self.root),
+                         {"runner_mode": "protect", "auto_cancel_interruptible": False})
+        p = runner.Paths(self.root)
+        p.make()
+        p.mode.write_text(json.dumps({"mode": "observe", "future_key": {"x": 1}}))
+        self.assertEqual(runner.set_auto_cancel(self.root, True),
+                         {"runner_mode": "observe", "auto_cancel_interruptible": True})
+        data = json.loads(p.mode.read_text())
+        self.assertEqual((data["future_key"], data["mode"]), ({"x": 1}, "observe"))
+        self.assertTrue(runner.read_mode(self.root)[2], "the runner reads the same flag")
+        runner.write_mode(self.root, "paused")
+        self.assertEqual(runner.get_settings(self.root),
+                         {"runner_mode": "paused", "auto_cancel_interruptible": True})
+        self.assertEqual(json.loads(p.mode.read_text())["future_key"], {"x": 1})
+        self.assertFalse(runner.set_auto_cancel(self.root, False)["auto_cancel_interruptible"])
+        for bad in ("true", 1, None, "false"):
+            with self.subTest(bad=bad), self.assertRaises(TypeError):
+                runner.set_auto_cancel(self.root, bad)
+        with self.assertRaises(ValueError):
+            runner.write_mode(self.root, "bogus")
+        self.assertEqual(runner.get_settings(self.root),
+                         {"runner_mode": "paused", "auto_cancel_interruptible": False})
+        self.assertFalse(list(p.coord.glob("runner.json.*.tmp")))
+
     def test_corrupt_peaks_and_mode_fall_back(self):
         p = runner.Paths(self.root)
         p.make()
