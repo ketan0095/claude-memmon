@@ -1070,6 +1070,21 @@ class HeaderAndRingTests(unittest.TestCase):
         self.assertTrue(state["claude"]["open"])
         self.assertIn("claude:fixture-a", state["claude"]["shown"])
 
+    def test_gate_detail_is_one_policy_line_and_one_recent_list(self):
+        rows = a11y("gate-open.json")
+        spoken = [r["label"] or r["value"] for r in rows]
+        self.assertIn("Current policy: WATCH or DANGER warns; CRITICAL stops before running. "
+                      "Only commands that match a memory-intensive rule are checked.", spoken)
+        self.assertIn("What commands match?", labels(rows))
+        self.assertIn("Recent", spoken)
+        for gone in ("Stopped before running", "Warned — command ran",
+                     "Matched command + memory then → result"):
+            self.assertNotIn(gone, spoken)
+        events = [l for l in labels(rows) if l.startswith(("Stopped, command", "Warned, command"))]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(events[0].startswith("Stopped, command did not run: pnpm typecheck"))
+        self.assertTrue(any(s.startswith("Retained activity since") for s in spoken))
+
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
         self.assertIn("Show Claude sessions in the list, 9.5 GB", found)

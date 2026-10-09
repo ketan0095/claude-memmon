@@ -225,10 +225,12 @@ printf 'saved prompt'
     def test_short_command_drops_wrappers_redirects_and_cd(self):
         cases = {
             "cd ~/a && pnpm -w typecheck": "pnpm -w typecheck",
-            "FOO=1 npx vitest run src/a.test.ts": "npx vitest run src/a.test.ts",
+            "FOO=1 npx vitest run src/a.test.ts": "npx vitest run a.test.ts",
             "nice -n 10 cargo build --release 2>&1 | tail": "cargo build --release",
             "timeout -k 5 600 make -j8": "make -j8",
             "caffeinate -s pnpm build": "pnpm build",
+            "../../node_modules/.bin/tsc --noEmit -p /tmp/x/tsconfig.json": "tsc --noEmit -p tsconfig.json",
+            "npx vitest run src/agent/line.test.ts": "npx vitest run line.test.ts",
             "caffeinate -t 60 pnpm build": "pnpm build",
             "env -u FOO pnpm build": "pnpm build",
         }

@@ -2803,16 +2803,17 @@ struct ConfirmOverlay: View {
     }
 }
 
-struct DecisionRow: View {
-    var level: String, result: String
+/// "Healthy runs · Watch warns · Danger warns · Critical stops", each level in its colour.
+struct PolicyStrip: View {
+    var levels: [(String, String)]
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(level)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(P.tint(level)).frame(width: 66, alignment: .leading)
-            Text(result).font(ft(11)).foregroundColor(P.muted)
-            Spacer(minLength: 0)
+        levels.enumerated().reduce(Text("")) { acc, item in
+            let (k, (level, verb)) = item
+            let head = Text(level.prefix(1) + level.dropFirst().lowercased()).foregroundColor(P.tint(level))
+            return acc + (k == 0 ? Text("") : Text("  ")) + head + Text(" " + verb).foregroundColor(P.muted)
         }
+        .font(ft(10.5, .medium))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -2848,11 +2849,6 @@ struct GateEventCard: View {
         return "Warning added to the session’s context; command ran"
     }
 
-    private var ruleLine: String {
-        guard let c = event.classification else { return "rule not recorded · \(event.level)" }
-        return "\(c.source == "learned" ? "learned" : "rule") \(c.rule) · \(event.level)"
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: expanded ? 8 : 2) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -2886,7 +2882,7 @@ struct GateEventCard: View {
                 eventDetail("Outcome", outcome)
             } else {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text("\(sessionLabel) · \(ruleLine)")
+                    Text("\(sessionLabel) · \(event.level)")
                         .font(ft(11)).foregroundColor(P.muted).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 2)
                     Chevron(open: false)
@@ -3599,6 +3595,26 @@ struct ContentView: View {
         }
     }
 
+    /// Opens the list of command rules; an info glyph beside the policy line.
+    private var matchRulesButton: some View {
+        Button { withAnimation(motion(0.16)) { openMatchRules.toggle() } } label: {
+            Image(systemName: openMatchRules ? "info.circle.fill" : "info.circle")
+                .font(.system(size: 12)).foregroundColor(P.muted)
+        }
+        .buttonStyle(.plain)
+        .help("What commands match?")
+        .accessibilityLabel("What commands match?")
+        .accessibilityValue(openMatchRules ? "expanded" : "collapsed")
+    }
+
+    /// One word per level for the policy strip: runs, warns or stops.
+    private func policyVerb(_ g: GateStats, _ level: String) -> String {
+        let r = policyResult(g, level)
+        if r.hasPrefix("stopped") { return "stops" }
+        if r.hasPrefix("warned") { return "warns" }
+        return "runs"
+    }
+
     private func policyResult(_ g: GateStats, _ level: String) -> String {
         if g.paused { return "runs without a memory check" }
         if level == "HEALTHY" { return "runs silently" }
@@ -3744,26 +3760,18 @@ struct ContentView: View {
                     Text(policyCopy(g)).font(ft(11)).foregroundColor(P.amber)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("Only commands that match a memory-intensive rule are checked.")
-                        .font(ft(11)).foregroundColor(P.muted)
-                    Text(policyCopy(g)).font(ft(11, .medium))
-                        .foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
+                    // The whole policy in one line; the sentence is for hover and VoiceOver.
+                    let sentence = policyCopy(g) + " Only commands that match a memory-intensive rule are checked."
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        PolicyStrip(levels: ["HEALTHY", "WATCH", "DANGER", "CRITICAL"].map { ($0, policyVerb(g, $0)) })
+                            .help(sentence)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(sentence)
+                        Spacer(minLength: 2)
+                        matchRulesButton
+                    }
                 }
-                Text("Matched command + memory then → result")
-                    .font(ft(10, .medium)).foregroundColor(P.muted)
-                VStack(spacing: 3) {
-                    DecisionRow(level: "HEALTHY", result: policyResult(g, "HEALTHY"))
-                    DecisionRow(level: "WATCH", result: policyResult(g, "WATCH"))
-                    DecisionRow(level: "DANGER", result: policyResult(g, "DANGER"))
-                    DecisionRow(level: "CRITICAL", result: policyResult(g, "CRITICAL"))
-                }
-                Button { withAnimation(motion(0.16)) { openMatchRules.toggle() } } label: {
-                    HStack {
-                        Text("What commands match?").font(ft(10, .medium)).foregroundColor(P.muted)
-                        Spacer()
-                        Chevron(open: openMatchRules)
-                    }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                if g.paused { matchRulesButton }
                 if openMatchRules {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Package tasks: typecheck, build, test, install, dev, lint")
@@ -3782,83 +3790,44 @@ struct ContentView: View {
                     Text("No warnings or stops since \(retainedDate(g.since, includeTime: true)).")
                         .font(ft(11, .medium)).foregroundColor(P.green)
                 } else {
-                    stoppedHistory(g)
-                    warningHistory(g)
+                    recentHistory(g)
                 }
                 if g.evaluated > 0 {
-                    Text("Retained activity since \(retainedDate(g.since, includeTime: true)).")
+                    let detail = g.historyTo.map {
+                        "Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate($0, includeTime: true))."
+                    } ?? ""
+                    Text("Since \(retainedDate(g.since, includeTime: true))" + (g.complete ? "" : " · older activity may be missing"))
                         .font(ft(10)).foregroundColor(P.muted)
-                    if !g.complete {
-                        Text("Older activity may be missing.").font(ft(10)).foregroundColor(P.muted)
-                    }
-                    if let to = g.historyTo {
-                        Text("Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate(to, includeTime: true)).")
-                            .font(ft(10)).foregroundColor(P.muted)
-                    }
+                        .help(detail)
+                        .accessibilityLabel("Retained activity since \(retainedDate(g.since, includeTime: true))."
+                            + (g.complete ? "" : " Older activity may be missing.") + (detail.isEmpty ? "" : " " + detail))
                 }
             }
         }
     }
 
-    private func stoppedHistory(_ g: GateStats) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("Stopped before running").font(ft(11, .medium)).foregroundColor(P.red)
-                Spacer()
-                Text("\(g.stopped)").font(ft(11, .semibold)).foregroundColor(P.red)
-            }
-            // Unfinished work first, never truncated.
+    /// Stops and warnings in one list, newest first. Unfinished stops lead and
+    /// are never hidden; the dot says which is which.
+    private func recentHistory(_ g: GateStats) -> some View {
+        let rest = (resolvedStops + recentWarnings).sorted { $0.ts > $1.ts }
+        return VStack(alignment: .leading, spacing: 5) {
+            Text("Recent").font(ft(11, .medium)).foregroundColor(P.muted)
             ForEach(pendingStops) { GateEventCard(event: $0, animation: motion(0.16)) }
-            ForEach(g.pending.filter { !$0.eventRetained }) {
-                MissingGateEventCard(item: $0)
-            }
+            ForEach(g.pending.filter { !$0.eventRetained }) { MissingGateEventCard(item: $0) }
             if showAllStops {
-                LazyVStack(spacing: 7) {
-                    ForEach(resolvedStops) { GateEventCard(event: $0, animation: motion(0.16)) }
+                LazyVStack(spacing: 5) {
+                    ForEach(rest) { GateEventCard(event: $0, animation: motion(0.16)) }
                 }
             } else {
-                ForEach(Array(resolvedStops.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16)) }
+                ForEach(Array(rest.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16)) }
             }
-            if resolvedStops.count > 3 {
-                Button(showAllStops
-                       ? "Show only 3 recent stops"
-                       : "Show all \(resolvedStops.count) earlier stops") {
+            if rest.count > 3 {
+                Button(showAllStops ? "Show only the 3 most recent" : "Show all \(rest.count)") {
                     withAnimation(motion(0.16)) { showAllStops.toggle() }
                 }
                 .buttonStyle(.plain)
                 .font(ft(11, .medium))
-                .foregroundColor(P.red)
-            }
-            if pendingStops.isEmpty && resolvedStops.isEmpty && g.pending.isEmpty {
-                Text("No commands have been stopped since \(retainedDate(g.since)).")
-                    .font(ft(11)).foregroundColor(P.muted)
-            }
-        }
-    }
-
-    private func warningHistory(_ g: GateStats) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("Warned — command ran").font(ft(11, .medium)).foregroundColor(P.amber)
-                Spacer()
-                Text("\(g.warned)").font(ft(11, .semibold)).foregroundColor(P.amber)
-            }
-            if showAllWarnings {
-                LazyVStack(spacing: 7) {
-                    ForEach(recentWarnings) { GateEventCard(event: $0, animation: motion(0.16)) }
-                }
-            } else {
-                ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16)) }
-            }
-            if recentWarnings.count > 3 {
-                Button(showAllWarnings
-                       ? "Show only 3 recent warnings"
-                       : "Show all \(g.warned) retained warnings") {
-                    withAnimation(motion(0.16)) { showAllWarnings.toggle() }
-                }
-                .buttonStyle(.plain)
-                .font(ft(11, .medium))
-                .foregroundColor(P.amber)
+                .foregroundColor(P.muted)
             }
         }
     }

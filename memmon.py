@@ -2426,6 +2426,10 @@ def short_command(cmd: str, limit: int = 60) -> str:
                 out.pop(0)
         if head in ("timeout", "gtimeout") and out and re.match(r"^[\d.]+[smhd]?$", out[0]):
             out.pop(0)
+    # A path is shown by its last component: `../../node_modules/.bin/tsc`
+    # reads as `tsc`, and a test file as its file name.
+    out = [os.path.basename(t.rstrip("/")) or t if "/" in t and not t.startswith("-") else t
+           for t in out]
     text = " ".join(out) or display_command(cmd)
     if HOME:
         text = text.replace(HOME + "/", "~/")
