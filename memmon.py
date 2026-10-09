@@ -77,6 +77,10 @@ DEFAULT_CONFIG = {
     "headroom_frac": 0.20,
     # false turns S2.11 off: no suggestion scan, card, notification or naming.
     "pressure_suggestions": True,
+    # false silences the sampler's notifications (and MemmonBar's).
+    "notifications": True,
+    # The gate's policy when MEMMON_GATE is not set in the hook's environment.
+    "gate_mode": None,
 }
 
 
@@ -1801,7 +1805,9 @@ def notify(text: str, title: str = "memmon", subtitle: str = "",
            run=subprocess.run) -> None:
     """Post one notification. The text reaches osascript only as `on run argv`
     arguments, never inside the script, so a label or a command can never be
-    read as AppleScript."""
+    read as AppleScript. Nothing is posted when settings turn notifications off."""
+    if CONFIG.get("notifications", True) is False:
+        return
     run(["osascript", "-e", "on run argv",
          "-e", "display notification (item 1 of argv) with title (item 2 of argv) "
                "subtitle (item 3 of argv)",
@@ -2727,6 +2733,22 @@ def _read_gate_rows(limit: int | None = 400) -> list[dict]:
     return out
 
 
+GATE_MODES = ("block-critical", "block", "warn", "off")
+
+
+def gate_mode() -> tuple:
+    """(mode, source). MEMMON_GATE in the hook's environment wins, then
+    config.json's gate_mode (`memmon settings set gate_mode …`), then the
+    default. config.json is already loaded at import, so this costs nothing."""
+    env = os.environ.get("MEMMON_GATE")
+    if env is not None:
+        return env, "env"
+    cfg = CONFIG.get("gate_mode")
+    if cfg in GATE_MODES:
+        return cfg, "config"
+    return "block-critical", "default"
+
+
 def gate_stats(limit: int | None = None) -> dict:
     """Retained decisions plus inspectable warning/stop events for the UI."""
     rows = _read_gate_rows(limit)
@@ -2735,8 +2757,8 @@ def gate_stats(limit: int | None = None) -> dict:
         acts[r.get("action", "?")] += 1
     lat = sorted(r.get("ms", 0) for r in rows if r.get("action") != "error")
     paused = pause_until()
-    mode = os.environ.get("MEMMON_GATE", "block-critical")
-    if mode not in ("block-critical", "block", "warn", "off"):
+    mode = gate_mode()[0]
+    if mode not in GATE_MODES:
         mode = "block-critical"
     pending = load_pending()
     def is_pending(sid: str, cmd: str) -> bool:
@@ -2918,7 +2940,6 @@ def gate() -> int:
         payload = json.loads(raw or "{}")
         tool = payload.get("tool_name", "")
         cmd = (payload.get("tool_input") or {}).get("command", "")
-        mode = os.environ.get("MEMMON_GATE", "block-critical")
 
         if pause_until():
             return 0
@@ -2932,7 +2953,11 @@ def gate() -> int:
             except Exception:
                 pass
         classification = classify_command(cmd)
-        if mode == "off" or tool != "Bash" or not classification["matched"]:
+        if tool != "Bash" or not classification["matched"]:
+            return 0
+        # Heavy path only: the policy (env, then config.json, then default).
+        mode = gate_mode()[0]
+        if mode == "off":
             return 0
 
         vm = read_vm(fast=True)
@@ -3203,7 +3228,7 @@ def route_status() -> dict:
 
 
 def protection_block(unmanaged: int) -> dict:
-    mode = os.environ.get("MEMMON_GATE", "block-critical")
+    mode = gate_mode()[0]
     if not gate_installed() or mode == "off":
         gate_state = "off"
     elif pause_until():
@@ -3479,6 +3504,126 @@ def reap_cli(argv: list, engine=None) -> int:
     return _apply_exit(out, args.apply)
 
 
+# ------------------------------------------------------------------ settings
+
+BOOL_SETTINGS = ("auto_cancel_interruptible", "pressure_suggestions", "notifications")
+SETTING_KEYS = ("gate_mode", "runner_mode", *BOOL_SETTINGS)
+ENV_WARNING = "MEMMON_GATE in the hook environment overrides this setting"
+
+
+def _runner_settings() -> dict:
+    import memmon_runner
+    get = getattr(memmon_runner, "get_settings", None)
+    if get is not None:
+        return get(STATE_DIR)
+    mode, _, auto = memmon_runner.read_mode(STATE_DIR)
+    return {"runner_mode": mode, "auto_cancel_interruptible": auto}
+
+
+def settings_payload() -> dict:
+    mode, source = gate_mode()
+    paused = pause_until()
+    out = {"schema_version": 1,
+           "gate_mode": {"value": mode, "source": source, "choices": list(GATE_MODES)},
+           "paused_until": None if not paused else "forever" if paused == float("inf")
+           else paused,
+           **_runner_settings(),
+           "pressure_suggestions": suggestions_enabled(),
+           "notifications": CONFIG.get("notifications", True) is not False,
+           "state_dir": os.path.abspath(STATE_DIR)}
+    if source == "env":
+        out["warning"] = ENV_WARNING
+    return out
+
+
+def _update_config(key: str, value) -> None:
+    """Change one key of config.json atomically and keep every other key.
+    Raises ValueError for a config.json that does not parse: rewriting it
+    would discard what the user wrote."""
+    import memmon_owners
+    path = os.path.join(STATE_DIR, "config.json")
+    try:
+        with open(path) as fh:
+            cfg = json.load(fh)
+    except FileNotFoundError:
+        cfg = {}
+    except ValueError:
+        raise ValueError("config.json is not valid JSON; fix or remove it first")
+    if not isinstance(cfg, dict):
+        raise ValueError("config.json is not a JSON object; fix or remove it first")
+    cfg[key] = value
+    memmon_owners.write_json_atomic(path, cfg)
+    CONFIG[key] = value
+
+
+def settings_set(key: str, raw: str) -> dict:
+    """Apply one allowlisted setting. Raises KeyError for an unknown key and
+    ValueError for a bad value. Never touches ~/.claude/settings.json."""
+    import memmon_runner
+    if key not in SETTING_KEYS:
+        raise KeyError(key)
+    if key == "gate_mode":
+        if raw not in GATE_MODES:
+            raise ValueError(f"gate_mode must be one of {', '.join(GATE_MODES)}")
+        _update_config("gate_mode", raw)
+    elif key == "runner_mode":
+        if raw not in memmon_runner.MODES:
+            raise ValueError(f"runner_mode must be one of {', '.join(memmon_runner.MODES)}")
+        memmon_runner.write_mode(STATE_DIR, raw)
+    else:
+        if raw not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false")
+        value = raw == "true"
+        if key == "auto_cancel_interruptible":
+            setter = getattr(memmon_runner, "set_auto_cancel", None)
+            if setter is not None:
+                setter(STATE_DIR, value)
+            else:
+                memmon_runner.write_mode(STATE_DIR, None, value)
+        else:
+            _update_config(key, value)
+    return settings_payload()
+
+
+def settings_cli(argv: list) -> int:
+    """memmon settings [--json] | memmon settings set KEY VALUE.
+    Exit 0 with the settings JSON, or 2 with {"error", "key"}."""
+    if argv[:1] == ["set"]:
+        if len(argv) != 3:
+            print(json.dumps({"error": "usage: memmon settings set KEY VALUE",
+                              "key": argv[1] if len(argv) > 1 else None}))
+            return 2
+        try:
+            out = settings_set(argv[1], argv[2])
+        except KeyError:
+            print(json.dumps({"error": f"unknown setting; one of {', '.join(SETTING_KEYS)}",
+                              "key": argv[1]}))
+            return 2
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc), "key": argv[1]}))
+            return 2
+        print(json.dumps(out))
+        return 0
+    if argv and argv != ["--json"]:
+        print(json.dumps({"error": "usage: memmon settings [--json] | "
+                                   "memmon settings set KEY VALUE", "key": None}))
+        return 2
+    out = settings_payload()
+    if argv == ["--json"]:
+        print(json.dumps(out))
+        return 0
+    g = out["gate_mode"]
+    print(f"gate_mode                  {g['value']} ({g['source']})"
+          + (f"  — {out['warning']}" if out.get("warning") else ""))
+    p = out["paused_until"]
+    print(f"paused_until               {'not paused' if p is None else p}")
+    for k in ("runner_mode", *BOOL_SETTINGS):
+        v = out[k]
+        print(f"{k:<27}{str(v).lower() if isinstance(v, bool) else v}")
+    print(f"state_dir                  {out['state_dir']}")
+    return 0
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -3490,9 +3635,9 @@ def main() -> int:
         import memmon_route
         return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
                                 split=shell_commands)
-    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap"):
-        return {"owners": owners_cli, "act": act_cli,
-                "reap": reap_cli}[sys.argv[1]](sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap", "settings"):
+        return {"owners": owners_cli, "act": act_cli, "reap": reap_cli,
+                "settings": settings_cli}[sys.argv[1]](sys.argv[2:])
     # Short-circuit before the parser exists: gate() runs on every Bash tool call
     # and has no use for 24 argument definitions.
     if "--gate" in sys.argv:
