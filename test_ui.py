@@ -80,6 +80,10 @@ def a11y_path(path, *flags):
     return rows
 
 
+# Sections start collapsed; tests that read rows open the agent sections.
+AGENTS = ("--sections", "claude,codex")
+
+
 def labels(rows):
     return [r["label"] for r in rows]
 
@@ -490,7 +494,7 @@ class AccessibilityTests(unittest.TestCase):
     """Walks the accessibility tree SwiftUI builds for each fixture."""
 
     def test_overview_labels_rows_chips_meter_and_status_lines(self):
-        rows = a11y("overview.json")
+        rows = a11y("overview.json", *AGENTS)
         found = labels(rows)
         self.assertIn("Sampled 2s ago by the live reader", found)
         self.assertIn("Protection partial · 2 heavy processes not started through memmon run", found)
@@ -512,7 +516,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Pause command protection", found)
 
     def test_unavailable_values_are_spoken_as_unavailable_never_zero(self):
-        found = labels(a11y("unavailable.json"))
+        found = labels(a11y("unavailable.json", *AGENTS))
         row = next(l for l in found if l.startswith("Checkout refactor,"))
         # Nothing measured is one state, not a memory reason plus a CPU one.
         self.assertIn("memory and CPU not available, not measured", row)
@@ -521,7 +525,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Sample time unknown", found)
         ring = next(l for l in found if l.startswith("Memory in use"))
         self.assertEqual(ring, "Memory in use not available, pressure unknown")
-        self.assertIn("Memory in use not available", " ".join(r["value"] for r in a11y("unavailable.json")))
+        self.assertIn("Memory in use not available", " ".join(r["value"] for r in a11y("unavailable.json", *AGENTS)))
 
     def test_session_detail_labels_child_jobs_and_kept_marker(self):
         found = labels(a11y("session-detail.json"))
@@ -714,7 +718,7 @@ class AccessibilityTests(unittest.TestCase):
         self.assertLessEqual(r["force_ttl"], memmon_owners.TOKEN_TTL_S)
 
     def test_rows_stay_one_line_and_the_label_keeps_everything(self):
-        rows = a11y("long-activity.json")
+        rows = a11y("long-activity.json", *AGENTS)
         short = next(r for r in rows if r["label"].startswith("Checkout refactor,"))
         long = next(r for r in rows if r["label"].startswith("Long activity,"))
         self.assertIn("very long label " * 6, long["label"])
@@ -761,17 +765,17 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("5 of 5 processes exited", spoken)
 
     def test_contract_shapes_conversation_job_codex_frontend_and_unattributed(self):
-        detail = labels(a11y("session-detail.json"))
+        detail = labels(a11y("session-detail.json", *AGENTS))
         self.assertIn("Conversation, 1.2 GB · stays open when you stop a build", detail)
         self.assertFalse(any(l.startswith("Stop job: Conversation") for l in detail))
-        shared = labels(a11y("shared-detail.json"))
+        shared = labels(a11y("shared-detail.json", *AGENTS))
         # The generator's own title for a Codex frontend.
         title = "Codex thread · runs in Codex daemon"
         self.assertIn(f'owner.title = "{title}"', (ROOT / "memmon_owners.py").read_text())
         pointer = next(l for l in shared if l.startswith(title + ","))
         self.assertIn("Codex thread · 1 process", pointer)
         self.assertIn("ownership confidence: shared", pointer)
-        growth = labels(a11y("growth-sort.json"))
+        growth = labels(a11y("growth-sort.json", *AGENTS))
         unattributed = next(l for l in growth if l.startswith("Unattributed,"))
         self.assertIn("growth not available, not enough history, 1.8 GB", unattributed)
 
@@ -865,9 +869,9 @@ class SectionTests(unittest.TestCase):
         self.assertFalse(self.small(footprint_bytes=100 * 1024 ** 2))         # not under 100 MiB
         self.assertFalse(self.small(footprint_bytes=None))                    # unknown is never small
 
-    def test_only_agent_sections_start_open(self):
+    def test_every_section_starts_collapsed(self):
         sec = self.by_section(self.probe())
-        self.assertEqual({k for k, v in sec.items() if v["open"]}, {"claude", "codex"})
+        self.assertEqual({k for k, v in sec.items() if v["open"]}, set())
 
     def test_an_open_section_shows_six_rows_then_show_more(self):
         sec = self.by_section(self.probe("sections-open.json"))
@@ -925,7 +929,7 @@ class SectionTests(unittest.TestCase):
         self.assertNotIn("0.0 GB", row)
 
     def test_headers_and_rows_say_everything_the_old_rows_did(self):
-        found = labels(a11y("sections-open.json"))
+        found = labels(a11y("sections-open.json", *AGENTS))
         self.assertIn("Mac apps, 8 owners, 6.4 GB, expanded", found)
         self.assertIn("Browsers, 2 owners, 5.9 GB, collapsed", found)
         self.assertIn("Background, 9 small owners and 6 unattributed processes, 2.1 GB, expanded", found)
@@ -1084,6 +1088,21 @@ class HeaderAndRingTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertTrue(events[0].startswith("Stopped, command did not run: pnpm typecheck"))
         self.assertTrue(any(s.startswith("Retained activity since") for s in spoken))
+
+    def test_header_face_follows_pressure_and_staleness(self):
+        found = labels(a11y("overview.json"))
+        self.assertIn("memmon mood: calm, memory pressure is normal", found)
+        self.assertIn("memmon mood: asleep, the sample is stale", labels(a11y("stale-paused.json")))
+        self.assertIn("memmon mood: unsure, memory pressure is unknown", labels(a11y("unavailable.json")))
+        danger = labels(a11y("under-pressure.json")) if (FIXTURES / "under-pressure.json").exists() else None
+        if danger is not None:
+            self.assertTrue(any(l.startswith("memmon mood: strained") or l.startswith("memmon mood: overheating")
+                                for l in danger), danger[:5])
+
+    def test_footer_says_nothing_it_cannot_explain(self):
+        spoken = " ".join(r["label"] + " " + r["value"] for r in a11y("overview.json"))
+        self.assertNotIn("child processes included once", spoken)
+        self.assertNotIn("Memory figures are estimates", spoken)
 
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
@@ -1367,7 +1386,7 @@ class GeneratorContractTests(unittest.TestCase):
         png = Path(self.out.name) / "generated.png"
         line = run_bin("--render", str(png), "--fixture", str(path), "--dark")
         self.assertIn("rendered", line)
-        rows = a11y_path(path)
+        rows = a11y_path(path, *AGENTS)
         found = labels(rows)
         row = next(l for l in found if l.startswith(session["title"] + ","))
         self.assertIn("Building · typecheck", row)

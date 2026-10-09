@@ -608,7 +608,9 @@ enum OwnerSection: String, CaseIterable, Identifiable {
     }
 
     /// Open until the user closes it: the sections that hold agent work.
-    var openByDefault: Bool { self == .claude || self == .codex }
+    /// Every section starts collapsed: the headers are the overview, and a
+    /// section opens on a click or for the row the user is acting on.
+    var openByDefault: Bool { false }
 
     /// At most this many rows show before "Show N more".
     static let cap = 6
@@ -2978,6 +2980,78 @@ struct ChromeHeightKey: PreferenceKey {
 func ringSweeps(reduceMotion: Bool, animate: Bool) -> Bool { animate && !reduceMotion }
 func dotPulses(reduceMotion: Bool) -> Bool { !reduceMotion }
 
+/// The header's face: how the machine feels, from the sample on screen. A
+/// stale or missing sample never looks calm.
+enum Mood: String {
+    case calm, watch, strained, critical, unsure, asleep
+
+    static func of(_ s: OwnersSnap?) -> Mood {
+        guard let s, s.age != nil else { return .unsure }
+        if s.stale { return .asleep }
+        switch s.system.scoreLevel?.uppercased() {
+        case "HEALTHY": return .calm
+        case "WATCH": return .watch
+        case "DANGER": return .strained
+        case "CRITICAL": return .critical
+        default: return .unsure
+        }
+    }
+
+    var face: String {
+        switch self {
+        case .calm: return "😌"
+        case .watch: return "😐"
+        case .strained: return "😰"
+        case .critical: return "🥵"
+        case .unsure: return "🤔"
+        case .asleep: return "😴"
+        }
+    }
+
+    var spoken: String {
+        switch self {
+        case .calm: return "calm, memory pressure is normal"
+        case .watch: return "watchful, memory pressure is rising"
+        case .strained: return "strained, memory pressure is high"
+        case .critical: return "overheating, memory pressure is critical"
+        case .unsure: return "unsure, memory pressure is unknown"
+        case .asleep: return "asleep, the sample is stale"
+        }
+    }
+
+    /// Breathing for calm, a faster breath when watchful, a wobble when
+    /// strained and a shake when critical.
+    var motion: (scale: CGFloat, angle: Double, period: Double) {
+        switch self {
+        case .calm: return (1.06, 0, 2.4)
+        case .watch: return (1.08, 0, 1.3)
+        case .strained: return (1.0, 6, 0.35)
+        case .critical: return (1.1, 10, 0.16)
+        case .unsure: return (1.0, 8, 1.6)
+        case .asleep: return (0.95, 0, 3.0)
+        }
+    }
+}
+
+struct MoodFace: View {
+    var mood: Mood
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var phase = false
+
+    var body: some View {
+        let m = mood.motion
+        Text(mood.face)
+            .font(.system(size: 19))
+            .scaleEffect(phase ? m.scale : 1)
+            .rotationEffect(.degrees(phase ? m.angle : (m.angle == 0 ? 0 : -m.angle)))
+            .onAppear {
+                // Renders and Reduce Motion get the still face.
+                guard dotPulses(reduceMotion: reduceMotion) else { return }
+                withAnimation(.easeInOut(duration: m.period).repeatForever(autoreverses: true)) { phase = true }
+            }
+    }
+}
+
 /// What the header's status pill says about the sample on screen.
 struct StatusState: Equatable {
     enum Kind: String { case live, syncing, sampling, stale }
@@ -3239,12 +3313,15 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image(systemName: "memorychip")
-                .font(.system(size: 15, weight: .medium)).foregroundColor(P.accent)
+            let mood = Mood.of(model.snap)
+            MoodFace(mood: mood)
+                .id(mood)
                 .frame(width: 34, height: 34)
                 .background(RoundedRectangle(cornerRadius: 10).fill(P.panel.opacity(0.75)))
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.border, lineWidth: 1))
-                .accessibilityHidden(true)
+                .help(mood.spoken)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("memmon mood: \(mood.spoken)")
             VStack(alignment: .leading, spacing: 1) {
                 Text("memmon").font(ft(16, .semibold)).tracking(-0.3).foregroundColor(P.text)
                 Text("Memory & sessions").font(ft(11)).foregroundColor(P.muted)
@@ -3337,6 +3414,7 @@ struct ContentView: View {
             HStack(alignment: .center, spacing: 16) {
                 ZStack {
                     MemoryRing(segments: segments, used: used, ram: ram, animate: !flattened)
+                        .help("Memory in use. Each section adds up its processes' footprints, compressed pages included; every process counts once, under its owner.")
                     VStack(spacing: 0) {
                         Text(used.map { String(format: "%.1f", $0 / GB) } ?? "—")
                             .font(.system(size: 22, weight: .semibold)).foregroundColor(P.text)
@@ -3833,19 +3911,9 @@ struct ContentView: View {
     }
 
     private var footer: some View {
-        let count = model.snap?.rows.count
-        return HStack(spacing: 8) {
+        HStack(spacing: 8) {
             FooterButton(icon: "arrow.clockwise", label: "Sync") { model.refresh() }
             Spacer(minLength: 4)
-            VStack(spacing: 1) {
-                if let count {
-                    Text("\(plural(count, "owner")) · child processes included once")
-                }
-                Text("Memory figures are estimates")
-            }
-            .font(ft(11)).foregroundColor(P.muted)
-            .multilineTextAlignment(.center)
-            .lineLimit(1).minimumScaleFactor(0.85)
             Spacer(minLength: 4)
             FooterButton(icon: "power", label: "Quit", action: onQuit)
         }
@@ -4003,7 +4071,9 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.openGate = ARGS.contains("--open-gate") || (view["open_gate"] as? Bool ?? false)
     o.dark = ARGS.contains("--dark")
     o.popoverClosed = view["popover_closed"] as? Bool ?? false
-    o.sections = view["sections"] as? [String] ?? []
+    // `--sections a,b` opens sections on top of the fixture's own view.
+    o.sections = (view["sections"] as? [String] ?? [])
+        + (argValue("--sections")?.split(separator: ",").map(String.init) ?? [])
     o.showAll = view["show_all"] as? [String] ?? []
     return o
 }
