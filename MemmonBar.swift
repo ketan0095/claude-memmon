@@ -1560,15 +1560,32 @@ enum ExplainOutcome {
     case failed(String)
 
     static func of(_ r: CLIResult) -> ExplainOutcome {
-        if r.timedOut { return .failed("Claude did not answer in time.") }
+        if r.timedOut { return .failed("Claude did not answer within \(Int(Model.explainTimeout)) s.") }
         if let e = r.launchError { return .failed("Could not ask Claude: \(e).") }
         let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
         if r.exit == 0, let j, let t = j["text"] as? String {
             return .reply(text: t.trimmingCharacters(in: .whitespacesAndNewlines),
                           chars: int(j["chars_sent"]), model: str(j["model"]))
         }
-        if let e = j.flatMap({ str($0["error"]) }) { return .failed("Could not ask Claude: \(e).") }
+        if let e = j.flatMap({ str($0["error"]) }) { return .failed(readable(e)) }
         return .failed("Could not ask Claude: memmon's answer could not be read.")
+    }
+
+    /// memmon's own error, said plainly: Claude missing, too slow, or failed.
+    static func readable(_ e: String) -> String {
+        if e.hasPrefix("claude not found") {
+            return "Claude Code isn’t installed, or memmon can’t find it (it looks on PATH, ~/.local/bin, /opt/homebrew/bin and /usr/local/bin)."
+        }
+        if e.hasPrefix("claude did not answer") { return "Claude did not answer within \(Int(Model.explainTimeout)) s." }
+        if e.hasPrefix("claude exited") { return "Claude stopped with an error: " + e.replacingOccurrences(of: "claude exited ", with: "exit ") + "." }
+        return "Could not ask Claude: \(e)."
+    }
+
+    /// `memmon explain --preview --json`: exactly what a send would carry.
+    static func preview(_ r: CLIResult) -> (text: String, chars: Int?)? {
+        guard r.exit == 0, let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any],
+              let t = j["preview"] as? String else { return nil }
+        return (t, int(j["chars"]))
     }
 }
 
@@ -2671,26 +2688,69 @@ final class Model: ObservableObject {
         }
     }
 
-    /// Explain (D47): asked only by a click, never on refresh or open.
+    /// Explain (D47): asked only by a click, never on refresh or open. A
+    /// click first shows exactly what would be sent; only Send calls Claude.
     @Published var explainOpen = false
     @Published var explainBusy = false
+    @Published var explainPreview: String?
+    @Published var explainPreviewLoading = false
     @Published var explainText: String?
     @Published var explainError: String?
     var explainChars: Int?
-    /// Claude has up to 60 s; memmon needs a moment more to start it.
-    static let explainTimeout = 75.0
+    /// Each send is numbered; Cancel moves past it, so a late answer is dropped.
+    var explainSeq = 0
+    /// How long the card waits for Claude.
+    static let explainTimeout = 60.0
 
+    /// The click: open the card on a fresh preview. Nothing goes to Claude.
     func explain() {
-        guard !explainBusy else { return }
+        guard !explainBusy, !explainPreviewLoading else { return }
         explainOpen = true
+        explainError = nil
+        explainText = nil
+        explainPreview = nil
+        let args = ["explain", "--preview", "--json"]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        explainPreviewLoading = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async {
+                self.explainPreviewLoading = false
+                if let p = ExplainOutcome.preview(r) {
+                    self.explainPreview = p.text
+                    self.explainChars = p.chars
+                } else {
+                    self.explainError = "Could not prepare the summary for Claude."
+                }
+            }
+        }
+    }
+
+    /// Send, after the preview: `memmon explain --json`, bounded to 60 s.
+    func sendExplain() {
+        guard explainPreview != nil, !explainBusy else { return }
         explainError = nil
         let args = ["explain", "--json"]
         guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        explainSeq += 1
+        let seq = explainSeq
         explainBusy = true
         DispatchQueue.global(qos: .userInitiated).async {
             let outcome = ExplainOutcome.of(CLI.run(args, timeout: Model.explainTimeout))
-            DispatchQueue.main.async { self.applyExplain(outcome) }
+            DispatchQueue.main.async {
+                guard seq == self.explainSeq else { return }      // cancelled meanwhile
+                self.applyExplain(outcome)
+            }
         }
+    }
+
+    /// Stops waiting. memmon's own call to Claude ends by itself within 60 s;
+    /// its answer, if any, is not shown.
+    func cancelExplain() {
+        guard explainBusy else { return }
+        explainSeq += 1
+        explainBusy = false
+        explainError = "Cancelled. Nothing was changed."
     }
 
     func applyExplain(_ o: ExplainOutcome) {
@@ -2698,14 +2758,18 @@ final class Model: ObservableObject {
         switch o {
         case .reply(let text, let chars, _):
             explainText = text
-            explainChars = chars
+            explainChars = chars ?? explainChars
             explainError = nil
+            explainPreview = nil
         case .failed(let e):
             explainError = e
         }
     }
 
-    func dismissExplain() { explainOpen = false }
+    func dismissExplain() {
+        if explainBusy { cancelExplain() }
+        explainOpen = false
+    }
 
     /// The stored theme; an unknown or missing value is System.
     var theme: ThemeChoice { ThemeChoice(rawValue: prefs.string(PrefKey.theme) ?? "") ?? .system }
@@ -5384,47 +5448,77 @@ struct ContentView: View {
     // MARK: explain (D47)
 
     /// Claude's reply, shown as plain text (Text(verbatim:)): nothing in it
-    /// is formatted, linked or run.
+    /// is formatted, linked or run. Before any send, the card shows exactly
+    /// what would be sent.
     private var explainCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
                 Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).foregroundColor(P.accent)
                     .accessibilityHidden(true)
-                Text("Claude’s suggestions").font(ft(13, .medium)).accessibilityAddTraits(.isHeader)
-                if model.explainBusy { Spinner() }
+                Text(model.explainText == nil ? "Ask Claude what to do" : "Claude’s suggestions")
+                    .font(ft(13, .medium)).accessibilityAddTraits(.isHeader)
+                if model.explainBusy || model.explainPreviewLoading { Spinner() }
                 Spacer()
                 ActionButton(title: "Close", icon: "xmark", variant: .icon) {
                     withAnimation(motion(0.12)) { model.dismissExplain() }
                 }
-                .accessibilityLabel("Close Claude’s suggestions")
+                .accessibilityLabel("Close Ask Claude")
             }
-            if model.explainBusy && model.explainText == nil {
-                Text("Asking Claude… this can take up to a minute.").font(ft(12)).foregroundColor(P.muted)
+            if let p = model.explainPreview, model.explainText == nil {
+                Text("This is all that is sent" + (model.explainChars.map { " (\($0) characters)" } ?? "")
+                     + ". It has no paths, PIDs or tokens.")
+                    .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                let sent = Text(verbatim: p).font(.system(size: 10, design: .monospaced)).foregroundColor(P.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Group {
+                    // Renders cannot draw a ScrollView, so they show it whole.
+                    if flattened { sent } else { ScrollView { sent }.frame(maxHeight: 140) }
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(P.soft))
+                .accessibilityLabel("What is sent to Claude")
+            }
+            if model.explainBusy {
+                HStack(spacing: 8) {
+                    Text("Asking Claude… up to \(Int(Model.explainTimeout)) s.").font(ft(12)).foregroundColor(P.muted)
+                    Spacer()
+                    ActionButton(title: "Cancel") { model.cancelExplain() }
+                        .accessibilityLabel("Cancel asking Claude")
+                }
+            } else if model.explainPreview != nil && model.explainText == nil {
+                HStack(spacing: 8) {
+                    Spacer()
+                    ActionButton(title: "Not now") { withAnimation(motion(0.12)) { model.dismissExplain() } }
+                    ActionButton(title: "Send to Claude", icon: "paperplane", variant: .primary) { model.sendExplain() }
+                        .accessibilityLabel("Send this summary to Claude")
+                }
             }
             if let e = model.explainError {
-                Text(verbatim: e).font(ft(12)).foregroundColor(P.red).fixedSize(horizontal: false, vertical: true)
+                Text(verbatim: e).font(ft(12)).foregroundColor(e.hasPrefix("Cancelled") ? P.muted : P.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let t = model.explainText {
                 Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-            }
-            HStack(alignment: .top, spacing: 8) {
-                Text("From Claude. memmon never acts on it."
-                     + (model.explainChars.map { " Sent \($0) characters, with no paths, PIDs or tokens." } ?? ""))
-                    .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 4)
-                if !model.explainBusy {
-                    ActionButton(title: model.explainText == nil && model.explainError == nil ? "Ask" : "Ask again",
-                                 variant: .link) { model.explain() }
+                HStack(alignment: .top, spacing: 8) {
+                    Text("From Claude. memmon never acts on it."
+                         + (model.explainChars.map { " Sent \($0) characters, with no paths, PIDs or tokens." } ?? ""))
+                        .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    ActionButton(title: "Ask again", variant: .link) { model.explain() }
                 }
+            } else if model.explainError != nil && !model.explainBusy && model.explainPreview == nil {
+                HStack { Spacer(); ActionButton(title: "Try again", variant: .link) { model.explain() } }
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .panel(12)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Claude’s suggestions")
+        .accessibilityLabel("Ask Claude")
     }
 
     // MARK: settings (D43)
@@ -6586,9 +6680,12 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     if let e = fixtureView["explain"] as? [String: Any] {
         // An Explain card: busy, or the outcome of one `memmon explain --json`.
         m.explainOpen = true
+        if let p = e["preview"] as? [String: Any] {
+            m.explainPreview = str(p["preview"]); m.explainChars = int(p["chars"])
+        }
         if e["busy"] as? Bool == true {
             m.explainBusy = true
-        } else {
+        } else if e["exit"] != nil {
             var r = CLIResult(exit: int(e["exit"]).map { Int32($0) }, stdout: Data())
             if let obj = e["stdout"], JSONSerialization.isValidJSONObject(obj) {
                 r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
@@ -7097,13 +7194,18 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     case "popover":
                         let w = PressureWatch(); popoverOpened(model, w); popoverHidden(model, w)
                     case "click": model.explain()
-                    case "click-twice": model.explain(); model.explain()
+                    case "send": model.sendExplain()
+                    case "send-twice": model.sendExplain(); model.sendExplain()
+                    case "send-nowait": model.sendExplain(); spin(0.3); continue
+                    case "cancel": model.cancelExplain()
+                    case "wait": spin(2.0)
                     default: fail("unknown explain step \(step)")
                     }
                     let deadline = Date().addingTimeInterval(8)
                     spin(0.05)
-                    while Date() < deadline && (model.explainBusy || model.refreshing) { spin(0.05) }
+                    while Date() < deadline && (model.explainBusy || model.explainPreviewLoading || model.refreshing) { spin(0.05) }
                 }
+                report["preview"] = model.explainPreview ?? NSNull()
                 report["open"] = model.explainOpen
                 report["text"] = model.explainText ?? NSNull()
                 report["error"] = model.explainError ?? NSNull()
@@ -7687,7 +7789,7 @@ if ARGS.contains("--constants") {
     var copy: [String: String] = [:]
     for r in reasons { copy[r] = Copy.refusal(r, noun: "build", forcing: false).0 }
     let out: [String: Any] = ["act_timeout": CLI.actTimeout, "owners_timeout": CLI.ownersTimeout,
-                              "force_ttl": Model.forceTTL, "refusals": copy]
+                              "force_ttl": Model.forceTTL, "explain_timeout": Model.explainTimeout, "refusals": copy]
     let data = try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
     exit(0)

@@ -4,7 +4,7 @@
   "explain": {
    "exit": 2,
    "stdout": {
-    "error": "claude did not answer within 60 s"
+    "error": "claude not found on PATH, ~/.local/bin, /opt/homebrew/bin or /usr/local/bin"
    }
   }
  }

@@ -2382,9 +2382,12 @@ class ThemeTests(unittest.TestCase):
 
 
 class ExplainTests(StubCase):
-    """D47: Claude is asked only on a click, and its reply is plain text that
-    memmon never acts on."""
+    """D47: a click shows exactly what would be sent; only Send asks Claude,
+    bounded to 60 s and cancellable. The reply is plain text memmon never
+    acts on."""
 
+    PREVIEW = {"preview": "pressure HEALTHY; used 39.2 of 48.0 GB\nClaude session \"Checkout refactor\" 8.9 GB",
+               "chars": 74}
     REPLY = {"text": "**Checkout refactor** holds 8.9 GB.\nRun `memmon act stop-job --target x` to free it.",
              "model": "claude-haiku-5-5", "chars_sent": 812, "elapsed_s": 3.1}
 
@@ -2396,48 +2399,76 @@ class ExplainTests(StubCase):
         script.write_text(
             "import json, sys, time\n"
             f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if sys.argv[1:2] == ['explain']:\n"
+            "a = sys.argv[1:]\n"
+            "if a[:2] == ['explain', '--preview']:\n"
+            f"    print(json.dumps({self.PREVIEW!r}))\n"
+            "elif a[:1] == ['explain']:\n"
             f"    time.sleep({sleep}); print(json.dumps({reply if reply is not None else self.REPLY!r})); sys.exit({code})\n"
-            f"print(open({str(owners)!r}).read())\n")
+            "else:\n"
+            f"    print(open({str(owners)!r}).read())\n")
         return str(script), calls
 
     def run_steps(self, steps, **stub):
         script, calls = self.stub(**stub)
         r = host("explain", FIXTURES / "overview.json", "--script", script, "--do", steps)
         made = [json.loads(l) for l in calls.read_text().splitlines()] if calls.exists() else []
-        return r, made
+        return r, [c for c in made if c[0] == "explain"]
 
     def test_nothing_is_asked_without_a_click(self):
         r, made = self.run_steps("refresh,popover,refresh")
-        self.assertFalse(r["open"])
-        self.assertTrue(made and all(c[0] == "owners" for c in made), made)
+        self.assertEqual((r["open"], made), (False, []))
 
-    def test_a_click_asks_once_and_shows_the_reply_as_is(self):
+    def test_a_click_shows_the_preview_and_sends_nothing(self):
         r, made = self.run_steps("click")
-        self.assertEqual(made, [["explain", "--json"]])
+        self.assertEqual(made, [["explain", "--preview", "--json"]])
+        self.assertEqual(r["preview"], self.PREVIEW["preview"])
+        self.assertIsNone(r["text"])
+
+    def test_send_asks_once_and_shows_the_reply_as_is(self):
+        r, made = self.run_steps("click,send-twice")
+        self.assertEqual(made, [["explain", "--preview", "--json"], ["explain", "--json"]])
         self.assertEqual(r["text"], self.REPLY["text"])
-        self.assertIsNone(r["error"])
         # A command in the reply is only text: memmon runs nothing after it.
-        self.assertFalse(any(c[0] == "act" for c in made))
+        self.assertFalse(any(c[1:2] == ["act"] for c in made))
 
-    def test_a_second_click_while_asking_is_ignored(self):
-        r, made = self.run_steps("click-twice", sleep=0.5)
-        self.assertEqual([c for c in made if c[0] == "explain"], [["explain", "--json"]])
+    def test_send_needs_the_preview_first(self):
+        r, made = self.run_steps("send")
+        self.assertEqual(made, [])
 
-    def test_a_failure_is_shown_inline(self):
-        r, _ = self.run_steps("click", reply={"error": "claude not found on PATH"}, code=2)
-        self.assertEqual((r["text"], r["error"]), (None, "Could not ask Claude: claude not found on PATH."))
-        r, _ = self.run_steps("click", reply="not json")
-        self.assertEqual(r["error"], "Could not ask Claude: memmon's answer could not be read.")
+    def test_cancel_drops_a_late_answer(self):
+        r, made = self.run_steps("click,send-nowait,cancel,wait", sleep=1.0)
+        self.assertEqual(made[-1], ["explain", "--json"])
+        self.assertIsNone(r["text"])
+        self.assertEqual(r["error"], "Cancelled. Nothing was changed.")
+
+    def test_the_wait_is_bounded_to_60_s(self):
+        self.assertEqual(run_json("--constants")["explain_timeout"], 60)
+
+    def test_errors_are_readable(self):
+        cases = [({"error": "claude not found on PATH, ~/.local/bin, /opt/homebrew/bin or /usr/local/bin"},
+                  "Claude Code isn’t installed, or memmon can’t find it"),
+                 ({"error": "claude did not answer within 60 s"}, "Claude did not answer within 60 s."),
+                 ({"error": "claude exited 1: rate limited"}, "Claude stopped with an error: exit 1: rate limited."),
+                 ("not json", "Could not ask Claude: memmon's answer could not be read.")]
+        for reply, says in cases:
+            r, _ = self.run_steps("click,send", reply=reply, code=0 if reply == "not json" else 2)
+            self.assertTrue(r["error"].startswith(says), (reply, r["error"]))
+            self.assertIsNone(r["text"])
 
     def test_fixture_mode_logs_the_exact_argv(self):
         self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],
+                         ["memmon explain --preview --json"])
+        self.assertEqual(host("explain", FIXTURES / "explain-preview.json", "--do", "send")["actions"],
                          ["memmon explain --json"])
 
-    def test_the_reply_is_rendered_verbatim(self):
+    def test_cards_say_what_they_show(self):
         found = said("explain-reply.json")
         self.assertTrue(any(l.startswith("Checkout refactor (Claude session) holds 8.9 GB") for l in found), found)
         self.assertTrue(any("**Billing API tests** (Codex)" in l for l in found), found)
-        self.assertIn("Ask Claude what to do about memory", said("overview.json"))
-        self.assertIn("Could not ask Claude: claude did not answer within 60 s.", said("explain-error.json"))
         self.assertTrue(any(l.startswith("From Claude. memmon never acts on it. Sent 812 characters") for l in found))
+        self.assertIn("Ask Claude what to do about memory", said("overview.json"))
+        preview = said("explain-preview.json")
+        self.assertIn("Send this summary to Claude", preview)
+        self.assertTrue(any(l.startswith("This is all that is sent (") for l in preview), preview)
+        self.assertIn("Cancel asking Claude", said("explain-busy.json"))
+        self.assertTrue(any(l.startswith("Claude Code isn’t installed") for l in said("explain-error.json")))
