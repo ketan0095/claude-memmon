@@ -219,6 +219,42 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(json.loads(buf.getvalue())["state"], "none")
 
 
+class SettingsInstallTests(unittest.TestCase):
+    def setUp(self):
+        import testkit
+        self.state = testkit.TempState()
+        self.addCleanup(self.state.close)
+
+    def settings(self):
+        import contextlib, io, memmon
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(memmon.settings_cli(["--json"]), 0)
+        return json.loads(buf.getvalue())
+
+    def test_settings_json_carries_install_without_the_path(self):
+        self.assertEqual(self.settings()["install"],
+                         {"commit": None, "branch": None, "installed_at": None,
+                          "source_known": False})
+        rec = {"version": 1, "source": "/Volumes/acme/acme-memmon", "flags": ["--sampler"],
+               "commit": "9782572aa1b2c3d4e5f60718293a4b5c6d7e8f90", "branch": "main",
+               "installed_at": 1791500000}
+        with open(os.path.join(self.state.root, "install.json"), "w") as fh:
+            json.dump(rec, fh)
+        out = self.settings()
+        self.assertEqual(out["install"], {"commit": "9782572", "branch": "main",
+                                          "installed_at": 1791500000, "source_known": True})
+        self.assertNotIn("acme-memmon", json.dumps(out))
+
+    def test_odd_install_json_values_become_null(self):
+        with open(os.path.join(self.state.root, "install.json"), "w") as fh:
+            json.dump({"source": "/Volumes/acme/x", "commit": 7, "branch": ["main"],
+                       "installed_at": "yesterday"}, fh)
+        self.assertEqual(up.install_summary(self.state.root),
+                         {"commit": None, "branch": None, "installed_at": None,
+                          "source_known": True})
+
+
 class InstallScriptTests(unittest.TestCase):
     def test_install_json_written_atomically_and_removed_on_uninstall(self):
         with open(os.path.join(HERE, "install.sh")) as fh:

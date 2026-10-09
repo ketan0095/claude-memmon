@@ -42,6 +42,16 @@ def read_install(state_dir) -> dict | None:
     return rec if isinstance(rec, dict) and rec.get("source") else None
 
 
+def install_summary(state_dir) -> dict:
+    """What `memmon settings --json` shows before any check: never the path."""
+    rec = read_install(state_dir) or {}
+    commit, branch, at = rec.get("commit"), rec.get("branch"), rec.get("installed_at")
+    return {"commit": _short(commit) if isinstance(commit, str) else None,
+            "branch": branch if isinstance(branch, str) else None,
+            "installed_at": at if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
+            "source_known": bool(rec.get("source"))}
+
+
 def recorded_flags(rec: dict) -> list:
     """Only the installer's own flags, in their usual order: install.json is
     a file on disk, and nothing else from it reaches a command line."""
