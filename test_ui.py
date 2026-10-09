@@ -2383,10 +2383,17 @@ class ThemeTests(unittest.TestCase):
         Path(self.store).write_text(json.dumps({"memmon.theme": "sepia"}))
         self.assertEqual((self.probe()["theme"], self.probe()["appearance"]), ("system", None))
 
+    def test_system_says_which_look_macos_uses(self):
+        r = self.probe("--system-style", "Dark", "--flip-to", "Light")
+        self.assertEqual((r["system_label"], r["system_label_after"]), ("System (Dark)", "System (Light)"))
+        r = self.probe("--flip-to", "Dark")
+        self.assertEqual((r["system_label"], r["system_label_after"]), ("System (Light)", "System (Dark)"))
+
     def test_settings_offers_the_theme(self):
         found = said("settings-panel.json")
-        self.assertIn("Theme, System", found)
-        self.assertIn("System, current choice", found)
+        self.assertIn("Theme, System (Light)", found)
+        self.assertIn("System (Light), current choice", found)
+        self.assertIn("Theme, System (Dark)", [r["label"] for r in a11y("settings-panel.json", "--dark")])
         self.assertIn("Choose Dark", found)
 
 
@@ -2501,6 +2508,26 @@ class ExplainTests(StubCase):
         reply = dict(self.REPLY, items=[{"owner": "Example Browser", "action": "Close tabs.", "why": ""}])
         r, _ = self.run_steps("click", reply=reply)
         self.assertEqual(r["items"], [{"owner": "Example Browser", "section": "app"}])
+
+    def test_the_fallback_is_one_bullet_per_line(self):
+        found = said("explain-reply.json")
+        lines = [l for l in found if l.startswith(("Checkout refactor (Claude", "Container VM uses",
+                                                     "Example Browser has", "**Billing API tests**"))]
+        self.assertEqual(len(lines), 4, found)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "e.json"
+            path.write_text(json.dumps(dict(effective(FIXTURES / "overview.json"), _view={"explain": {
+                "exit": 0, "stdout": {"text": "- Container VM: stop it from its app.\n\n2. Example Browser: close tabs.\nnothing else"}}})))
+            three = [r["label"] for r in a11y_path(path)]
+        self.assertIn("Container VM: stop it from its app.", three)
+        self.assertIn("Example Browser: close tabs.", three)
+        self.assertIn("nothing else", three)
+        self.assertFalse(any("\n" in l or ("Container VM" in l and "Example Browser" in l) for l in three))
+
+    def test_owner_before_a_colon_is_split_out(self):
+        r = run_json("--explain-line-probe", "--line", "VM · colima: stop it overnight.")
+        self.assertEqual(r, {"owner": "VM · colima", "rest": "stop it overnight."})
+        self.assertEqual(run_json("--explain-line-probe", "--line", "Close unused tabs.")["owner"], None)
 
     def test_fixture_mode_logs_the_exact_argv(self):
         self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],

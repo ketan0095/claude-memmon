@@ -1252,12 +1252,32 @@ final class FileStore: MemoryStore {
 enum ThemeChoice: String, CaseIterable {
     case system, light, dark
     var label: String { rawValue.capitalized }
+    /// The segment's name: System says which look macOS is using now.
+    func label(systemDark: Bool) -> String {
+        self == .system ? "System (\(systemDark ? "Dark" : "Light"))" : label
+    }
     var appearance: NSAppearance? {
         switch self {
         case .system: return nil
         case .light: return NSAppearance(named: .aqua)
         case .dark: return NSAppearance(named: .darkAqua)
         }
+    }
+}
+
+/// macOS's own look, from the global AppleInterfaceStyle default.
+func systemIsDark(_ defaults: UserDefaults = .standard) -> Bool {
+    defaults.string(forKey: "AppleInterfaceStyle") == "Dark"
+}
+
+/// Keeps the System label current: macOS posts this distributed
+/// notification when its look changes. The center is injectable for tests.
+final class SystemLookWatch {
+    static let name = Notification.Name("AppleInterfaceThemeChangedNotification")
+    private var token: NSObjectProtocol?
+    init(center: NotificationCenter = DistributedNotificationCenter.default(),
+         read: @escaping () -> Bool = { systemIsDark() }, onChange: @escaping (Bool) -> Void) {
+        token = center.addObserver(forName: SystemLookWatch.name, object: nil, queue: .main) { _ in onChange(read()) }
     }
 }
 
@@ -1564,6 +1584,35 @@ struct ExplainItem: Equatable {
     }
 
     var spoken: String { [owner, action, why].filter { !$0.isEmpty }.joined(separator: ", ") }
+}
+
+/// The reply's lines without blanks or leading list markers ("- ", "• ", "1. ").
+func explainLines(_ text: String) -> [String] {
+    text.split(whereSeparator: \.isNewline).map { raw -> String in
+        var l = raw.trimmingCharacters(in: .whitespaces)
+        for m in ["- ", "• ", "* "] where l.hasPrefix(m) { l = String(l.dropFirst(m.count)) }
+        if let r = l.range(of: #"^\d+[.)] "#, options: .regularExpression) { l.removeSubrange(r) }
+        return l
+    }.filter { !$0.isEmpty }
+}
+
+/// "Container VM: stop it" -> ("Container VM", "stop it"), when the part
+/// before the colon is short enough to be a name.
+func explainLineOwner(_ line: String) -> (String, String)? {
+    guard let r = line.range(of: ": ") else { return nil }
+    let owner = String(line[..<r.lowerBound]), rest = String(line[r.upperBound...])
+    guard !owner.isEmpty, owner.count <= 48, !rest.isEmpty else { return nil }
+    return (owner, rest)
+}
+
+/// A suggestion's bullet: a 6 pt circle.
+struct ExplainBullet: View {
+    var color: Color
+    var body: some View {
+        Circle().fill(color).frame(width: 6, height: 6)
+            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+            .accessibilityHidden(true)
+    }
 }
 
 /// The section of the owner an item names, by the snapshot's own titles
@@ -2797,6 +2846,10 @@ final class Model: ObservableObject {
     var theme: ThemeChoice { ThemeChoice(rawValue: prefs.string(PrefKey.theme) ?? "") ?? .system }
     /// Applies a theme to the live popover; unset in renders and probes.
     var onTheme: ((ThemeChoice) -> Void)?
+
+    /// macOS's look, for the System segment's label. Renders set it from
+    /// --light / --dark, so fixtures stay the same on any Mac.
+    @Published var systemDark = false
 
     func setTheme(_ t: ThemeChoice) {
         prefs.set(t.rawValue, PrefKey.theme)
@@ -5485,10 +5538,12 @@ struct ContentView: View {
                         Image(systemName: "checkmark.circle").font(.system(size: 13, weight: .medium))
                             .foregroundColor(P.green).padding(.top, 1).accessibilityHidden(true)
                     }
-                    if model.explainItems.isEmpty || model.explainQuiet {
+                    if model.explainQuiet {
                         Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
                             .fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
+                    } else if model.explainItems.isEmpty {
+                        explainLineList(t)
                     } else {
                         explainItemList(model.explainItems)
                     }
@@ -5515,28 +5570,53 @@ struct ContentView: View {
     /// One row per item: the owner (with its section's dot), what to do,
     /// and why. Plain text throughout.
     private func explainItemList(_ items: [ExplainItem]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(items.enumerated()), id: \.offset) { k, item in
                 if k > 0 { Rectangle().fill(P.border).frame(height: 1) }
                 let sec = explainSection(item.owner, model.snap)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Circle().fill(sec.map(P.section) ?? P.muted).frame(width: 7, height: 7)
-                            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                // The action and why sit under the name, not under the bullet.
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    ExplainBullet(color: sec.map(P.section) ?? P.muted)
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(verbatim: item.owner).font(ft(12, .semibold)).foregroundColor(P.text)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Text(verbatim: item.action).font(ft(12)).foregroundColor(P.text)
-                        .fixedSize(horizontal: false, vertical: true).padding(.leading, 13)
-                    if !item.why.isEmpty {
-                        Text(verbatim: item.why).font(ft(11)).foregroundColor(P.muted)
-                            .fixedSize(horizontal: false, vertical: true).padding(.leading, 13)
+                        Text(verbatim: item.action).font(ft(12)).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if !item.why.isEmpty {
+                            Text(verbatim: item.why).font(ft(11)).foregroundColor(P.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(item.spoken)
+            }
+        }
+    }
+
+    /// An older memmon's plain reply: one muted bullet per line, never one
+    /// paragraph. A line that reads "owner: rest" shows the owner in semibold.
+    private func explainLineList(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(explainLines(text).enumerated()), id: \.offset) { _, line in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    ExplainBullet(color: P.muted)
+                    Group {
+                        if let (owner, rest) = explainLineOwner(line) {
+                            Text(verbatim: owner).fontWeight(.semibold) + Text(verbatim: ": " + rest)
+                        } else {
+                            Text(verbatim: line)
+                        }
+                    }
+                    .font(ft(12)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Read from the Text itself, so what is spoken is what is shown.
+                .accessibilityElement(children: .combine)
             }
         }
     }
@@ -5664,12 +5744,14 @@ struct ContentView: View {
         settingsCard("Appearance", "circle.lefthalf.filled") {
             HStack(spacing: 8) {
                 Text("Theme").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
-                ChoiceSegmented(choices: ThemeChoice.allCases.map { ($0.rawValue, $0.label, $0.label, $0.label) },
+                ChoiceSegmented(choices: ThemeChoice.allCases.map {
+                    let l = $0.label(systemDark: model.systemDark); return ($0.rawValue, l, l, l)
+                },
                                 selected: model.theme.rawValue, enabled: true) { v in
                     model.setTheme(ThemeChoice(rawValue: v) ?? .system)
                 }
                 .accessibilityElement(children: .contain)
-                .accessibilityLabel("Theme, \(model.theme.label)")
+                .accessibilityLabel("Theme, \(model.theme.label(systemDark: model.systemDark))")
             }
         }
         if let dir = st.stateDir {
@@ -6495,6 +6577,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let runnerDir = NSString(string: "~/.claude/memmon/runner").expandingTildeInPath
     let configPath = NSString(string: "~/.claude/memmon/config.json").expandingTildeInPath
     let pressureWatch = PressureWatch()
+    var lookWatch: SystemLookWatch?
     /// One runner read at a time; a slow disk skips a tick instead of piling up.
     var readingRunner = false
 
@@ -6509,6 +6592,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
         applyTheme(popover, model.theme)
         model.onTheme = { [weak self] t in self.map { applyTheme($0.popover, t) } }
+        model.systemDark = systemIsDark()
+        lookWatch = SystemLookWatch { [weak self] dark in self?.model.systemDark = dark }
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -6681,6 +6766,7 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
     guard let snap = OwnersSnap.decode(json) else { fail("fixture is not an owners payload (schema 2)") }
     let m = Model()
     m.live = false
+    m.systemDark = o.dark
     m.snap = snap
     m.sort = o.sort
     m.expanded = o.select
@@ -7779,6 +7865,13 @@ if ARGS.contains("--notify-probe") {
     print(String(data: data, encoding: .utf8)!)
     exit(0)
 }
+if ARGS.contains("--explain-line-probe") {
+    let l = argValue("--line") ?? ""
+    let o = explainLineOwner(l)
+    print(String(data: try! JSONSerialization.data(withJSONObject: ["owner": o.map { $0.0 as Any } ?? NSNull(), "rest": o.map { $0.1 as Any } ?? NSNull()],
+                                                    options: [.sortedKeys]), encoding: .utf8)!)
+    exit(0)
+}
 if ARGS.contains("--theme-probe") {
     // Stores a theme through the Settings path into a file-backed store (as
     // UserDefaults would hold it) and applies it to a real popover.
@@ -7794,6 +7887,20 @@ if ARGS.contains("--theme-probe") {
     out["theme"] = m.theme.rawValue
     out["stored"] = m.prefs.string(PrefKey.theme) ?? NSNull()
     out["appearance"] = pop.appearance?.name.rawValue ?? NSNull()
+    // The System label follows macOS's look: a local center stands in for
+    // the distributed one, so nothing is posted system-wide.
+    var dark = argValue("--system-style") == "Dark"
+    let center = NotificationCenter()
+    m.systemDark = dark
+    let watch = SystemLookWatch(center: center, read: { dark }) { m.systemDark = $0 }
+    out["system_label"] = ThemeChoice.system.label(systemDark: m.systemDark)
+    if let flip = argValue("--flip-to") {
+        dark = flip == "Dark"
+        center.post(name: SystemLookWatch.name, object: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        out["system_label_after"] = ThemeChoice.system.label(systemDark: m.systemDark)
+    }
+    _ = watch
     print(String(data: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), encoding: .utf8)!)
     exit(0)
 }
