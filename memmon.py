@@ -3511,12 +3511,11 @@ def reap_cli(argv: list, engine=None) -> int:
 
 USAGE_CACHE = os.path.join(STATE_DIR, "runner", "coord", "usage-cache.json")
 ADMISSION_LOG = os.path.join(STATE_DIR, "runner", "coord", "admission-log.jsonl")
-USAGE_SECTIONS = ("claude", "codex", "browser", "app", "service", "other")
-# History rows only know app_group()'s names. These are the honest calls;
-# any name not listed here is "other", never guessed.
-USAGE_APP_SECTION = {"Brave": "browser", "Docker": "service", "Docker VM": "service",
-                     "Slack": "app", "Cursor": "app", "VS Code": "app", "Spotify": "app",
-                     "Notion": "app", "Zoom": "app", "Obsidian": "app", "Figma": "app"}
+USAGE_SECTIONS = ("claude", "codex", "browser", "dev", "app", "service", "other")
+# Names in a history row's `apps` that are not apps: a VM is a service, the
+# window server is the system.
+USAGE_VM_NAMES = {"Docker VM", "colima", "lima", "qemu", "Virtualization"}
+USAGE_SYSTEM_NAMES = {"WindowServer", "kernel_task", "launchd"}
 _TS_RE = re.compile(r'"ts":\s*([0-9.]+)')
 
 
@@ -3541,12 +3540,28 @@ def _day_rows(path: str, start: float):
                 yield ts, row
 
 
+def usage_section(name: str) -> str:
+    """The section of one name in a history row's `apps`, decided by the
+    same bundle-id sets as the owner list (memmon_owners.category_of)."""
+    import memmon_common
+    import memmon_owners
+    if name in USAGE_VM_NAMES:
+        return "service"
+    if name in USAGE_SYSTEM_NAMES:
+        return "other"
+    bid = memmon_common.NAME_BUNDLE.get(name, "")
+    if bid in memmon_owners.GUI_VM_APPS:
+        return "service"
+    # Every other entry is an app: dev, browser or plain app, never "other".
+    return memmon_owners.category_of("app", "app:" + bid)
+
+
 def _row_sections(row: dict) -> dict | None:
     """One history row's memory by section. sessions and the Claude runtime
-    pool (overhead) are claude; app_group names go by USAGE_APP_SECTION;
-    worktree builds and unlisted names are other. Codex has no field in a
-    history row, so it is not recorded (null), not zero. Orphans are left
-    out: they are mostly the same processes as the worktree builds."""
+    pool (overhead) are claude; `apps` names go by usage_section(); worktree
+    builds are other. Codex has no field in a history row, so the caller
+    reports it as not recorded (null), never zero. Orphans are left out:
+    they are mostly the same processes as the worktree builds."""
     if not isinstance(row.get("sessions"), dict):
         return None                                  # a partial row
     out = dict.fromkeys(USAGE_SECTIONS, 0)
@@ -3554,7 +3569,7 @@ def _row_sections(row: dict) -> dict | None:
     out["claude"] += row.get("overhead") or 0
     for name, mem in (row.get("apps") or {}).items():
         if isinstance(mem, (int, float)):
-            out[USAGE_APP_SECTION.get(name, "other")] += mem
+            out[usage_section(name)] += mem
     out["other"] += sum(v for v in (row.get("worktrees") or {}).values()
                         if isinstance(v, (int, float)))
     return out
@@ -3582,7 +3597,8 @@ def usage(days: int = 7, now: float | None = None) -> dict:
     dates = [time.strftime("%Y-%m-%d", time.localtime(
         time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1) + i,
                      12, 0, 0, 0, 0, -1)))) for i in range(days)]
-    key = {"days": days, "dates": dates, "inputs": _usage_inputs()}
+    # v changes whenever the mapping does, so an old cache is never served.
+    key = {"v": 2, "days": days, "dates": dates, "inputs": _usage_inputs()}
     cached = _read_row(USAGE_CACHE)
     if cached and cached.get("key") == key:
         return cached["value"]

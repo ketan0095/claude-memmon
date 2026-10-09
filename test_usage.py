@@ -80,8 +80,27 @@ class UsageTests(unittest.TestCase):
         sec = memmon.usage(7, now=NOW)["series"][-1]["by_section"]
         # Row 2 has no sessions: its claude share is the runtime pool only.
         self.assertEqual(sec, {"claude": (GB + GB // 2 + GB // 2) // 2,
-                               "codex": None, "browser": 2 * GB, "app": GB,
-                               "service": 3 * GB, "other": 4 * GB + GB // 4 + GB // 4})
+                               "codex": None, "browser": 2 * GB, "dev": 0,
+                               "app": GB + GB // 4, "service": 3 * GB,
+                               "other": 4 * GB + GB // 4})
+
+    def test_app_names_follow_the_owner_list_categories(self):
+        cases = {"Google Chrome": "browser", "Chrome": "browser", "Safari": "browser",
+                 "Arc": "browser", "Brave": "browser", "Cursor": "dev", "VS Code": "dev",
+                 "Ghostty": "dev", "Xcode": "dev", "PyCharm": "dev", "Docker": "service",
+                 "OrbStack": "service", "Docker VM": "service", "colima": "service",
+                 "Slack": "app", "SomeNewApp": "app", "WindowServer": "other"}
+        for name, want in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(memmon.usage_section(name), want)
+
+    def test_name_table_covers_every_categorised_bundle(self):
+        # One table: every bundle id the owner list categorises has a name.
+        import memmon_common
+        import memmon_owners as mo
+        named = set(memmon_common.APP_NAMES)
+        for group in (mo.BROWSERS, mo.SHELL_HOSTS, mo.DEV_APPS, set(mo.GUI_VM_APPS)):
+            self.assertEqual(set(group) - named, set())
 
     def test_partial_rows_count_as_samples_only(self):
         self.write(memmon.HISTORY, [full_row(at(0)),

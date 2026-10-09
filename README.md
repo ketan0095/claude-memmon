@@ -886,10 +886,10 @@ size and mtime. Each day has its sample count, peak and average memory (the
 strict "used" figure where the sampler recorded it, else `top`'s), memory by
 section, gate warnings and stops, and runner holds. A day with no samples is
 empty, never interpolated. Sections come only from what a history row
-records: Claude sessions and Claude's runtime pool are `claude`; the apps
-history names go to `browser` (Brave), `service` (Docker, Docker VM) or `app`
-(Slack, Cursor, VS Code, Spotify, Notion, Zoom, Obsidian, Figma); worktree
-builds and any other name are `other`. Codex and policy cancels are not in
+records: Claude sessions and Claude's runtime pool are `claude`. Each app
+the row names goes to `browser`, `dev` (terminals and editors) or `service`
+(Docker Desktop, OrbStack, a VM) by the same rules as the owner list, and to
+`app` otherwise. Worktree builds and the window server are `other`. Codex and policy cancels are not in
 history, so they are `null` ("not recorded"), as are runner holds for days
 older than the admission log.
 
