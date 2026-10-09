@@ -3924,6 +3924,9 @@ def main() -> int:
         import memmon_route
         return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
                                 split=shell_commands)
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        import memmon_update
+        return memmon_update.cli(sys.argv[2:], STATE_DIR)
     if len(sys.argv) > 1 and sys.argv[1] == "explain":
         import memmon_explain
         return memmon_explain.cli(sys.argv[2:], lambda: owners_json(cpu_window=1.0),
