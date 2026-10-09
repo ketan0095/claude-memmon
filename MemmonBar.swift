@@ -5451,7 +5451,9 @@ struct ContentView: View {
     private func healthLine(_ s: OwnersSnap, cpuNow: Double?, cpuMissing: String, ncpu: Double) -> String {
         let sys = s.system
         let cpu: String = cpuNow.map { String(format: "CPU %.1f of %.0f cores busy", $0, ncpu) } ?? cpuMissing
-        return cpu + (sys.reason.map { " · memory reading failed: \($0)" } ?? "")
+        // When memmon's own read failed, the kernel's level is the only one left: say it.
+        let kernel: String = sys.pressureLevel == nil ? (sys.kernelLevel.map { " · macOS reports \($0) pressure" } ?? "") : ""
+        return cpu + kernel + (sys.reason.map { " · memory reading failed: \($0)" } ?? "")
     }
 
     private func gapNoticeRow(_ n: GapNotice) -> some View {

@@ -1711,7 +1711,7 @@ class UnknownPressureTests(StubCase):
                            level_reason="vm_stat failed", rates="unavailable")
         found = said_payload(p)
         self.assertIn("Under pressure, kernel critical", found)
-        self.assertTrue(any("kernel critical" in l and l.startswith("CPU") for l in found), found)
+        self.assertTrue(any("macOS reports critical pressure" in l and l.startswith("CPU") for l in found), found)
 
     def test_retry_copy_under_unknown_says_the_gate_lets_it_run(self):
         found = said("pressure-unknown.json")
