@@ -30,8 +30,8 @@ from a real machine.
 | **Command protection**: blocked commands waiting to retry, the policy, and recent events in plain words. | **Managed jobs** started with `memmon run`: running, and waiting with the reason. |
 | <img src="docs/screenshots/usage-memory-dark.png" width="300" alt="Last 7 days, memory"> | <img src="docs/screenshots/usage-protection-light.png" width="300" alt="Last 7 days, protection"> |
 | **Last 7 days**: daily peak and average memory. | The same card's **Protection** view: warnings and stops per day. |
-| <img src="docs/screenshots/explain-preview-dark.png" width="300" alt="Ask Claude preview"> | <img src="docs/screenshots/explain-reply-light.png" width="300" alt="Claude's suggestions"> |
-| **Ask Claude what to do** shows exactly what would be sent before anything is sent. | **The reply is shown as text.** memmon never acts on it. |
+| <img src="docs/screenshots/explain-busy-dark.png" width="300" alt="Asking Claude"> | <img src="docs/screenshots/explain-reply-light.png" width="300" alt="Claude's suggestions"> |
+| **Ask Claude what to do** asks once, on a click, with Cancel and a 60 s limit. | **The reply is shown as text.** memmon never acts on it. |
 | <img src="docs/screenshots/settings-panel-dark.png" width="300" alt="Settings panel"> | |
 | **Settings**: gate mode, pause, runner mode, auto-cancel, suggestions, notifications and theme. | |
 
@@ -195,8 +195,10 @@ busy for about 25 seconds per click.
 - **Notifications you can act on.** When a managed job needs you, clicking its
   notification opens the popover at that job's confirm.
 - **Ask Claude what to do.** On a click only, memmon sends Claude a short
-  summary with no paths, PIDs or tokens, and shows the reply as plain text. It
-  never acts on the reply. `memmon explain --preview` prints what would be sent.
+  summary with no paths, PIDs or tokens, and shows the reply as plain text.
+  Under pressure it suggests what to stop now; when memory is healthy it looks
+  for patterns in the last 7 days; with nothing to report it says so without
+  asking Claude at all. It never acts on the reply.
 - **Real app icons** in the owner list, and a light and a dark palette.
 
 ## Permissions and privacy
@@ -214,8 +216,8 @@ the notifications.
 **Everything is local.** memmon makes no network calls and sends no telemetry.
 The one exception is one you start: *Ask Claude what to do* (`memmon explain`)
 runs your own `claude` CLI, which sends Claude a fixed instruction and a
-summary capped at 1,500 characters. Nothing is sent until you click, and the preview shows the exact
-text first.
+short summary. Nothing is sent until you click, and `memmon explain --preview`
+prints the exact text in the terminal.
 
 **What it records**, all in `~/.claude/memmon/`: session names, worktree names,
 process names, per-app memory, and the first 200 characters of commands the gate
@@ -776,12 +778,22 @@ key.
 its own: only the menu bar's *Ask Claude what to do* button or the command
 starts it.
 
-- **Preview first.** In the menu bar, the button shows the exact text that would
-  be sent and its length, with *Send to Claude* and *Not now*.
-  `memmon explain --preview` prints the same text and sends nothing.
-- **What is sent.** A fixed instruction and a summary of the pressure reading
-  and the largest owners (names, kinds and sizes), capped at 1,500 characters.
-  Paths, PIDs, tokens, working directories, usernames and emails are removed.
+- **Three kinds of answer**, picked by memmon from the current state:
+  - *Free memory now*, under pressure: at most three owners to stop, ranked by
+    memory freed and safety, using what memmon knows (idle time, growth,
+    whether memmon can stop it).
+  - *Patterns this week*, when memory is healthy but the last 7 days show
+    something worth changing: high peaks, repeated gate warnings, duplicate
+    servers, or an owner that sits idle at 2 GB or more most days.
+  - *Nothing to do*, when none of that applies. memmon says so itself and
+    sends nothing.
+- **Only specific advice is kept.** A reply line that does not name one of the
+  owners in the summary is dropped, and at most three lines are shown.
+- **What is sent.** A fixed instruction and a summary of the pressure reading,
+  the owners (names, kinds, sizes, idle time) and, for patterns, the week's
+  daily peaks and gate counts. Paths, PIDs, tokens, working directories,
+  usernames and emails are removed. `memmon explain --preview` prints the exact
+  text and sends nothing.
 - **How it is sent.** memmon runs your `claude` CLI (`claude -p`, found on
   `PATH`, `~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin`) with every
   tool disabled, so Claude can only reply. The call is bounded to 60 seconds and
