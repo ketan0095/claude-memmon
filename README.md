@@ -167,7 +167,7 @@ busy for about 25 seconds per click.
 
 - **Sessions & apps.** Every process belongs to exactly one owner, grouped as
   Claude sessions, Codex, Managed jobs, Mac apps, Shared services and Background.
-  Sort by memory, CPU or growth. Expand a session to see its builds, tests and
+  Sort by memory or CPU. Expand a session to see its builds, tests and
   servers, each with its own Stop. On the command line, `memmon owners` shows the
   same list and `memmon act` performs the stop.
 - **Identity-checked stops.** A stop re-reads each process's PID and start time
@@ -326,8 +326,8 @@ From top to bottom:
 - **Under pressure.** Only at DANGER or CRITICAL; see below.
 - **Last 7 days.** Collapsed by default. Memory, Top consumers and Protection
   views.
-- **Sessions & apps.** One row per owner, grouped into sections. Sort by memory,
-  CPU or growth. A row shows its title, what it is doing, and where it runs
+- **Sessions & apps.** One row per owner, grouped into sections. Sort by memory
+  or CPU. A row shows its title, what it is doing, and where it runs
   (project · worktree · confidence). A value memmon could not measure shows `—`
   with the reason, and sorts last. Expand a session for its builds, tests and
   servers, each with its own Stop; the conversation is listed too and marked
@@ -372,9 +372,11 @@ process on the machine, instead of `top`'s ~0.6 s. A number memmon could not
 read is shown as `—` with the reason, never as 0.
 
 CPU needs two samples. The popover takes them a second apart; the sampler keeps
-a baseline so the next tick can measure against it. Growth per 10 minutes needs
-at least 5 samples over 10 minutes with no gap longer than 3 minutes, so a
-freshly started owner, or one seen across a sleep, says "not enough history".
+a baseline so the next tick can measure against it. Growth per 10 minutes is
+shown only where it is known: in an owner's detail and in the Under pressure
+list. It needs at least 5 samples over 10 minutes with no gap longer than 3
+minutes, so a freshly started owner, or one seen across a sleep, says "not
+enough history" there.
 
 ### Stopping something
 
