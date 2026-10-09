@@ -194,6 +194,34 @@ class SettingsTests(unittest.TestCase):
                                              "notifications": False,
                                              "pressure_suggestions": False})
 
+    def test_failed_write_leaves_config_byte_identical(self):
+        original = b'{"project_roots": ["~/code"],  "gate_mode": "block"}\n'
+        with open(self.config, "wb") as fh:
+            fh.write(original)
+        with mock.patch.object(os, "replace", side_effect=OSError(28, "No space left")):
+            rc, out = self.cli("set", "gate_mode", "warn")
+        self.assertEqual((rc, out["key"]), (2, "gate_mode"))
+        self.assertIn("could not write", out["error"])
+        with open(self.config, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertEqual([f for f in os.listdir(self.state.root) if f.endswith(".tmp")], [])
+
+    def test_runner_busy_exits_2_with_json(self):
+        import fcntl
+        import testkit
+        paths = memmon_runner.Paths(self.state.root)
+        paths.make()
+        fd = os.open(paths.ledger, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)                     # admission holds the ledger
+        clock = testkit.FakeTelemetryClock()               # its sleep moves time on
+        with mock.patch.object(memmon_runner.telemetry, "SYSTEM_CLOCK", clock):
+            for key, raw in (("runner_mode", "observe"), ("auto_cancel_interruptible", "true")):
+                with self.subTest(key=key):
+                    rc, out = self.cli("set", key, raw)
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(out, {"error": "runner busy, try again", "key": key})
+
     def test_unwritable_state_dir_exits_2_with_json(self):
         os.chmod(self.state.root, 0o500)
         self.addCleanup(os.chmod, self.state.root, 0o700)

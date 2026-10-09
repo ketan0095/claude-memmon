@@ -3868,6 +3868,7 @@ def settings_set(key: str, raw: str) -> dict:
 def settings_cli(argv: list) -> int:
     """memmon settings [--json] | memmon settings set KEY VALUE.
     Exit 0 with the settings JSON, or 2 with {"error", "key"}."""
+    import memmon_runner
     if argv[:1] == ["set"]:
         if len(argv) != 3:
             print(json.dumps({"error": "usage: memmon settings set KEY VALUE",
@@ -3885,6 +3886,10 @@ def settings_cli(argv: list) -> int:
         except OSError as exc:
             print(json.dumps({"error": f"could not write the setting: {exc}",
                               "key": argv[1]}))
+            return 2
+        except memmon_runner.LedgerTimeout:
+            # runner.json is written under ledger.lock, which admission holds.
+            print(json.dumps({"error": "runner busy, try again", "key": argv[1]}))
             return 2
         print(json.dumps(out))
         return 0

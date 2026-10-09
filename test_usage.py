@@ -220,6 +220,19 @@ class UsageTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(memmon.main(), 0)
 
+    def test_cache_from_an_older_version_is_never_served(self):
+        self.write(memmon.HISTORY, [full_row(at(0))])
+        fresh = memmon.usage(7, now=NOW)
+        with open(memmon.USAGE_CACHE) as fh:
+            cached = json.load(fh)
+        bogus = {**fresh, "series": [{"date": "bogus"}]}
+        for old in ({k: v for k, v in cached["key"].items() if k != "v"},
+                    {**cached["key"], "v": 1}):
+            with self.subTest(key=old.get("v")):
+                with open(memmon.USAGE_CACHE, "w") as fh:
+                    json.dump({"key": old, "value": bogus}, fh)
+                self.assertEqual(memmon.usage(7, now=NOW), fresh)
+
     def test_cache_is_keyed_by_the_inputs(self):
         self.write(memmon.HISTORY, [full_row(at(0))])
         first = memmon.usage(7, now=NOW)
