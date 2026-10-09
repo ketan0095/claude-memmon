@@ -168,6 +168,33 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(s[-1]["runner"], {"held": 0, "cancelled": None})
         self.assertIsNone(s[-3]["runner"]["held"])         # before the log's first row
 
+    def test_malformed_rows_are_skipped(self):
+        good = full_row(at(0))
+        with open(memmon.HISTORY, "w") as fh:
+            fh.write('{"ts": 1..2, "ram_used": 1}\n')
+            fh.write(json.dumps(full_row(at(0, 9), apps=["Brave"])) + "\n")
+            fh.write(json.dumps(full_row(at(0, 10), worktrees=["build:x"])) + "\n")
+            fh.write(json.dumps(full_row(at(0, 11), sessions=["x"])) + "\n")
+            fh.write(json.dumps({"ts": float("nan")}).replace("NaN", "1e400") + "\n")
+            fh.write("not json\n")
+            fh.write(json.dumps(good) + "\n")
+        self.write(memmon.GATE_LOG, [{"ts": at(0), "action": ["warn"]},
+                                     {"ts": at(0), "action": "warn"}])
+        self.write(memmon.ADMISSION_LOG, [{"ts": at(0), "decision": "hold", "run_id": ["a"]},
+                                          {"ts": at(0), "decision": "hold", "run_id": {"x": 1}},
+                                          {"ts": at(0), "decision": "hold", "run_id": "b"}])
+        day = memmon.usage(7, now=NOW)["series"][-1]
+        self.assertEqual(day["samples"], 1)
+        self.assertEqual(day["by_section"]["browser"], 2 * GB)
+        self.assertEqual(day["gate"], {"warned": 1, "stopped": 0})
+        self.assertEqual(day["runner"]["held"], 1)
+        import contextlib
+        import io
+        out = io.StringIO()
+        with mock.patch("sys.argv", ["memmon", "usage", "--json"]), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(memmon.main(), 0)
+
     def test_cache_is_keyed_by_the_inputs(self):
         self.write(memmon.HISTORY, [full_row(at(0))])
         first = memmon.usage(7, now=NOW)

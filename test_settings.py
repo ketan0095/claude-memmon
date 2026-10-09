@@ -32,6 +32,10 @@ class SettingsTests(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop("MEMMON_GATE", None)
         self.config = os.path.join(self.state.root, "config.json")
+        self.claude_settings = os.path.join(self.state.root, "claude-settings.json")
+        q = mock.patch.object(memmon, "CLAUDE_SETTINGS", self.claude_settings)
+        q.start()
+        self.addCleanup(q.stop)
 
     def cli(self, *argv):
         out = io.StringIO()
@@ -117,6 +121,87 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((rc, out["gate_mode"]["source"]), (0, "env"))
         self.assertEqual(out["warning"], memmon.ENV_WARNING)
 
+    def gate_row(self, **row):
+        with open(memmon.GATE_LOG, "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "action": "allow", **row}) + "\n")
+
+    def test_hook_env_seen_only_in_the_gate_log(self):
+        # MEMMON_GATE is in Claude's hook environment, not this process's.
+        self.cli("set", "gate_mode", "block")
+        self.gate_row(mode="warn", mode_source="env")
+        out = self.cli("--json")[1]
+        self.assertEqual(out["gate_mode"]["value"], "warn")
+        self.assertEqual(out["gate_mode"]["source"], "env")
+        self.assertEqual(out["warning"], memmon.ENV_WARNING)
+
+    def test_hook_env_from_claude_settings_is_read_only(self):
+        with open(self.claude_settings, "w") as fh:
+            json.dump({"env": {"MEMMON_GATE": "off"}, "hooks": {}}, fh)
+        before = os.stat(self.claude_settings).st_mtime_ns
+        out = self.cli("--json")[1]
+        self.assertEqual((out["gate_mode"]["value"], out["gate_mode"]["source"]), ("off", "env"))
+        self.assertEqual(out["warning"], memmon.ENV_WARNING)
+        self.cli("set", "gate_mode", "warn")
+        self.assertEqual(os.stat(self.claude_settings).st_mtime_ns, before)
+
+    def test_no_override_anywhere(self):
+        self.cli("set", "gate_mode", "warn")
+        # A gate row from before the change (config-sourced) is just stale.
+        self.gate_row(mode="block-critical", mode_source="default")
+        out = self.cli("--json")[1]
+        self.assertEqual((out["gate_mode"]["value"], out["gate_mode"]["source"]),
+                         ("warn", "config"))
+        self.assertNotIn("warning", out)
+        self.gate_row(mode="warn", mode_source="config")
+        self.assertNotIn("warning", self.cli("--json")[1])
+
+    def test_legacy_gate_row_without_source(self):
+        # Before rows recorded their source: a mode that no config explains.
+        self.gate_row(mode="off")
+        out = self.cli("--json")[1]
+        self.assertEqual((out["gate_mode"]["value"], out["gate_mode"]["source"]), ("off", "env"))
+        self.cli("set", "gate_mode", "warn")
+        self.assertEqual(self.cli("--json")[1]["gate_mode"]["source"], "config")
+
+    def test_concurrent_sets_keep_every_key(self):
+        import threading
+        real = json.load
+
+        def slow(fh, *a, **kw):
+            value = real(fh, *a, **kw)
+            time.sleep(0.05)                      # widen the read-modify-write
+            return value
+        with open(self.config, "w") as fh:
+            json.dump({"project_roots": []}, fh)
+        errors = []
+
+        def run(key, raw):
+            try:
+                memmon.settings_set(key, raw)
+            except Exception as exc:              # pragma: no cover
+                errors.append(exc)
+        with mock.patch.object(json, "load", slow):
+            threads = [threading.Thread(target=run, args=kv) for kv in
+                       (("gate_mode", "warn"), ("notifications", "false"),
+                        ("pressure_suggestions", "false"))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(errors, [])
+        with open(self.config) as fh:
+            self.assertEqual(json.load(fh), {"project_roots": [], "gate_mode": "warn",
+                                             "notifications": False,
+                                             "pressure_suggestions": False})
+
+    def test_unwritable_state_dir_exits_2_with_json(self):
+        os.chmod(self.state.root, 0o500)
+        self.addCleanup(os.chmod, self.state.root, 0o700)
+        rc, out = self.cli("set", "gate_mode", "warn")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out["key"], "gate_mode")
+        self.assertIn("could not write", out["error"])
+
     def test_paused_until(self):
         until = time.time() + 3600
         with open(memmon.PAUSE, "w") as fh:
@@ -154,6 +239,10 @@ class GateHonoursConfigTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("MEMMON_GATE", None)
+        q = mock.patch.object(memmon, "CLAUDE_SETTINGS",
+                              os.path.join(self.state.root, "claude-settings.json"))
+        q.start()
+        self.addCleanup(q.stop)
         crit = {"level": "CRITICAL", "color": "red", "score": 9, "reasons": ["paging"],
                 "rates": "ok", "level_reason": None, "headroom_min": None}
         for name, value in (("read_vm", lambda *a, **k: {}),
@@ -183,6 +272,16 @@ class GateHonoursConfigTests(unittest.TestCase):
         memmon.settings_set("gate_mode", "off")
         os.environ["MEMMON_GATE"] = "block-critical"
         self.assertEqual(self.gate()[0], 2)
+
+    def test_gate_logs_where_its_mode_came_from(self):
+        memmon.settings_set("gate_mode", "warn")
+        self.gate()
+        os.environ["MEMMON_GATE"] = "block"
+        self.gate()
+        with open(memmon.GATE_LOG) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual([(r["mode"], r["mode_source"]) for r in rows],
+                         [("warn", "config"), ("block", "env")])
 
     def test_light_command_never_reads_the_mode(self):
         with mock.patch.object(memmon, "gate_mode",

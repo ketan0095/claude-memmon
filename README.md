@@ -853,7 +853,12 @@ DANGER), `warn` (never blocks), `off`. Set the mode with
 `memmon settings set gate_mode warn` (or the menu bar's Settings): it lives in
 `~/.claude/memmon/config.json` and takes effect on the next heavy command in
 every session, running or not. `MEMMON_GATE` in the hook's environment still
-overrides it, and `memmon settings --json` says so with a warning. **Do not
+overrides it. That environment is Claude Code's, not your terminal's or the
+menu bar's, so `memmon settings` finds an override in two places: the `env`
+block of `~/.claude/settings.json` (read, never written), and the mode the gate
+last logged, which records where it came from. When either shows one,
+`settings --json` reports `source: "env"` with the gate's actual mode and a
+warning, and the menu bar locks the control. **Do not
 rely on either as a kill switch**: the mode is read inside Python, after a
 heavy command has already started it. To switch the gate off, use
 `memmon --off`.
@@ -911,10 +916,14 @@ memmon settings set notifications false        # memmon's macOS notifications
 A set prints the settings after the change and exits 0. An unknown key or a
 bad value exits 2 with `{"error": …, "key": …}` and changes nothing. Writes go
 through a temp file and keep every other key in `config.json` (the runner's two
-settings live in `runner/coord/runner.json`). `gate_mode` reports where its
-value came from: `env` when `MEMMON_GATE` is set in the hook's environment
-(which then wins), `config`, or `default`. Pausing stays `memmon --off
-[DURATION]` and `memmon --on`.
+settings live in `runner/coord/runner.json`); concurrent sets are serialised
+by `runner/coord/config.lock`, and a write that fails exits 2 the same way.
+`gate_mode` reports where its value came from: `env` when `MEMMON_GATE` is set
+in the hook's environment (seen through `settings.json` or the gate's last
+logged row, and then it wins), `config`, or `default`. When the hook's
+environment changes, the report catches up at the gate's next heavy command.
+Pausing
+stays `memmon --off [DURATION]` and `memmon --on`.
 
 ## Configuration
 

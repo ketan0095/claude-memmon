@@ -2972,7 +2972,7 @@ def gate() -> int:
         if tool != "Bash" or not classification["matched"]:
             return 0
         # Heavy path only: the policy (env, then config.json, then default).
-        mode = gate_mode()[0]
+        mode, mode_source = gate_mode()
         if mode == "off":
             return 0
 
@@ -2996,7 +2996,7 @@ def gate() -> int:
             with open(path, "a") as fh:
                 fh.write(json.dumps({
                     "ts": event_ts, "cmd": cmd, "cmd_display": display_command(cmd),
-                    "mode": mode,
+                    "mode": mode, "mode_source": mode_source,
                     "level": pres.get("level"), "action": action,
                     "session": sid, "session_name": lookup_session_name(sid),
                     "cwd": payload.get("cwd", ""),
@@ -3529,6 +3529,8 @@ USAGE_SECTIONS = ("claude", "codex", "browser", "dev", "app", "service", "other"
 # window server is the system.
 USAGE_VM_NAMES = {"Docker VM", "colima", "lima", "qemu", "Virtualization"}
 USAGE_SYSTEM_NAMES = {"WindowServer", "kernel_task", "launchd"}
+# What a malformed history, gate or admission row can raise; it is skipped.
+BAD_ROW = (TypeError, ValueError, AttributeError, OverflowError, OSError)
 _TS_RE = re.compile(r'"ts":\s*([0-9.]+)')
 
 
@@ -3541,10 +3543,10 @@ def _day_rows(path: str, start: float):
         return
     with fh:
         for line in fh:
-            m = _TS_RE.search(line, 0, 40)
-            if m and float(m.group(1)) < start:
-                continue
             try:
+                m = _TS_RE.search(line, 0, 40)
+                if m and float(m.group(1)) < start:
+                    continue
                 row = json.loads(line)
             except ValueError:
                 continue
@@ -3575,12 +3577,14 @@ def _row_sections(row: dict) -> dict | None:
     builds are other. Codex has no field in a history row, so the caller
     reports it as not recorded (null), never zero. Orphans are left out:
     they are mostly the same processes as the worktree builds."""
-    if not isinstance(row.get("sessions"), dict):
+    if "sessions" not in row:
         return None                                  # a partial row
+    if not isinstance(row["sessions"], dict):
+        raise TypeError("sessions is not an object")
     out = dict.fromkeys(USAGE_SECTIONS, 0)
     out["claude"] = sum(v for v in row["sessions"].values() if isinstance(v, (int, float)))
     out["claude"] += row.get("overhead") or 0
-    for name, mem in (row.get("apps") or {}).items():
+    for name, mem in (row.get("apps") or {}).items():          # a list raises
         if isinstance(mem, (int, float)):
             out[usage_section(name)] += mem
     out["other"] += sum(v for v in (row.get("worktrees") or {}).values()
@@ -3623,7 +3627,12 @@ def usage(days: int = 7, now: float | None = None) -> dict:
                "held": set()} for d in dates}
     first = last = None
     for ts, row in _day_rows(HISTORY, start_day):
-        a = acc.get(day_of(ts))
+        # A malformed row is skipped whole, before anything of it is counted.
+        try:
+            a = acc.get(day_of(ts))
+            sec = _row_sections(row)
+        except BAD_ROW:
+            continue
         if a is None:
             continue
         first = ts if first is None else min(first, ts)
@@ -3636,13 +3645,15 @@ def usage(days: int = 7, now: float | None = None) -> dict:
             a["mem_n"] += 1
             a["mem_sum"] += mem
             a["mem_peak"] = mem if a["mem_peak"] is None else max(a["mem_peak"], mem)
-        sec = _row_sections(row)
         if sec is not None:
             a["sec_n"] += 1
             for k, v in sec.items():
                 a["sec"][k] += v
     for ts, row in _day_rows(GATE_LOG, start_day):
-        a = acc.get(day_of(ts))
+        try:
+            a = acc.get(day_of(ts))
+        except BAD_ROW:
+            continue
         if a is not None and row.get("action") == "warn":
             a["warned"] += 1
         elif a is not None and row.get("action") == "block":
@@ -3651,10 +3662,16 @@ def usage(days: int = 7, now: float | None = None) -> dict:
     # day before its first row is not recorded. Policy cancels are not logged.
     log_first = None
     for ts, row in _day_rows(ADMISSION_LOG, start_day):
+        try:
+            a = acc.get(day_of(ts))
+            run = row.get("run_id")
+            if a is not None and row.get("decision") == "hold" and run:
+                if not isinstance(run, str):
+                    raise TypeError("run_id is not a string")
+                a["held"].add(run)
+        except BAD_ROW:
+            continue
         log_first = ts if log_first is None else min(log_first, ts)
-        a = acc.get(day_of(ts))
-        if a is not None and row.get("decision") == "hold" and row.get("run_id"):
-            a["held"].add(row["run_id"])
     log_from = day_of(log_first) if log_first is not None else None
     series = []
     for d in dates:
@@ -3711,8 +3728,64 @@ def _runner_settings() -> dict:
     return memmon_runner.get_settings(STATE_DIR)
 
 
-def settings_payload() -> dict:
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+
+
+def _hook_env_gate() -> str | None:
+    """MEMMON_GATE from Claude Code's settings.json env block: the hook's
+    environment, which a terminal or MemmonBar does not share. Read only."""
+    try:
+        with open(CLAUDE_SETTINGS) as fh:
+            env = (json.load(fh) or {}).get("env") or {}
+        value = env.get("MEMMON_GATE")
+        return value if isinstance(value, str) else None
+    except Exception:
+        return None
+
+
+def _last_gate_row() -> dict | None:
+    """The newest gate.jsonl row that records its mode."""
+    try:
+        with open(GATE_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 16384))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("mode"):
+            return row
+    return None
+
+
+def effective_gate_mode() -> tuple:
+    """The gate mode as the hook sees it. This process's own environment is
+    not the hook's, so settings also reads the hook env from settings.json and
+    the mode the gate last recorded: a gate row whose mode came from its
+    environment means MEMMON_GATE is set there. A row from before the gate
+    recorded its source counts only when no config value explains it."""
     mode, source = gate_mode()
+    if source == "env":
+        return mode, source
+    hook = _hook_env_gate()
+    if hook is not None:
+        return hook, "env"
+    row = _last_gate_row()
+    if row is not None:
+        recorded = row.get("mode_source")
+        if recorded == "env":
+            return row["mode"], "env"
+        if recorded is None and source == "default" and row["mode"] != mode:
+            return row["mode"], "env"
+    return mode, source
+
+
+def settings_payload() -> dict:
+    mode, source = effective_gate_mode()
     paused = pause_until()
     out = {"schema_version": 1,
            "gate_mode": {"value": mode, "source": source, "choices": list(GATE_MODES)},
@@ -3731,19 +3804,28 @@ def _update_config(key: str, value) -> None:
     """Change one key of config.json atomically and keep every other key.
     Raises ValueError for a config.json that does not parse: rewriting it
     would discard what the user wrote."""
+    import fcntl
     import memmon_owners
     path = os.path.join(STATE_DIR, "config.json")
+    lock = os.path.join(STATE_DIR, "runner", "coord", "config.lock")
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        with open(path) as fh:
-            cfg = json.load(fh)
-    except FileNotFoundError:
-        cfg = {}
-    except ValueError:
-        raise ValueError("config.json is not valid JSON; fix or remove it first")
-    if not isinstance(cfg, dict):
-        raise ValueError("config.json is not a JSON object; fix or remove it first")
-    cfg[key] = value
-    memmon_owners.write_json_atomic(path, cfg)
+        # Two sets of different keys must not lose one another's change.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            with open(path) as fh:
+                cfg = json.load(fh)
+        except FileNotFoundError:
+            cfg = {}
+        except ValueError:
+            raise ValueError("config.json is not valid JSON; fix or remove it first")
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json is not a JSON object; fix or remove it first")
+        cfg[key] = value
+        memmon_owners.write_json_atomic(path, cfg)
+    finally:
+        os.close(fd)
     CONFIG[key] = value
 
 
@@ -3788,6 +3870,10 @@ def settings_cli(argv: list) -> int:
             return 2
         except (ValueError, TypeError) as exc:      # the runner's own refusals too
             print(json.dumps({"error": str(exc), "key": argv[1]}))
+            return 2
+        except OSError as exc:
+            print(json.dumps({"error": f"could not write the setting: {exc}",
+                              "key": argv[1]}))
             return 2
         print(json.dumps(out))
         return 0
