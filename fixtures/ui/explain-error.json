@@ -1,0 +1,11 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "explain": {
+   "exit": 2,
+   "stdout": {
+    "error": "claude did not answer within 60 s"
+   }
+  }
+ }
+}

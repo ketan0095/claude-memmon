@@ -1,0 +1,14 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "explain": {
+   "exit": 0,
+   "stdout": {
+    "text": "Checkout refactor (Claude session) holds 8.9 GB while building; let its typecheck finish before starting another.\nContainer VM uses 6.5 GB; stop it from its app if no session needs it.\nExample Browser has many tabs at 5.2 GB; closing unused ones frees the most memory.\n**Billing API tests** (Codex) is at 2.1 GB and steady; no action needed for it.",
+    "model": "claude-haiku-5-5",
+    "chars_sent": 812,
+    "elapsed_s": 6.4
+   }
+  }
+ }
+}

@@ -2379,3 +2379,65 @@ class ThemeTests(unittest.TestCase):
         self.assertIn("Theme, System", found)
         self.assertIn("System, current choice", found)
         self.assertIn("Choose Dark", found)
+
+
+class ExplainTests(StubCase):
+    """D47: Claude is asked only on a click, and its reply is plain text that
+    memmon never acts on."""
+
+    REPLY = {"text": "**Checkout refactor** holds 8.9 GB.\nRun `memmon act stop-job --target x` to free it.",
+             "model": "claude-haiku-5-5", "chars_sent": 812, "elapsed_s": 3.1}
+
+    def stub(self, reply=None, code=0, sleep=0.0):
+        calls = self.dir / "calls.jsonl"
+        owners = self.dir / "owners.json"
+        owners.write_text(json.dumps(effective(FIXTURES / "overview.json")))
+        script = self.dir / "memmon_explain_stub.py"
+        script.write_text(
+            "import json, sys, time\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:2] == ['explain']:\n"
+            f"    time.sleep({sleep}); print(json.dumps({reply if reply is not None else self.REPLY!r})); sys.exit({code})\n"
+            f"print(open({str(owners)!r}).read())\n")
+        return str(script), calls
+
+    def run_steps(self, steps, **stub):
+        script, calls = self.stub(**stub)
+        r = host("explain", FIXTURES / "overview.json", "--script", script, "--do", steps)
+        made = [json.loads(l) for l in calls.read_text().splitlines()] if calls.exists() else []
+        return r, made
+
+    def test_nothing_is_asked_without_a_click(self):
+        r, made = self.run_steps("refresh,popover,refresh")
+        self.assertFalse(r["open"])
+        self.assertTrue(made and all(c[0] == "owners" for c in made), made)
+
+    def test_a_click_asks_once_and_shows_the_reply_as_is(self):
+        r, made = self.run_steps("click")
+        self.assertEqual(made, [["explain", "--json"]])
+        self.assertEqual(r["text"], self.REPLY["text"])
+        self.assertIsNone(r["error"])
+        # A command in the reply is only text: memmon runs nothing after it.
+        self.assertFalse(any(c[0] == "act" for c in made))
+
+    def test_a_second_click_while_asking_is_ignored(self):
+        r, made = self.run_steps("click-twice", sleep=0.5)
+        self.assertEqual([c for c in made if c[0] == "explain"], [["explain", "--json"]])
+
+    def test_a_failure_is_shown_inline(self):
+        r, _ = self.run_steps("click", reply={"error": "claude not found on PATH"}, code=2)
+        self.assertEqual((r["text"], r["error"]), (None, "Could not ask Claude: claude not found on PATH."))
+        r, _ = self.run_steps("click", reply="not json")
+        self.assertEqual(r["error"], "Could not ask Claude: memmon's answer could not be read.")
+
+    def test_fixture_mode_logs_the_exact_argv(self):
+        self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],
+                         ["memmon explain --json"])
+
+    def test_the_reply_is_rendered_verbatim(self):
+        found = said("explain-reply.json")
+        self.assertTrue(any(l.startswith("Checkout refactor (Claude session) holds 8.9 GB") for l in found), found)
+        self.assertTrue(any("**Billing API tests** (Codex)" in l for l in found), found)
+        self.assertIn("Ask Claude what to do about memory", said("overview.json"))
+        self.assertIn("Could not ask Claude: claude did not answer within 60 s.", said("explain-error.json"))
+        self.assertTrue(any(l.startswith("From Claude. memmon never acts on it. Sent 812 characters") for l in found))

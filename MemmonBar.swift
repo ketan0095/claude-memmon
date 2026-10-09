@@ -1553,6 +1553,25 @@ struct SettingsInfo {
     }
 }
 
+/// `memmon explain --json` (D47): exit 0 with {text, chars_sent, model}, or
+/// exit 2 with {error}. The reply is only ever shown as plain text.
+enum ExplainOutcome {
+    case reply(text: String, chars: Int?, model: String?)
+    case failed(String)
+
+    static func of(_ r: CLIResult) -> ExplainOutcome {
+        if r.timedOut { return .failed("Claude did not answer in time.") }
+        if let e = r.launchError { return .failed("Could not ask Claude: \(e).") }
+        let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
+        if r.exit == 0, let j, let t = j["text"] as? String {
+            return .reply(text: t.trimmingCharacters(in: .whitespacesAndNewlines),
+                          chars: int(j["chars_sent"]), model: str(j["model"]))
+        }
+        if let e = j.flatMap({ str($0["error"]) }) { return .failed("Could not ask Claude: \(e).") }
+        return .failed("Could not ask Claude: memmon's answer could not be read.")
+    }
+}
+
 enum SettingsOutcome {
     case ok(SettingsInfo)
     case failed(String)
@@ -2651,6 +2670,42 @@ final class Model: ObservableObject {
             DispatchQueue.main.async { self.refresh() }
         }
     }
+
+    /// Explain (D47): asked only by a click, never on refresh or open.
+    @Published var explainOpen = false
+    @Published var explainBusy = false
+    @Published var explainText: String?
+    @Published var explainError: String?
+    var explainChars: Int?
+    /// Claude has up to 60 s; memmon needs a moment more to start it.
+    static let explainTimeout = 75.0
+
+    func explain() {
+        guard !explainBusy else { return }
+        explainOpen = true
+        explainError = nil
+        let args = ["explain", "--json"]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        explainBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = ExplainOutcome.of(CLI.run(args, timeout: Model.explainTimeout))
+            DispatchQueue.main.async { self.applyExplain(outcome) }
+        }
+    }
+
+    func applyExplain(_ o: ExplainOutcome) {
+        explainBusy = false
+        switch o {
+        case .reply(let text, let chars, _):
+            explainText = text
+            explainChars = chars
+            explainError = nil
+        case .failed(let e):
+            explainError = e
+        }
+    }
+
+    func dismissExplain() { explainOpen = false }
 
     /// The stored theme; an unknown or missing value is System.
     var theme: ThemeChoice { ThemeChoice(rawValue: prefs.string(PrefKey.theme) ?? "") ?? .system }
@@ -4523,6 +4578,24 @@ struct SuggestionRow: View {
     }
 }
 
+/// A small rotating ring drawn in SwiftUI, which renders offscreen (an
+/// AppKit ProgressView does not); still under Reduce Motion.
+struct Spinner: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var spin = false
+    var body: some View {
+        Circle().trim(from: 0, to: 0.72)
+            .stroke(P.accent, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+            .frame(width: 11, height: 11)
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+            }
+            .accessibilityLabel("Working")
+    }
+}
+
 /// A switch drawn in SwiftUI: the native one is an AppKit control that the
 /// offscreen renderer leaves blank.
 struct SwitchToggle: View {
@@ -5308,6 +5381,52 @@ struct ContentView: View {
         .background(LinearGradient(colors: [P.headerTop, P.headerBottom], startPoint: .top, endPoint: .bottom))
     }
 
+    // MARK: explain (D47)
+
+    /// Claude's reply, shown as plain text (Text(verbatim:)): nothing in it
+    /// is formatted, linked or run.
+    private var explainCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).foregroundColor(P.accent)
+                    .accessibilityHidden(true)
+                Text("Claude’s suggestions").font(ft(13, .medium)).accessibilityAddTraits(.isHeader)
+                if model.explainBusy { Spinner() }
+                Spacer()
+                ActionButton(title: "Close", icon: "xmark", variant: .icon) {
+                    withAnimation(motion(0.12)) { model.dismissExplain() }
+                }
+                .accessibilityLabel("Close Claude’s suggestions")
+            }
+            if model.explainBusy && model.explainText == nil {
+                Text("Asking Claude… this can take up to a minute.").font(ft(12)).foregroundColor(P.muted)
+            }
+            if let e = model.explainError {
+                Text(verbatim: e).font(ft(12)).foregroundColor(P.red).fixedSize(horizontal: false, vertical: true)
+            }
+            if let t = model.explainText {
+                Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            HStack(alignment: .top, spacing: 8) {
+                Text("From Claude. memmon never acts on it."
+                     + (model.explainChars.map { " Sent \($0) characters, with no paths, PIDs or tokens." } ?? ""))
+                    .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                if !model.explainBusy {
+                    ActionButton(title: model.explainText == nil && model.explainError == nil ? "Ask" : "Ask again",
+                                 variant: .link) { model.explain() }
+                }
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Claude’s suggestions")
+    }
+
     // MARK: settings (D43)
 
     private func settingsCard<C: View>(_ title: String, _ icon: String, @ViewBuilder _ body: () -> C) -> some View {
@@ -5470,6 +5589,9 @@ struct ContentView: View {
                     .padding(.horizontal, 12).padding(.bottom, 10)
                     .transition(.opacity)
             }
+            if model.explainOpen {
+                explainCard.padding(.horizontal, 12).padding(.bottom, 12)
+            }
             if !s.shownSuggestions.isEmpty {
                 underPressure(s).padding(.horizontal, 12).padding(.bottom, 12)
             }
@@ -5610,6 +5732,15 @@ struct ContentView: View {
                       + " · macOS memory pressure \(sys.kernel ?? "unavailable")")
             if let notice = gapNotice(s, dismissed: model.dismissedGap, now: nowTs()) {
                 gapNoticeRow(notice)
+            }
+            if !model.explainOpen {
+                HStack {
+                    Spacer()
+                    ActionButton(title: "Ask Claude what to do", icon: "sparkles", variant: .link) { model.explain() }
+                        .help("Sends a short summary, with no paths, PIDs or tokens, to Claude. Nothing is done with the answer.")
+                        .accessibilityLabel("Ask Claude what to do about memory")
+                }
+                .padding(.top, -4).padding(.bottom, -6)
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
@@ -6452,6 +6583,19 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
         m.showAll.insert(sec)
     }
     if let d = o.dismissedGap { m.prefs.set(d, PrefKey.dismissedGap) }
+    if let e = fixtureView["explain"] as? [String: Any] {
+        // An Explain card: busy, or the outcome of one `memmon explain --json`.
+        m.explainOpen = true
+        if e["busy"] as? Bool == true {
+            m.explainBusy = true
+        } else {
+            var r = CLIResult(exit: int(e["exit"]).map { Int32($0) }, stdout: Data())
+            if let obj = e["stdout"], JSONSerialization.isValidJSONObject(obj) {
+                r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+            }
+            m.applyExplain(ExplainOutcome.of(r))
+        }
+    }
     if let v = o.usage {
         m.usage = (json["_usage"] as? [String: Any]).flatMap(UsageData.decode)
         m.usageFetchedAt = m.clock()
@@ -6944,6 +7088,26 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     report["next"] = gapNotice(n, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
                 }
                 report["stored"] = model.dismissedGap ?? NSNull()
+            case "explain":
+                // Steps against a stub memmon: refresh, popover, click.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    switch step {
+                    case "refresh": model.refresh()
+                    case "popover":
+                        let w = PressureWatch(); popoverOpened(model, w); popoverHidden(model, w)
+                    case "click": model.explain()
+                    case "click-twice": model.explain(); model.explain()
+                    default: fail("unknown explain step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && (model.explainBusy || model.refreshing) { spin(0.05) }
+                }
+                report["open"] = model.explainOpen
+                report["text"] = model.explainText ?? NSNull()
+                report["error"] = model.explainError ?? NSNull()
+                report["actions"] = model.actionLog
             case "usage":
                 // `--do` steps against a stub memmon (`--script`): refresh,
                 // expand, collapse, age:<s> (moves the cache clock), view:<v>.
