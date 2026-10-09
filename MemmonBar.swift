@@ -290,6 +290,8 @@ struct ManagedJob: Identifiable {
 
 struct SystemInfo {
     var ramBytes: Double?, usedBytes: Double?
+    /// What "free" holds: pages nothing uses now, and file cache macOS reclaims.
+    var idleBytes: Double? = nil, cacheBytes: Double? = nil
     var pressureLevel: String?, scoreLevel: String?
     var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
     /// Why nothing was measured; set only when cpu_coverage is null.
@@ -521,6 +523,7 @@ struct OwnersSnap {
                                   ncpu: num(y["ncpu"]), cpuCores: num(y["cpu_cores"]),
                                   cpuCoverage: num(y["cpu_coverage"]), cpuReason: str(y["cpu_reason"]),
                                   reason: str(y["reason"]))
+            s.system.idleBytes = num(y["idle_bytes"]); s.system.cacheBytes = num(y["cache_bytes"])
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -1441,6 +1444,8 @@ final class Model: ObservableObject {
     @Published var showAll: Set<OwnerSection> = []
     /// A section the ring's legend asked to bring into view.
     @Published var scrollTarget: OwnerSection?
+    /// The ring legend's Free row is expanded into its parts.
+    @Published var freeOpen = false
     @Published var techOpen: Set<String> = []
     @Published var confirm: ConfirmRequest?
     @Published var banner: Banner?
@@ -1993,6 +1998,25 @@ struct ActionButton: View {
     }
 }
 
+/// The installed app's own icon, looked up locally by bundle id. Only the
+/// running app enables it; renders and tests keep the glyphs, so their
+/// pictures do not depend on what this Mac has installed.
+enum AppIcons {
+    static var enabled = false
+    private static var cache: [String: NSImage?] = [:]
+
+    static func icon(for owner: Owner) -> NSImage? {
+        guard enabled, owner.id.hasPrefix("app:") || owner.kind == "service" else { return nil }
+        let bundle = owner.id.hasPrefix("app:") ? String(owner.id.dropFirst(4)) : nil
+        guard let bundle, !bundle.isEmpty else { return nil }
+        if let hit = cache[bundle] { return hit }
+        let image = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle)
+            .map { NSWorkspace.shared.icon(forFile: $0.path) }
+        cache[bundle] = image
+        return image
+    }
+}
+
 struct OwnerIcon: View {
     var owner: Owner
     var selected: Bool
@@ -2015,13 +2039,20 @@ struct OwnerIcon: View {
         }
     }
     var body: some View {
-        Image(systemName: symbol)
-            .font(.system(size: size * 0.41, weight: .medium))
-            .foregroundColor(selected ? P.accent : P.muted)
-            .frame(width: size, height: size)
-            .background(RoundedRectangle(cornerRadius: size * 0.28).fill(P.panel))
-            .overlay(RoundedRectangle(cornerRadius: size * 0.28).stroke(P.border, lineWidth: 1))
-            .accessibilityHidden(true)
+        if let icon = AppIcons.icon(for: owner) {
+            Image(nsImage: icon)
+                .resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.41, weight: .medium))
+                .foregroundColor(selected ? P.accent : P.muted)
+                .frame(width: size, height: size)
+                .background(RoundedRectangle(cornerRadius: size * 0.28).fill(P.panel))
+                .overlay(RoundedRectangle(cornerRadius: size * 0.28).stroke(P.border, lineWidth: 1))
+                .accessibilityHidden(true)
+        }
     }
 }
 
@@ -2819,72 +2850,110 @@ struct PolicyStrip: View {
     }
 }
 
+/// What a gate rule means in everyday words, and why it counts as heavy.
+func gateKind(_ c: GateClassification?) -> (what: String, why: String) {
+    guard let c else { return ("a memory-heavy command", "It matched memmon's list of memory-heavy commands.") }
+    if c.source == "learned" {
+        let seen = c.observedPeak.map { " (about \(gb($0)) last time)" } ?? ""
+        return ("a command this Mac has seen use a lot of memory",
+                "memmon learned it is heavy from earlier runs on this Mac\(seen); learned rules only ever warn.")
+    }
+    let r = (c.rule + " " + c.shape).lowercased()
+    func has(_ words: String...) -> Bool { words.contains { r.contains($0) } }
+    if has("tsc", "typecheck", "type-check") { return ("a type check", "Type checkers like tsc load the whole project into memory.") }
+    if has("vitest", "jest", "pytest", "playwright", "mocha", " test") {
+        return ("a test run", "Test runners start many workers at once, and each takes memory.")
+    }
+    if has("install", "pnpm i", "npm i", "yarn") && !has("build") {
+        return ("a package install", "Installs unpack and link many packages at once.")
+    }
+    if has("docker", "colima", "compose") { return ("a container start", "Containers reserve memory for their virtual machine.") }
+    if has("dev", "serve", "start") { return ("a dev server", "Dev servers keep a bundler and a watcher in memory.") }
+    if has("lint", "eslint", "biome") { return ("a lint run", "Linters parse every file of the project.") }
+    if has("build", "webpack", "vite", "next", "cargo", "gradle", "bazel", "xcodebuild", "make", "swift") {
+        return ("a build", "Builds compile many files in parallel.")
+    }
+    return ("a memory-heavy command", "It matched memmon's list of memory-heavy commands.")
+}
+
+/// Pressure levels as people say them.
+func levelPhrase(_ level: String) -> String {
+    switch level.uppercased() {
+    case "HEALTHY": return "normal"
+    case "WATCH": return "getting tight"
+    case "DANGER": return "high"
+    case "CRITICAL": return "critical"
+    default: return "unknown"
+    }
+}
+
 struct GateEventCard: View {
     var event: GateEvent
     var animation: Animation?
     @State private var expanded = false
+    @State private var fullCommand = false
 
     private var stopped: Bool { event.action == "block" }
     private var tint: Color { stopped ? P.red : P.amber }
     private var sessionLabel: String {
-        event.sessionName ?? (event.sessionID.isEmpty ? "Unknown session" : event.sessionID)
+        event.sessionName ?? (event.sessionID.isEmpty ? "an unknown session" : event.sessionID)
     }
-    private var matchLabel: String {
-        guard let c = event.classification else { return "Rule match not recorded" }
-        if c.source == "learned" {
-            let observed = c.samples.map { " · \($0) observations" } ?? ""
-            return "Learned rule: \(c.rule)\(observed) · warning only"
-        }
-        return "Built-in rule: \(c.rule)"
+    private var kind: (what: String, why: String) { gateKind(event.classification) }
+    private var memory: String { levelPhrase(event.level) }
+
+    /// The one-line summary under the session name.
+    private var summary: String {
+        (stopped ? "Held back \(kind.what)" : "Ran \(kind.what)") + " while memory was \(memory)"
     }
-    private var fullMatchLabel: String {
-        guard event.classification != nil else {
-            return "Not recorded — this event predates rule tracking"
-        }
-        return matchLabel
+    /// The whole story in one sentence.
+    private var story: String {
+        stopped
+            ? "memmon stopped \(kind.what) in \(sessionLabel) before it started, because memory was \(memory)."
+            : "memmon warned \(sessionLabel) that \(kind.what) was starting while memory was \(memory). The command still ran."
     }
-    private var outcome: String {
+    private var nextStep: String {
         if stopped {
-            return "Stopped before running · "
-                + (event.retryStatus == "waiting" ? "waiting to retry" : "not waiting to retry")
+            return event.retryStatus == "waiting"
+                ? "It is waiting in the blocked list above. Retry it once memory is back to normal."
+                : "Nothing is waiting: it was retried, dismissed or expired."
         }
-        return "Warning added to the session’s context; command ran"
+        return "Nothing to do. If memory keeps climbing, stop an idle session to make room."
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: expanded ? 8 : 2) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Circle().fill(tint).frame(width: 6, height: 6).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
-                Text(event.commandShort ?? event.commandDisplay)
-                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
-                    .lineLimit(1).truncationMode(.middle)
+                (Text(stopped ? "Stopped" : "Warned").foregroundColor(tint).fontWeight(.semibold)
+                    + Text(" · " + sessionLabel).foregroundColor(P.text))
+                    .font(ft(12)).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 4)
                 Text(relative(event.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
             if expanded {
-                eventDetail(stopped ? "Stopped · command did not run" : "Warned · command ran",
-                            "\(eventTime(event.ts))")
-                VStack(alignment: .leading, spacing: 2) {
+                Text(story).font(ft(12)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                eventDetail("Why it counts as heavy", kind.why)
+                eventDetail("Memory at \(eventClock(event.ts))",
+                            "\(memory.prefix(1).uppercased() + memory.dropFirst())"
+                            + (event.reasons.isEmpty ? "" : ": " + event.reasons.joined(separator: ", ")))
+                eventDetail("What to do", nextStep)
+                VStack(alignment: .leading, spacing: 3) {
                     Text("Command").font(ft(10, .medium)).foregroundColor(P.muted)
-                    Text(event.commandDisplay)
+                    Text(fullCommand ? event.commandDisplay : (event.commandShort ?? event.commandDisplay))
                         .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(fullCommand ? nil : 1).truncationMode(.middle)
+                        .fixedSize(horizontal: false, vertical: fullCommand)
                         .textSelection(.enabled)
-                }
-                eventDetail("Session", sessionLabel)
-                eventDetail("Command match", fullMatchLabel)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Memory at \(eventClock(event.ts))")
-                        .font(ft(10, .medium)).foregroundColor(P.muted)
-                    Text(event.level).font(ft(11, .semibold)).foregroundColor(P.tint(event.level))
-                    ForEach(Array(event.reasons.enumerated()), id: \.offset) { _, reason in
-                        Text(reason).font(ft(11)).foregroundColor(P.muted)
+                    if event.commandShort != nil && event.commandShort != event.commandDisplay {
+                        Button(fullCommand ? "Show less" : "Show full command") { fullCommand.toggle() }
+                            .buttonStyle(.plain).font(ft(10, .medium)).foregroundColor(P.accent)
                     }
                 }
-                eventDetail("Outcome", outcome)
+                Text(eventTime(event.ts)).font(ft(10)).foregroundColor(P.muted)
             } else {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text("\(sessionLabel) · \(event.level)")
+                    Text(summary)
                         .font(ft(11)).foregroundColor(P.muted).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 2)
                     Chevron(open: false)
@@ -2899,9 +2968,8 @@ struct GateEventCard: View {
         .help(event.commandDisplay)
         .onTapGesture { withAnimation(animation) { expanded.toggle() } }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(stopped ? "Stopped, command did not run" : "Warned, command ran"): "
-            + "\(event.commandDisplay) · Session \(sessionLabel) · \(relative(event.ts)) · "
-            + "\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
+        .accessibilityLabel("\(stopped ? "Stopped" : "Warned"), \(sessionLabel), \(relative(event.ts)): \(story) "
+            + "Command: \(event.commandDisplay).")
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isButton)
     }
@@ -3396,7 +3464,7 @@ struct ContentView: View {
         // total only when every process was measured (coverage exactly 1).
         let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
         let cpuMissing = s.degraded ? "CPU not measured"
-            : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU partly measured"
+            : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU still measuring some processes"
         let ncpu = sys.ncpu ?? Double(ProcessInfo.processInfo.activeProcessorCount)
         let over = (used ?? 0) > (ram ?? .infinity)
         let free = used.flatMap { u in ram.map { max($0 - u, 0) } }
@@ -3417,13 +3485,20 @@ struct ContentView: View {
                 ZStack {
                     MemoryRing(segments: segments, used: used, ram: ram, animate: !flattened)
                         .help("Memory in use. Each section adds up its processes' footprints, compressed pages included; every process counts once, under its owner.")
-                    VStack(spacing: 0) {
-                        Text(used.map { String(format: "%.1f", $0 / GB) } ?? "—")
-                            .font(.system(size: 22, weight: .semibold)).foregroundColor(P.text)
-                        Text(used == nil ? "not available" : ram.map { String(format: "/ %.0f GB", $0 / GB) } ?? "GB in use")
-                            .font(ft(11)).foregroundColor(P.muted)
-                        Text(pressureWord(level)).font(ft(11, .semibold)).foregroundColor(tint)
-                            .padding(.top, 1)
+                    VStack(spacing: 1) {
+                        HStack(alignment: .firstTextBaseline, spacing: 2) {
+                            Text(used.map { String(format: "%.1f", $0 / GB) } ?? "—")
+                                .font(.system(size: 22, weight: .semibold)).foregroundColor(P.text)
+                            if used != nil {
+                                Text("GB").font(ft(10, .semibold)).foregroundColor(P.muted)
+                            }
+                        }
+                        Text(used == nil ? "not available" : ram.map { String(format: "in use of %.0f", $0 / GB) } ?? "in use")
+                            .font(ft(10)).foregroundColor(P.muted)
+                        Text(pressureWord(level)).font(ft(10, .semibold)).foregroundColor(tint)
+                            .padding(.horizontal, 7).padding(.vertical, 1)
+                            .background(Capsule().fill(tint.opacity(0.14)))
+                            .padding(.top, 2)
                     }
                     .monospacedDigit()
                 }
@@ -3437,23 +3512,54 @@ struct ContentView: View {
                     }
                     ForEach(legend) { seg in legendRow(seg, s) }
                     if let free {
-                        LegendRow(color: P.track, outlined: true, name: "Free", value: gb(free))
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel("Free \(gb(free))")
+                        let split = freeSplit(sys, free: free)
+                        Button { withAnimation(motion(0.16)) { model.freeOpen.toggle() } } label: {
+                            LegendRow(color: P.track, outlined: true, name: "Free", value: gb(free))
+                        }
+                        .buttonStyle(.plain)
+                        .help(split.sentence)
+                        .accessibilityLabel("Free \(gb(free)). " + split.sentence)
+                        .accessibilityValue(model.freeOpen ? "expanded" : "collapsed")
+                        if model.freeOpen {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(split.rows, id: \.0) { name, value in
+                                    HStack {
+                                        Text(name).font(ft(11)).foregroundColor(P.muted)
+                                        Spacer(minLength: 4)
+                                        Text(value).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                                    }
+                                }
+                                Text("macOS hands cache back the moment an app needs it.")
+                                    .font(ft(10)).foregroundColor(P.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.leading, 16)
+                            .accessibilityElement(children: .combine)
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text("\(cpuNow.map { String(format: "CPU %.1f / %.0f cores", $0, ncpu) } ?? cpuMissing)"
-                 + " · Score \(level ?? "unavailable") · kernel \(sys.pressureLevel ?? "unavailable")"
-                 + (sys.reason.map { " · \($0)" } ?? ""))
+            // Plain words on the card; the raw score and kernel level are for hover.
+            Text("\(cpuNow.map { String(format: "CPU %.1f of %.0f cores busy", $0, ncpu) } ?? cpuMissing)"
+                 + (sys.reason.map { " · memory reading failed: \($0)" } ?? ""))
                 .font(ft(11)).foregroundColor(P.muted).monospacedDigit()
                 .fixedSize(horizontal: false, vertical: true)
+                .help("Pressure score \(level ?? "unavailable") · macOS memory pressure \(sys.pressureLevel ?? "unavailable")")
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
         .panel(13)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("System memory")
+    }
+
+    /// Free memory, split when the reader knows how much is truly empty.
+    private func freeSplit(_ sys: SystemInfo, free: Double) -> (rows: [(String, String)], sentence: String) {
+        guard let idle = sys.idleBytes, let cache = sys.cacheBytes else {
+            return ([], "Memory no app is using right now.")
+        }
+        return ([("Empty now", gb(idle)), ("Cache macOS can reclaim", gb(cache))],
+                "\(gb(idle)) empty right now and \(gb(cache)) of file cache macOS reclaims when an app needs it.")
     }
 
     @ViewBuilder private func legendRow(_ seg: RingSegment, _ s: OwnersSnap) -> some View {
@@ -4813,7 +4919,16 @@ if ARGS.contains("--palette-probe") {
     for s in OwnerSection.allCases { tokens["section." + s.rawValue] = P.section(s) }
     var out: [String: [String: String]] = [:]
     for (k, c) in tokens { out[k] = ["light": hex(c, .aqua), "dark": hex(c, .darkAqua)] }
+    // App icons: off by default (renders), found locally when the app enables them.
+    let finder = Owner.decode(["owner_id": "app:com.apple.finder", "kind": "app", "title": "Finder"])!
+    let iconOff = AppIcons.icon(for: finder) != nil
+    AppIcons.enabled = true
+    let iconOn = AppIcons.icon(for: finder) != nil
+    let missing = Owner.decode(["owner_id": "app:com.example.not-installed", "kind": "app", "title": "X"])!
+    let iconMissing = AppIcons.icon(for: missing) != nil
+    AppIcons.enabled = false
     let data = try! JSONSerialization.data(withJSONObject: [
+        "icons": ["off": iconOff, "on": iconOn, "missing": iconMissing],
         "tokens": out, "mood_animates": moodAnimates(reduceMotion: false),
         "mood_animates_reduced": moodAnimates(reduceMotion: true)], options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
@@ -4911,6 +5026,7 @@ if ARGS.contains("--a11y-dump") {
 }
 
 let app = NSApplication.shared
+AppIcons.enabled = true
 let controller = Controller()
 app.delegate = controller
 app.run()

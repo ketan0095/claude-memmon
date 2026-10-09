@@ -210,6 +210,15 @@ class StrictReaderTests(unittest.TestCase):
         self.assertEqual(r["pressure_level"], "warning")
         self.assertEqual(r["ram_bytes"], 1 << 34)
 
+    def test_free_splits_into_idle_and_reclaimable_cache(self):
+        r = mp.read_system_strict(run=self.run_ok(), sysctl=self.sysctl)
+        free = r["ram_bytes"] - r["used_bytes"]
+        self.assertEqual(r["idle_bytes"], 100 * 16384)
+        self.assertEqual(r["idle_bytes"] + r["cache_bytes"], free)
+        bare = mp.read_system_strict(run=self.run_ok(VMSTAT.replace("Pages free", "Pages gone")),
+                                     sysctl=self.sysctl)
+        self.assertNotIn("idle_bytes", bare)
+
     def test_raises_rather_than_defaulting(self):
         with self.assertRaises(KeyError):
             mp.read_system_strict(run=self.run_ok(VMSTAT.replace("Anonymous", "Anon")),

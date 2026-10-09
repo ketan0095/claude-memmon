@@ -586,5 +586,12 @@ def read_system_strict(run=subprocess.run, sysctl=sysctl_u64,
         raise KeyError(f"vm_stat missing {', '.join(missing)}")
     pages = (counts["Anonymous pages"] - counts["Pages purgeable"]
              + counts["Pages wired down"] + counts["Pages occupied by compressor"])
-    return {"ram_bytes": ram, "used_bytes": pages * page,
-            "pressure_level": PRESSURE_LEVELS[level]}
+    out = {"ram_bytes": ram, "used_bytes": pages * page,
+           "pressure_level": PRESSURE_LEVELS[level]}
+    # What "free" (RAM minus used) is made of: pages nothing holds right now,
+    # and the rest, file cache that macOS hands back the moment an app asks.
+    if "Pages free" in counts:
+        idle = min(counts["Pages free"] * page, max(ram - pages * page, 0))
+        out["idle_bytes"] = idle
+        out["cache_bytes"] = max(ram - pages * page - idle, 0)
+    return out

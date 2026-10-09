@@ -676,9 +676,11 @@ class AccessibilityTests(unittest.TestCase):
                       found)
 
     def test_cpu_total_only_with_full_coverage(self):
-        self.assertIn("CPU partly measured", self.spoken("small.json"))
-        self.assertIn("CPU partly measured", self.spoken("overview.json"))
-        self.assertIn("CPU 3.1 / 18 cores", self.spoken("helpers-only.json"))
+        self.assertIn("CPU still measuring some processes", self.spoken("small.json"))
+        self.assertIn("CPU still measuring some processes", self.spoken("overview.json"))
+        self.assertIn("CPU 3.1 of 18 cores busy", self.spoken("helpers-only.json"))
+        for jargon in ("Score HEALTHY", "kernel normal"):
+            self.assertNotIn(jargon, self.spoken("overview.json"))
         # Nothing measured: coverage is null and memmon says why.
         self.assertIn("CPU warming up", self.spoken("warming-up.json"))
         self.assertIn("CPU not measured", self.spoken("degraded.json"))
@@ -1084,9 +1086,15 @@ class HeaderAndRingTests(unittest.TestCase):
         for gone in ("Stopped before running", "Warned — command ran",
                      "Matched command + memory then → result"):
             self.assertNotIn(gone, spoken)
-        events = [l for l in labels(rows) if l.startswith(("Stopped, command", "Warned, command"))]
+        events = [l for l in labels(rows) if l.startswith(("Stopped, ", "Warned, "))]
         self.assertEqual(len(events), 2)
-        self.assertTrue(events[0].startswith("Stopped, command did not run: pnpm typecheck"))
+        self.assertTrue(events[0].startswith("Stopped, Checkout refactor"))
+        # Plain words: who, what kind of command, how memory was, what happened.
+        self.assertIn("memmon stopped a type check in Checkout refactor before it started, "
+                      "because memory was critical.", events[0])
+        self.assertIn("memmon warned Billing API tests that a test run was starting while memory "
+                      "was getting tight. The command still ran.", events[1])
+        self.assertIn("Command: pnpm typecheck", events[0])
         self.assertTrue(any(s.startswith("Retained activity since") for s in spoken))
 
     def test_header_face_follows_pressure_and_staleness(self):
@@ -1119,9 +1127,25 @@ class HeaderAndRingTests(unittest.TestCase):
             # Background, System & other and the free track must not blend.
             self.assertGreater(min(b - a for a, b in zip(levels, levels[1:])), 0.08, theme)
 
+    def test_app_icons_are_local_and_only_in_the_live_app(self):
+        icons = run_json("--palette-probe")["icons"]
+        # Renders keep glyphs; the app finds an installed app's icon; a missing
+        # bundle falls back to the glyph.
+        self.assertEqual(icons, {"off": False, "on": True, "missing": False})
+
     def test_mood_face_is_still_under_reduce_motion(self):
         t = run_json("--palette-probe")
         self.assertEqual((t["mood_animates"], t["mood_animates_reduced"]), (True, False))
+
+    def test_free_explains_what_it_holds(self):
+        payload = effective(FIXTURES / "overview.json")
+        payload["system"]["idle_bytes"], payload["system"]["cache_bytes"] = 3 * 2**30, 5.8 * 2**30
+        path = Path(self.tmp.name) / "free.json"
+        path.write_text(json.dumps(payload))
+        free = next(l for l in labels(a11y_path(path)) if l.startswith("Free "))
+        self.assertIn("3.0 GB empty right now and 5.8 GB of file cache macOS reclaims", free)
+        plain = next(l for l in labels(a11y("overview.json")) if l.startswith("Free "))
+        self.assertIn("Memory no app is using right now.", plain)
 
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
@@ -1420,7 +1444,7 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertIsNone(payload["system"]["cpu_cores"])
         self.assertEqual(payload["runner_jobs"], [self.LEASE])
         spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
-        self.assertIn("CPU partly measured", spoken)
+        self.assertIn("CPU still measuring some processes", spoken)
         self.assertIn("Managed job acme-api tests · waiting · 12s, heavy, memory pressure: WATCH",
                       [r["label"] or r["value"] for r in rows])
 
