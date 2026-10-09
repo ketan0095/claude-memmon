@@ -2454,6 +2454,29 @@ class ExplainTests(StubCase):
             self.assertTrue(r["error"].startswith(says), (reply, r["error"]))
             self.assertIsNone(r["text"])
 
+    def test_the_title_comes_from_the_mode(self):
+        for fixture, heading in [("explain-now.json", "Free memory now"),
+                                 ("explain-patterns.json", "Patterns this week"),
+                                 ("explain-quiet.json", "Nothing to do"),
+                                 ("explain-reply.json", "Claude’s suggestions")]:     # no mode or title
+            self.assertIn(heading, said(fixture), fixture)
+        reply = dict(self.REPLY, mode="patterns", title="Patterns this week")
+        r, _ = self.run_steps("click", reply=reply)
+        self.assertEqual((r["heading"], r["quiet"]), ("Patterns this week", False))
+        r, _ = self.run_steps("click")
+        self.assertEqual((r["heading"], r["quiet"]), ("Claude’s suggestions", False))
+
+    def test_quiet_has_no_from_claude_footer(self):
+        quiet = said("explain-quiet.json")
+        self.assertIn("Memory pressure is normal and nothing stands out this week.", quiet)
+        self.assertNotIn("From Claude. memmon never acts on it.", quiet)
+        self.assertIn("Ask again", quiet)
+        self.assertIn("Close Ask Claude", quiet)
+        for f in ("explain-now.json", "explain-patterns.json"):
+            self.assertIn("From Claude. memmon never acts on it.", said(f), f)
+        r, _ = self.run_steps("click", reply={"text": "All clear.", "mode": "quiet", "title": "Nothing to do"})
+        self.assertEqual((r["heading"], r["quiet"]), ("Nothing to do", True))
+
     def test_fixture_mode_logs_the_exact_argv(self):
         self.assertEqual(host("explain", FIXTURES / "overview.json", "--do", "click")["actions"],
                          ["memmon explain --json"])

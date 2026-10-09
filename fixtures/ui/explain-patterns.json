@@ -1,0 +1,15 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "explain": {
+   "exit": 0,
+   "stdout": {
+    "mode": "patterns",
+    "title": "Patterns this week",
+    "model": "claude-haiku-5-5",
+    "chars_sent": 910,
+    "text": "Memory peaks above 40 GB on days with two or more Claude sessions building at once; stagger typechecks.\nContainer VM stays near 7 GB all week even when idle; consider stopping it overnight."
+   }
+  }
+ }
+}

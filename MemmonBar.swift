@@ -1556,7 +1556,9 @@ struct SettingsInfo {
 /// `memmon explain --json` (D47): exit 0 with {text, chars_sent, model}, or
 /// exit 2 with {error}. The reply is only ever shown as plain text.
 enum ExplainOutcome {
-    case reply(text: String, chars: Int?, model: String?)
+    /// `mode` is "now", "patterns" or "quiet"; quiet means memmon answered
+    /// itself and Claude was not asked. Both are absent from older memmon.
+    case reply(text: String, chars: Int?, model: String?, mode: String? = nil, title: String? = nil)
     case failed(String)
 
     static func of(_ r: CLIResult) -> ExplainOutcome {
@@ -1565,7 +1567,8 @@ enum ExplainOutcome {
         let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
         if r.exit == 0, let j, let t = j["text"] as? String {
             return .reply(text: t.trimmingCharacters(in: .whitespacesAndNewlines),
-                          chars: int(j["chars_sent"]), model: str(j["model"]))
+                          chars: int(j["chars_sent"]), model: str(j["model"]),
+                          mode: str(j["mode"]), title: str(j["title"]))
         }
         if let e = j.flatMap({ str($0["error"]) }) { return .failed(readable(e)) }
         return .failed("Could not ask Claude: memmon's answer could not be read.")
@@ -2698,6 +2701,12 @@ final class Model: ObservableObject {
     @Published var explainBusy = false
     @Published var explainText: String?
     @Published var explainError: String?
+    /// The answer's mode and title from memmon; nil from an older memmon.
+    @Published var explainMode: String?
+    @Published var explainTitle: String?
+    var explainQuiet: Bool { explainMode == "quiet" }
+    /// The card's title once there is an answer.
+    var explainHeading: String { explainTitle ?? "Claude’s suggestions" }
     /// Each ask is numbered; Cancel moves past it, so a late answer is dropped.
     var explainSeq = 0
     /// How long the card waits for Claude.
@@ -2709,6 +2718,8 @@ final class Model: ObservableObject {
         explainOpen = true
         explainError = nil
         explainText = nil
+        explainMode = nil
+        explainTitle = nil
         let args = ["explain", "--json"]
         guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
         explainSeq += 1
@@ -2735,8 +2746,10 @@ final class Model: ObservableObject {
     func applyExplain(_ o: ExplainOutcome) {
         explainBusy = false
         switch o {
-        case .reply(let text, _, _):
+        case .reply(let text, _, _, let mode, let title):
             explainText = text
+            explainMode = mode
+            explainTitle = title
             explainError = nil
         case .failed(let e):
             explainError = e
@@ -5412,7 +5425,7 @@ struct ContentView: View {
             HStack(spacing: 7) {
                 Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).foregroundColor(P.accent)
                     .accessibilityHidden(true)
-                Text(model.explainText == nil ? "Ask Claude what to do" : "Claude’s suggestions")
+                Text(model.explainText == nil ? "Ask Claude what to do" : model.explainHeading)
                     .font(ft(13, .medium)).accessibilityAddTraits(.isHeader)
                 if model.explainBusy { Spinner() }
                 Spacer()
@@ -5434,12 +5447,21 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let t = model.explainText {
-                Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
+                HStack(alignment: .top, spacing: 7) {
+                    if model.explainQuiet {
+                        // memmon's own all-clear: Claude was not asked.
+                        Image(systemName: "checkmark.circle").font(.system(size: 13, weight: .medium))
+                            .foregroundColor(P.green).padding(.top, 1).accessibilityHidden(true)
+                    }
+                    Text(verbatim: t).font(ft(12)).foregroundColor(P.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
                 HStack(alignment: .top, spacing: 8) {
-                    Text("From Claude. memmon never acts on it.")
-                        .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                    if !model.explainQuiet {
+                        Text("From Claude. memmon never acts on it.")
+                            .font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+                    }
                     Spacer(minLength: 4)
                     ActionButton(title: "Ask again", variant: .link) { model.explain() }
                 }
@@ -7136,6 +7158,8 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 }
                 report["open"] = model.explainOpen
                 report["text"] = model.explainText ?? NSNull()
+                report["heading"] = model.explainText == nil ? NSNull() : model.explainHeading
+                report["quiet"] = model.explainQuiet
                 report["error"] = model.explainError ?? NSNull()
                 report["actions"] = model.actionLog
             case "usage":
