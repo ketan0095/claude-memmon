@@ -2,11 +2,7 @@
  "_base": "overview.json",
  "_view": {
   "explain": {
-   "busy": true,
-   "preview": {
-    "preview": "You are helping someone on a Mac that runs several AI coding agents and dev tools. Below is memmon's snapshot of memory use. Give at most 4 short, concrete recommendations...\n\npressure HEALTHY; used 39.2 of 48.0 GB; swap 2.0 GB\nClaude session \"Checkout refactor\" 8.9 GB, building typecheck\nservice \"Container VM\" 6.5 GB\napp \"Example Browser\" 5.2 GB\nCodex \"Billing API tests\" 2.1 GB\nunattributed 1.8 GB (6 processes)",
-    "chars": 415
-   }
+   "busy": true
   }
  }
 }
