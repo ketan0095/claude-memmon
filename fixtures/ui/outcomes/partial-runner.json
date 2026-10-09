@@ -1,0 +1,40 @@
+{
+ "exit": 3,
+ "stdout": {
+  "reason": "survivors",
+  "exited": 3,
+  "remaining": [
+   {
+    "pid": 48311,
+    "start": [
+     1791449101,
+     5
+    ],
+    "forceable": true,
+    "role": "survivor",
+    "signalled": true,
+    "argv0": "node"
+   },
+   {
+    "pid": 48500,
+    "start": [
+     1791449958,
+     1
+    ],
+    "forceable": false,
+    "role": "runner",
+    "signalled": false,
+    "argv0": "python3"
+   }
+  ],
+  "kept": [],
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 40802189312,
+  "measured_at": 1791450000.0,
+  "result": "partial",
+  "captured": 5,
+  "forceable": 1,
+  "observed": 0,
+  "force_token": "eyJ2IjoxLCJhY3Rpb24iOiJmb3JjZSIsInN1cnZpdm9ycyI6WzQ4MzExXX0="
+ }
+}

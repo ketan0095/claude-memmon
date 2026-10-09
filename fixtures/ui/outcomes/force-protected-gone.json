@@ -1,0 +1,20 @@
+{
+ "exit": 0,
+ "after_force": true,
+ "stdout": {
+  "reason": null,
+  "exited": 3,
+  "remaining": [],
+  "kept": [],
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 40802189312,
+  "measured_at": 1791450000.0,
+  "result": "force_stopped",
+  "killed": 1,
+  "exited_unsignalled": 1,
+  "named": 3,
+  "forceable": 0,
+  "observed": 0,
+  "observed_unlisted": 0
+ }
+}

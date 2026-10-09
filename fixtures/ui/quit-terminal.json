@@ -1,0 +1,193 @@
+{
+ "_base": "overview.json",
+ "owners": [
+  {
+   "owner_id": "claude:fixture-a",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout refactor",
+   "project": "acme-web",
+   "worktree": "checkout",
+   "activity": "Building · typecheck",
+   "confidence": "exact",
+   "footprint_bytes": 9556302233,
+   "cpu_cores": 3.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
+   "member_count": 9,
+   "root": {
+    "pid": 48211,
+    "start": [
+     1791449000,
+     318442
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [
+    {
+     "job_id": "48211.1791449000.318442",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 1288490188,
+     "member_count": 3,
+     "token": null
+    },
+    {
+     "job_id": "48302.1791449100.120044",
+     "kind": "build",
+     "label": "typecheck",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 7301444403,
+     "member_count": 5,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODMwMiwic3RhcnQiOlsxNzkxNDQ5MTAwLDEyMDA0NF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    },
+    {
+     "job_id": "48260.1791449050.500100",
+     "kind": "server",
+     "label": "dev server · port 3000",
+     "action": "stop-server",
+     "managed": false,
+     "footprint_bytes": 966367641,
+     "member_count": 1,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLXNlcnZlciIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODI2MCwic3RhcnQiOlsxNzkxNDQ5MDUwLDUwMDEwMF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "instances": null,
+   "shared_with": null,
+   "category": "claude"
+  },
+  {
+   "owner_id": "app:com.example.shellterm",
+   "kind": "app",
+   "agent": "app",
+   "title": "Example Shell Terminal",
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 429496729,
+   "cpu_cores": 0.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 1048576,
+   "member_count": 3,
+   "root": {
+    "pid": 8100,
+    "start": [
+     1791420000,
+     0
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJxdWl0LWFwcCIsIm93bmVyX2lkIjoiYXBwOmNvbS5leGFtcGxlLnNoZWxsdGVybSIsImJ1bmRsZV9pZCI6ImNvbS5leGFtcGxlLnNoZWxsdGVybSIsImluc3RhbmNlcyI6W3sicGlkIjo4MTAwLCJzdGFydCI6WzE3OTE0MjAwMDAsMF0sImxhdW5jaF9kYXRlIjoxNzkxNDIwMDAwLjB9XSwic25hcHNob3RfdHMiOjE3OTE0NDk5OTguMH0=",
+   "jobs": [],
+   "actions": [
+    "quit-app"
+   ],
+   "instances": [
+    {
+     "pid": 8100,
+     "launch_date": 1791420000.0
+    }
+   ],
+   "hosts": [],
+   "hosts_shells": true,
+   "category": "app"
+  },
+  {
+   "owner_id": "codex:fixture-b",
+   "kind": "codex",
+   "agent": "codex",
+   "title": "Billing API tests",
+   "project": "acme-api",
+   "worktree": "main",
+   "activity": "Testing · vitest run",
+   "confidence": "inferred",
+   "footprint_bytes": 2254857830,
+   "cpu_cores": null,
+   "cpu_coverage": null,
+   "cpu_reason": "warming up",
+   "growth_bytes_per_10min": null,
+   "growth_reason": "not enough history",
+   "member_count": 5,
+   "root": {
+    "pid": 7310,
+    "start": [
+     1791449800,
+     1200
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY29kZXg6Zml4dHVyZS1iIiwib3duZXJfcm9vdCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInRhcmdldCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [
+    {
+     "job_id": "7310.1791449800.1200",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 536870912,
+     "member_count": 2,
+     "token": null
+    },
+    {
+     "job_id": "7333.1791449820.4000",
+     "kind": "test",
+     "label": "vitest run",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 1717986918,
+     "member_count": 3,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY29kZXg6Zml4dHVyZS1iIiwib3duZXJfcm9vdCI6eyJwaWQiOjczMTAsInN0YXJ0IjpbMTc5MTQ0OTgwMCwxMjAwXX0sInRhcmdldCI6eyJwaWQiOjczMzMsInN0YXJ0IjpbMTc5MTQ0OTgyMCw0MDAwXX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9"
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "category": "codex"
+  },
+  {
+   "owner_id": "claude:fixture-c",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout copy fixes",
+   "project": "acme-web",
+   "worktree": "copy",
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 644245094,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 2097152,
+   "member_count": 2,
+   "root": {
+    "pid": 51002,
+    "start": [
+     1791447000,
+     9
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYyIsIm93bmVyX3Jvb3QiOnsicGlkIjo1MTAwMiwic3RhcnQiOlsxNzkxNDQ3MDAwLDldfSwidGFyZ2V0Ijp7InBpZCI6NTEwMDIsInN0YXJ0IjpbMTc5MTQ0NzAwMCw5XX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "end-session"
+   ],
+   "category": "claude"
+  }
+ ],
+ "_view": {
+  "select": "app:com.example.shellterm",
+  "confirm": "quit-app"
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.737
+ }
+}

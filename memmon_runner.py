@@ -154,7 +154,7 @@ def run(command, state_dir, pressure_reader, resource="heavy", timeout=600,
             print(f"memmon: could not start command: {exc}", file=sys.stderr)
             return 126
         row.update(state="running", reason="command running", child_pid=child.pid,
-                   started_at=time.time())
+                   child_start=_start_of(child.pid), started_at=time.time())
         _write(record, row)
         while child.poll() is None:
             if cancelled[0]:
@@ -177,6 +177,18 @@ def run(command, state_dir, pressure_reader, resource="heavy", timeout=600,
         lease.close()
         for signum, previous in handlers.items():
             signal.signal(signum, previous)
+
+
+def _start_of(pid):
+    """The child's (sec, usec) start, so a stop request can prove it names this
+    child and not a later process that reused the PID. The child is ours and
+    unreaped, so the PID cannot be reused while this reads it."""
+    try:
+        import memmon_procs
+        proc = memmon_procs.default_source().read(pid)
+        return list(proc.start) if proc is not None and proc.start else None
+    except Exception:
+        return None
 
 
 def _stop(child, signum):

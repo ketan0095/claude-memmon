@@ -1,0 +1,10 @@
+{
+ "exit": 4,
+ "stdout": {
+  "result": "refused",
+  "reason": "target_changed",
+  "exited": 0,
+  "remaining": [],
+  "kept": []
+ }
+}

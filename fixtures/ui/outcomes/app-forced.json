@@ -1,0 +1,15 @@
+{
+ "app": {
+  "forced": true,
+  "results": [
+   {
+    "pid": 5101,
+    "state": "exited"
+   },
+   {
+    "pid": 5188,
+    "state": "force_stopped"
+   }
+  ]
+ }
+}

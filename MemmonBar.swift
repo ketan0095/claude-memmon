@@ -1,8 +1,15 @@
 // MemmonBar — menu-bar front end for memmon.
 //
-// Deliberately does no background work. `memmon --json` (which spawns `top`,
-// ~1.4s) runs ONLY when the popover opens. The title is refreshed from the tiny
+// Deliberately does no background work. `memmon owners --json` runs ONLY when
+// the popover opens or Sync is pressed. The title is refreshed from the tiny
 // cached sample the launchd sampler already writes — a file read, never a spawn.
+//
+// memmon.py is the only component that signals processes: every stop goes
+// through `memmon act`, which re-checks identity before each signal. This file
+// never calls kill(), not even on its own memmon children: a call that times
+// out is abandoned and reaped in the background. The one thing done here is
+// quitting a GUI app, through NSRunningApplication, between two
+// `memmon act verify-app` checks made under actions.lock.
 //
 // Build:  swiftc -O -o MemmonBar MemmonBar.swift -framework Cocoa
 
@@ -14,30 +21,30 @@ import SwiftUI
 let GB = 1024.0 * 1024.0 * 1024.0
 let MB = 1024.0 * 1024.0
 
-func human(_ b: Double) -> String {
-    if b >= GB { return String(format: "%.1fG", b / GB) }
-    if b >= MB { return String(format: "%.0fM", b / MB) }
-    return String(format: "%.0fB", b)
+/// Render and test modes pin the clock so fixture ages stay stable.
+var clockOverride: Double?
+func nowTs() -> Double { clockOverride ?? Date().timeIntervalSince1970 }
+
+func gb(_ b: Double) -> String { String(format: "%.1f GB", b / GB) }
+
+func growthText(_ b: Double) -> String {
+    let sign = b < 0 ? "−" : "+"
+    let a = abs(b)
+    return a >= GB ? sign + String(format: "%.1f GB", a / GB)
+                   : sign + String(format: "%.0f MB", a / MB)
 }
 
-func durS(_ sec: Int) -> String {
-    if sec >= 86400 { return "\(sec / 86400)d\((sec % 86400) / 3600)h" }
-    if sec >= 3600 { return "\(sec / 3600)h\(String(format: "%02d", (sec % 3600) / 60))m" }
-    return "\(sec / 60)m"
+func coresText(_ c: Double) -> String { String(format: "%.1f cores", c) }
+
+func ageText(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds))
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return "\(s / 60) min" }
+    if s < 86400 { return "\(s / 3600) h" }
+    return "\(s / 86400) d"
 }
 
-func clockOf(_ ts: Double) -> String {
-    let f = DateFormatter(); f.dateFormat = "HH:mm"
-    return f.string(from: Date(timeIntervalSince1970: ts))
-}
-
-func relative(_ ts: Double) -> String {
-    let s = Int(Date().timeIntervalSince1970 - ts)
-    if s < 60 { return "\(s)s ago" }
-    if s < 3600 { return "\(s / 60)m ago" }
-    if s < 86400 { return "\(s / 3600)h ago" }
-    return "\(s / 86400)d ago"
-}
+func relative(_ ts: Double) -> String { ageText(nowTs() - ts) + " ago" }
 
 func eventTime(_ ts: Double) -> String {
     let f = DateFormatter(); f.dateFormat = "d MMM, HH:mm"
@@ -49,103 +56,109 @@ func retainedDate(_ ts: Double, includeTime: Bool = false) -> String {
     return f.string(from: Date(timeIntervalSince1970: ts))
 }
 
-func eventClock(_ ts: Double) -> String {
-    let f = DateFormatter(); f.dateFormat = "HH:mm"
+func eventClock(_ ts: Double, seconds: Bool = false) -> String {
+    let f = DateFormatter(); f.dateFormat = seconds ? "HH:mm:ss.SSS" : "HH:mm"
     return f.string(from: Date(timeIntervalSince1970: ts))
+}
+
+func plural(_ n: Int, _ one: String, _ many: String? = nil) -> String {
+    "\(n) " + (n == 1 ? one : (many ?? one + "s"))
 }
 
 // MARK: - palette
 
+/// One token set per appearance, resolved by the view's own appearance, so the
+/// popover follows the system theme and a render can force either one.
+private func rgb(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+            green: CGFloat((hex >> 8) & 0xff) / 255,
+            blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
+}
+
+private func token(_ light: NSColor, _ dark: NSColor) -> Color {
+    Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+    })
+}
+
 enum P {
-    // Deep indigo base with a violet lift, so coloured accents read as light
-    // rather than as stains on flat grey.
-    static let bgTop = Color(red: 0.055, green: 0.043, blue: 0.086)
-    static let bgMid = Color(red: 0.094, green: 0.071, blue: 0.161)
-    static let bgBot = Color(red: 0.129, green: 0.086, blue: 0.220)
+    static let bg = token(rgb(0xfaf9fe), rgb(0x171621))
+    static let panel = token(rgb(0xffffff), rgb(0x201f2e))
+    static let soft = token(rgb(0xefedf7), rgb(0x292738))
+    static let text = token(rgb(0x262332), rgb(0xf1eefb))
+    static let muted = token(rgb(0x696377), rgb(0xaca6bd))
+    static let border = token(rgb(0xe2deec), rgb(0x363242))
+    static let accent = token(rgb(0x6450be), rgb(0xbaa7ff))
+    static let selected = token(rgb(0xeee8ff), rgb(0x30283f))
+    static let green = token(rgb(0x257049), rgb(0x87d7a5))
+    static let amber = token(rgb(0x886009), rgb(0xefc570))
+    static let red = token(rgb(0xab3a4a), rgb(0xffa0ae))
+    static let scrim = token(rgb(0x39334d, 0x55 / 255.0), rgb(0x080610, 0xa8 / 255.0))
+    static let onTint = token(rgb(0xffffff), rgb(0x221a35))
+    /// The header's gradient: soft lavender in light, deep purple in dark.
+    static let headerTop = token(rgb(0xebe4ff), rgb(0x2f2154))
+    static let headerBottom = token(rgb(0xf7f4ff), rgb(0x1c1830))
+    /// The donut's grey parts: memory outside every section, and free memory.
+    static let system = token(rgb(0xcbd5e1), rgb(0x46526a))
+    static let track = token(rgb(0xeef0f5), rgb(0x232838))
 
-    static let card = Color(red: 1, green: 1, blue: 1).opacity(0.045)
-    static let cardHi = Color(red: 1, green: 1, blue: 1).opacity(0.085)
-    static let stroke = Color.white.opacity(0.085)
-    static let strokeHi = Color.white.opacity(0.16)
+    /// One colour per owner section, shared by the ring, legend and headers.
+    static func section(_ s: OwnerSection) -> Color {
+        switch s {
+        case .claude: return sectionClaude
+        case .codex: return sectionCodex
+        case .job: return sectionJob
+        case .browser: return sectionBrowser
+        case .dev: return sectionDev
+        case .app: return sectionApp
+        case .service: return sectionService
+        case .background: return sectionBackground
+        }
+    }
+    static let sectionClaude = token(rgb(0x7c3aed), rgb(0xa78bfa))
+    static let sectionCodex = token(rgb(0x0d9488), rgb(0x2dd4bf))
+    static let sectionJob = token(rgb(0xea580c), rgb(0xfb923c))
+    static let sectionBrowser = token(rgb(0x2563eb), rgb(0x60a5fa))
+    static let sectionDev = token(rgb(0x16a34a), rgb(0x4ade80))
+    static let sectionApp = token(rgb(0xdb2777), rgb(0xf472b6))
+    static let sectionService = token(rgb(0xca8a04), rgb(0xfacc15))
+    static let sectionBackground = token(rgb(0x94a3b8), rgb(0x8391a7))
 
-    static let text = Color(red: 0.96, green: 0.95, blue: 1.0)
-    static let dim = Color(red: 0.72, green: 0.70, blue: 0.82)
-    static let faint = Color(red: 0.52, green: 0.50, blue: 0.63)
-
-    static let green = Color(red: 0.204, green: 0.867, blue: 0.596)   // #34DD98
-    static let amber = Color(red: 0.984, green: 0.749, blue: 0.235)   // #FBBF3C
-    static let red = Color(red: 0.984, green: 0.443, blue: 0.518)     // #FB7184
-    static let violet = Color(red: 0.694, green: 0.529, blue: 0.988)  // #B187FC
-    static let blue = Color(red: 0.298, green: 0.749, blue: 0.973)    // #4CBFF8
-    static let fuchsia = Color(red: 0.910, green: 0.475, blue: 0.976) // #E879F9
-
-    /// RAM is sky, swap is fuchsia — two hues that never read as the same thing.
-    static let ram = blue
-    static let swap = fuchsia
-
-    static func tint(_ level: String) -> Color {
+    /// An unknown level is muted, never green: a missing reading is not health.
+    static func tint(_ level: String?) -> Color {
         switch level {
         case "CRITICAL", "DANGER": return red
         case "WATCH": return amber
-        default: return green
-        }
-    }
-
-    /// Matches Claude Code's own session convention rather than traffic-light
-    /// intuition: green means finished, grey means still going. Consistency with
-    /// the tool these sessions belong to beats a prettier mapping.
-    static func stateColor(_ s: String) -> Color {
-        switch s {
-        case "done", "stopped": return green      // completed
-        case "working": return dim                // working
-        case "blocked": return amber              // idle, waiting on you
-        case "terminal": return blue              // interactive terminal session
-        default: return faint
-        }
-    }
-
-    static func stateLabel(_ s: String) -> String {
-        switch s {
-        case "done", "stopped": return "completed"
-        case "working": return "working"
-        case "blocked": return "idle"             // Claude's 'blocked' = awaiting input
-        case "terminal": return "terminal"
-        default: return s
+        case "HEALTHY": return green
+        default: return muted
         }
     }
 }
 
-// MARK: - model
-
-struct Child: Identifiable {
-    let id = UUID()
-    var tag: String, worktree: String
-    var mem: Double, pid: Int, age: Int
+func ft(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+    .system(size: size, weight: weight)
 }
 
-struct Agent: Identifiable {
-    let id = UUID()
-    var kind: String, goal: String, active: Bool
+extension View {
+    func panel(_ radius: CGFloat = 12) -> some View {
+        background(RoundedRectangle(cornerRadius: radius).fill(P.panel))
+            .overlay(RoundedRectangle(cornerRadius: radius).stroke(P.border, lineWidth: 1))
+    }
 }
 
-struct Sess: Identifiable {
-    let id = UUID()
-    var name: String, state: String, doing: String
-    var total: Double, ram: Double, swap: Double
-    var procs: Int, subActive: Int
-    var root: Int
-    var children: [Child] = []
-    var agents: [Agent] = []       // active only — finished ones are noise
-    var subFinished: Int = 0
-    var started: [String] = []
-}
+// MARK: - JSON helpers
 
-struct WT: Identifiable {
-    let id = UUID()
-    var name: String, tag: String
-    var mem: Double, ram: Double, swap: Double
-    var procs: Int, orphans: Int
+/// JSONSerialization hands booleans over as NSNumber; a flag is never a metric.
+func num(_ v: Any?) -> Double? {
+    guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+    let d = n.doubleValue
+    return d.isFinite ? d : nil
 }
+func int(_ v: Any?) -> Int? { num(v).map { Int($0) } }
+func str(_ v: Any?) -> String? { (v as? String).flatMap { $0.isEmpty ? nil : $0 } }
+func strs(_ v: Any?) -> [String]? { (v as? [Any])?.compactMap { $0 as? String } }
+
+// MARK: - gate model (legacy `gate` object, embedded verbatim in owners --json)
 
 struct GateClassification {
     var source: String, rule: String, shape: String
@@ -159,6 +172,8 @@ struct GateEvent: Identifiable {
     var ts: Double, action: String, mode: String
     var sessionID: String, sessionName: String?
     var commandRaw: String, commandDisplay: String
+    /// The operation alone; older payloads carry none.
+    var commandShort: String? = nil
     var classification: GateClassification?
     var legacy: Bool
     var level: String, score: Int?, reasons: [String]
@@ -171,13 +186,10 @@ struct PendingRetry: Identifiable {
     var ts: Double, sessionID: String, sessionName: String?
     var commandRaw: String, commandDisplay: String, pressureLevel: String
     var eventRetained: Bool
-}
-
-struct App: Identifiable {
-    let id = UUID()
-    var name: String
-    var mem: Double
-    var procs: Int
+    /// memmon's id for `--dismiss-blocked`; older payloads carry none.
+    var pendingID: String? = nil
+    /// The operation alone (`pnpm test:affected`); the raw line stays in the label.
+    var commandShort: String? = nil
 }
 
 struct GateStats {
@@ -190,312 +202,1743 @@ struct GateStats {
     var evaluated = 0, warned = 0, stopped = 0, errors = 0
     var events: [GateEvent] = []
     var pending: [PendingRetry] = []
-}
 
-struct ManagedJob: Identifiable {
-    var id: String, resource: String, label: String, state: String, reason: String
-    var elapsed: Int
-}
-
-struct Snap {
-    var ramUsed = 0.0, ramTotal = 1.0, swapUsed = 0.0, swapTotal = 1.0
-    var free = 0.0, load = 0.0, compressed = 0.0
-    var level = "HEALTHY", reasons: [String] = [], headroom: Double? = nil
-    var score = 0
-    var advice = "", nextLevel: String? = nil, toNext: Int? = nil
-    var sessions: [Sess] = [], worktrees: [WT] = []
-    var orphanTotal = 0.0, orphanCount = 0
-    var idleSpares = 0, idleSpareMem = 0.0
-    var apps: [App] = []
-    var gate = GateStats()
-    var jobs: [ManagedJob] = []
-}
-
-final class Model: ObservableObject {
-    @Published var snap = Snap()
-    @Published var loaded = false
-    @Published var refreshing = false
-    @Published var lastSync: Date?
-
-    let python = "/usr/bin/python3"
-    let script = NSString(string: "~/.claude/memmon/memmon.py").expandingTildeInPath
-
-    @discardableResult
-    func run(_ args: [String]) -> Data? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: python)
-        p.arguments = [script] + args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let out = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return out
-    }
-
-    /// Full sync. Kicked off when the popover opens; the previous snapshot stays
-    /// on screen meanwhile so the UI never blanks or blocks.
-    func refresh() {
-        guard !refreshing else { return }
-        refreshing = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            var parsed: Snap?
-            if let d = self.run(["--json"]),
-               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
-                parsed = Model.decode(j)
+    static func decode(_ g: [String: Any]) -> GateStats {
+        func number(_ value: Any?) -> Double { num(value) ?? 0 }
+        func integer(_ value: Any?) -> Int { int(value) ?? 0 }
+        var s = GateStats()
+        s.installed = g["installed"] as? Bool ?? false
+        s.paused = g["paused"] as? Bool ?? false
+        if let until = g["paused_until"], !(until is NSNull) {
+            s.pausedUntil = number(until)
+        }
+        if let policy = g["policy"] as? [String: Any] {
+            s.mode = policy["mode"] as? String ?? "block-critical"
+        }
+        if let counts = g["counts"] as? [String: Any] {
+            s.since = number(counts["since"])
+            s.complete = counts["complete"] as? Bool ?? false
+            s.evaluated = integer(counts["evaluated"])
+            s.warned = integer(counts["warned"])
+            s.stopped = integer(counts["stopped"])
+            s.errors = integer(counts["errors"])
+        }
+        if let history = g["history"] as? [String: Any] {
+            s.historyFrom = number(history["from"])
+            if let to = history["to"], !(to is NSNull) {
+                s.historyTo = number(to)
             }
-            DispatchQueue.main.async {
-                if let parsed { self.snap = parsed; self.loaded = true; self.lastSync = Date() }
-                self.refreshing = false
-            }
-        }
-    }
-
-    static func decode(_ j: [String: Any]) -> Snap {
-        func number(_ value: Any?) -> Double {
-            (value as? NSNumber)?.doubleValue ?? 0
-        }
-        func integer(_ value: Any?) -> Int {
-            (value as? NSNumber)?.intValue ?? 0
-        }
-        var s = Snap()
-        if let vm = j["vm"] as? [String: Any] {
-            s.ramUsed = vm["ram_used"] as? Double ?? 0
-            s.ramTotal = max(vm["ram_total"] as? Double ?? 1, 1)
-            s.swapUsed = vm["swap_used"] as? Double ?? 0
-            s.swapTotal = max(vm["swap_total"] as? Double ?? 1, 1)
-            s.free = vm["free_pct"] as? Double ?? 0
-            s.load = vm["load"] as? Double ?? 0
-            s.compressed = vm["compressor"] as? Double ?? 0
-        }
-        if let p = j["pressure"] as? [String: Any] {
-            s.level = p["level"] as? String ?? "HEALTHY"
-            s.reasons = p["reasons"] as? [String] ?? []
-            s.headroom = p["headroom_min"] as? Double
-            s.score = p["score"] as? Int ?? 0
-            s.advice = p["advice"] as? String ?? ""
-            s.nextLevel = p["next_level"] as? String
-            s.toNext = p["to_next"] as? Int
-        }
-        s.jobs = (j["jobs"] as? [[String: Any]] ?? []).map { d in
-            ManagedJob(id: d["id"] as? String ?? UUID().uuidString,
-                       resource: d["resource"] as? String ?? "heavy",
-                       label: d["label"] as? String ?? "command",
-                       state: d["state"] as? String ?? "unknown",
-                       reason: d["reason"] as? String ?? "",
-                       elapsed: integer(d["elapsed_seconds"]))
-        }
-        s.sessions = (j["sessions"] as? [[String: Any]] ?? []).map { d in
-            let subs = d["subagents_active"] as? [[String: Any]] ?? []
-            let all = d["subagents"] as? [[String: Any]] ?? []
-            let kids = d["top_children"] as? [[String: Any]] ?? []
-            // started is {service: [iso_ts, command]}. "Docker" and "Docker VM"
-            // are one action to the user, so collapse them.
-            var services = Set((d["started"] as? [String: Any] ?? [:]).keys
-                .map { $0 == "Docker VM" ? "Docker" : $0 })
-            services.remove("")
-            // Distinct agent types only; an omega wave spawns the same auditor
-            // several times and listing each is pure repetition.
-            var seenKinds = Set<String>()
-            let activeAgents = subs.compactMap { a -> Agent? in
-                let k = a["kind"] as? String ?? "agent"
-                guard !seenKinds.contains(k) else { return nil }
-                seenKinds.insert(k)
-                return Agent(kind: k, goal: a["goal"] as? String ?? "", active: true)
-            }
-            return Sess(
-                name: d["name"] as? String ?? "?",
-                state: d["state"] as? String ?? "",
-                doing: d["doing"] as? String ?? "",
-                total: d["mem"] as? Double ?? 0,
-                ram: d["ram"] as? Double ?? 0,
-                swap: d["swap"] as? Double ?? 0,
-                procs: d["nproc"] as? Int ?? 0,
-                subActive: subs.count,
-                root: d["root"] as? Int ?? 0,
-                children: kids.map {
-                    Child(tag: $0["tag"] as? String ?? "?",
-                          worktree: $0["worktree"] as? String ?? "",
-                          mem: $0["mem"] as? Double ?? 0,
-                          pid: $0["pid"] as? Int ?? 0,
-                          age: $0["age"] as? Int ?? 0)
-                },
-                agents: Array(activeAgents.prefix(5)),
-                subFinished: max(0, all.count - subs.count),
-                started: services.sorted())
-        }
-        s.worktrees = (j["worktrees"] as? [[String: Any]] ?? []).map { d in
-            WT(name: d["name"] as? String ?? "?",
-               tag: d["tag"] as? String ?? "",
-               mem: d["mem"] as? Double ?? 0,
-               ram: d["ram"] as? Double ?? 0,
-               swap: d["swap"] as? Double ?? 0,
-               procs: d["n"] as? Int ?? 0,
-               orphans: d["orphans"] as? Int ?? 0)
-        }
-        s.orphanTotal = j["orphan_total"] as? Double ?? 0
-        s.orphanCount = (j["orphans"] as? [[String: Any]])?.count ?? 0
-        // Non-Claude memory feeds the verdict, so it has to be visible. A
-        // browser routinely outweighs every session combined, and no amount of
-        // scoping a build addresses that.
-        s.apps = ((j["apps"] as? [String: Any]) ?? [:]).compactMap { k, v in
-            guard let d = v as? [String: Any] else { return nil }
-            return App(name: k, mem: d["mem"] as? Double ?? 0,
-                       procs: d["n"] as? Int ?? 0)
-        }.sorted { $0.mem > $1.mem }
-        if let g = j["gate"] as? [String: Any] {
-            s.gate.installed = g["installed"] as? Bool ?? false
-            s.gate.paused = g["paused"] as? Bool ?? false
-            if let until = g["paused_until"], !(until is NSNull) {
-                s.gate.pausedUntil = number(until)
-            }
-            if let policy = g["policy"] as? [String: Any] {
-                s.gate.mode = policy["mode"] as? String ?? "block-critical"
-            }
-            if let counts = g["counts"] as? [String: Any] {
-                s.gate.since = number(counts["since"])
-                s.gate.complete = counts["complete"] as? Bool ?? false
-                s.gate.evaluated = integer(counts["evaluated"])
-                s.gate.warned = integer(counts["warned"])
-                s.gate.stopped = integer(counts["stopped"])
-                s.gate.errors = integer(counts["errors"])
-            }
-            if let history = g["history"] as? [String: Any] {
-                s.gate.historyFrom = number(history["from"])
-                if let to = history["to"], !(to is NSNull) {
-                    s.gate.historyTo = number(to)
-                }
-                s.gate.truncated = history["truncated"] as? Bool ?? false
-                s.gate.events = (history["events"] as? [[String: Any]] ?? []).map { d in
-                    let session = d["session"] as? [String: Any] ?? [:]
-                    let command = d["command"] as? [String: Any] ?? [:]
-                    let pressure = d["pressure"] as? [String: Any] ?? [:]
-                    var match: GateClassification?
-                    if let c = d["classification"] as? [String: Any] {
-                        match = GateClassification(
-                            source: c["source"] as? String ?? "none",
-                            rule: c["rule"] as? String ?? "",
-                            shape: c["shape"] as? String ?? "",
-                            samples: c["samples"] is NSNull ? nil : integer(c["samples"]),
-                            observedPeak: c["observed_peak_bytes"] is NSNull
-                                ? nil : number(c["observed_peak_bytes"]),
-                            blockEligible: c["block_eligible"] as? Bool ?? false)
-                    }
-                    return GateEvent(
-                        ts: number(d["ts"]),
-                        action: d["action"] as? String ?? "warn",
-                        mode: d["mode"] as? String ?? "block-critical",
-                        sessionID: session["id"] as? String ?? "",
-                        sessionName: session["name"] as? String,
-                        commandRaw: command["raw"] as? String ?? "",
-                        commandDisplay: command["display"] as? String ?? "",
-                        classification: match,
-                        legacy: (d["legacy"] as? Bool) ?? (match == nil),
-                        level: pressure["level"] as? String ?? "?",
-                        score: pressure["score"] is NSNull ? nil : integer(pressure["score"]),
-                        reasons: pressure["reasons"] as? [String] ?? [],
-                        retryStatus: d["retry_status"] as? String ?? "not_waiting",
-                        ms: integer(d["ms"]))
-                }
-            }
-            s.gate.pending = (g["pending_retry"] as? [[String: Any]] ?? []).map { d in
+            s.truncated = history["truncated"] as? Bool ?? false
+            s.events = (history["events"] as? [[String: Any]] ?? []).map { d in
                 let session = d["session"] as? [String: Any] ?? [:]
                 let command = d["command"] as? [String: Any] ?? [:]
-                return PendingRetry(
+                let pressure = d["pressure"] as? [String: Any] ?? [:]
+                var match: GateClassification?
+                if let c = d["classification"] as? [String: Any] {
+                    match = GateClassification(
+                        source: c["source"] as? String ?? "none",
+                        rule: c["rule"] as? String ?? "",
+                        shape: c["shape"] as? String ?? "",
+                        samples: c["samples"] is NSNull ? nil : integer(c["samples"]),
+                        observedPeak: c["observed_peak_bytes"] is NSNull
+                            ? nil : number(c["observed_peak_bytes"]),
+                        blockEligible: c["block_eligible"] as? Bool ?? false)
+                }
+                return GateEvent(
                     ts: number(d["ts"]),
+                    action: d["action"] as? String ?? "warn",
+                    mode: d["mode"] as? String ?? "block-critical",
                     sessionID: session["id"] as? String ?? "",
                     sessionName: session["name"] as? String,
                     commandRaw: command["raw"] as? String ?? "",
                     commandDisplay: command["display"] as? String ?? "",
-                    pressureLevel: d["pressure_level"] as? String ?? "?",
-                    eventRetained: d["event_retained"] as? Bool ?? false)
+                    commandShort: command["short"] as? String,
+                    classification: match,
+                    legacy: (d["legacy"] as? Bool) ?? (match == nil),
+                    level: pressure["level"] as? String ?? "?",
+                    score: pressure["score"] is NSNull ? nil : integer(pressure["score"]),
+                    reasons: pressure["reasons"] as? [String] ?? [],
+                    retryStatus: d["retry_status"] as? String ?? "not_waiting",
+                    ms: integer(d["ms"]))
             }
         }
-        if let ov = j["overhead"] as? [String: Any] {
-            s.idleSpares = ov["spares"] as? Int ?? 0
-            s.idleSpareMem = ov["spare_mem"] as? Double ?? 0
+        s.pending = (g["pending_retry"] as? [[String: Any]] ?? []).map { d in
+            let session = d["session"] as? [String: Any] ?? [:]
+            let command = d["command"] as? [String: Any] ?? [:]
+            return PendingRetry(
+                ts: number(d["ts"]),
+                sessionID: session["id"] as? String ?? "",
+                sessionName: session["name"] as? String,
+                commandRaw: command["raw"] as? String ?? "",
+                commandDisplay: command["display"] as? String ?? "",
+                pressureLevel: d["pressure_level"] as? String ?? "?",
+                eventRetained: d["event_retained"] as? Bool ?? false,
+                pendingID: d["id"] as? String,
+                commandShort: command["short"] as? String)
         }
         return s
     }
 }
 
+// MARK: - owners model (memmon owners --json, schema 2)
+
+/// A `memmon run` lease, waiting or running; the same shape as legacy --json jobs.
+struct ManagedJob: Identifiable {
+    var id: String, resource: String, label: String, state: String, reason: String
+    var elapsed: Int
+}
+
+struct SystemInfo {
+    var ramBytes: Double?, usedBytes: Double?
+    /// What "free" holds: pages nothing uses now, and file cache macOS reclaims.
+    var idleBytes: Double? = nil, cacheBytes: Double? = nil
+    var pressureLevel: String?, scoreLevel: String?
+    var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
+    /// Why nothing was measured; set only when cpu_coverage is null.
+    var cpuReason: String?
+    var reason: String?
+}
+
+struct Protection {
+    var summary: String?, gate: String?, route: String?
+    var unmanagedHeavy: Int?
+}
+
+struct OwnerJob: Identifiable {
+    var id: String
+    var kind: String, label: String
+    var footprint: Double?, memberCount: Int?
+    var token: String?, action: String?
+
+    var isConversation: Bool { kind == "conversation" }
+    var rootPid: String? { id.split(separator: ".").first.map(String.init) }
+
+    var stopAction: String {
+        if let action { return action }
+        return kind == "server" ? "stop-server" : "stop-job"
+    }
+    var stopLabel: String {
+        switch stopAction {
+        case "stop-server": return "Stop server"
+        case "stop-managed-job": return "Stop job"
+        default:
+            switch kind {
+            case "build": return "Stop build"
+            case "test": return "Stop tests"
+            default: return "Stop job"
+            }
+        }
+    }
+    /// "typecheck" + build → "Typecheck · build".
+    var displayName: String {
+        let head = label.prefix(1).uppercased() + label.dropFirst()
+        if isConversation || label.lowercased().contains(kind) { return head }
+        return "\(head) · \(kind)"
+    }
+}
+
+struct AppInstanceInfo {
+    var pid: Int, launchDate: Double?
+}
+
+struct Owner: Identifiable {
+    var id: String
+    var kind: String, agent: String, title: String
+    var project: String?, worktree: String?
+    var activity: String?, confidence: String?
+    var footprint: Double?, footprintReason: String?
+    var cpu: Double?, cpuCoverage: Double?, cpuReason: String?
+    var growth: Double?, growthReason: String?
+    var memberCount: Int?
+    var rootPid: Int?, rootStart: [Double]?
+    var token: String?
+    var jobs: [OwnerJob] = []
+    var actions: [String] = []
+    var instances: [AppInstanceInfo]?
+    var sharedWith: [String]?
+    var stopCommand: String?
+    var usedBy: [String]?
+    /// Other owners whose roots run inside this app (a terminal hosting
+    /// sessions). memmon offers no quit for such an app.
+    var hosts: [String] = []
+    /// The app runs plain shells: quitting it ends every one of them.
+    var hostsShells = false
+    /// memmon's display grouping (claude, codex, job, browser, dev, app,
+    /// service, unknown). It only places the row; it never decides an action.
+    var category: String?
+
+    static let shellWarning = "Quitting a terminal ends every shell and agent session in it."
+    /// Set only on the synthetic "Unattributed" row that collapses unknown owners.
+    var group: [Owner] = []
+
+    var isUnattributed: Bool { kind == "unknown" || agent == "unknown" }
+
+    /// An app hosting other owners' sessions is never offered a quit, even if
+    /// a payload were to list one.
+    func can(_ action: String) -> Bool {
+        actions.contains(action) && token != nil && !(action == "quit-app" && !hosts.isEmpty)
+    }
+
+    var agentLabel: String {
+        switch kind {
+        case "codex-app": return "Codex app"
+        case "codex-ui": return "Codex thread"
+        default: break
+        }
+        switch agent {
+        case "claude": return "Claude"
+        case "codex": return "Codex"
+        case "app": return "App"
+        case "service": return "Shared service"
+        case "job": return "Managed job"
+        default: return "Unattributed"
+        }
+    }
+
+    var line2: String {
+        if !group.isEmpty {
+            return "\(plural(memberCount ?? 0, "process", "processes")) · no owning session or app"
+        }
+        if let activity { return "\(agentLabel) · \(activity)" }
+        if let n = memberCount { return "\(agentLabel) · \(plural(n, "process", "processes"))" }
+        return agentLabel
+    }
+
+    var line3: String {
+        let parts = [project, worktree.map { "\($0) worktree" }].compactMap { $0 }
+        if !parts.isEmpty { return parts.joined(separator: " · ") }
+        if !group.isEmpty || isUnattributed { return "Ownership could not be traced" }
+        switch kind {
+        case "service": return "Not assigned to a session"
+        case "codex-app": return "Shared process — memory not split by thread"
+        case "codex-ui": return "Frontend only — no stop action"
+        case "claude", "codex": return "No project detected"
+        case "app":
+            if !hosts.isEmpty { return "Hosts \(plural(hosts.count, "session"))" }
+            if let n = instances?.count { return n == 0 ? "Helpers only — nothing to quit" : plural(n, "instance") }
+            return "Not assigned to a session"
+        default: return agentLabel
+        }
+    }
+
+    var detailTag: String {
+        if !group.isEmpty { return "Unattributed processes" }
+        switch kind {
+        case "claude", "codex": return "Session details"
+        case "codex-app": return "Shared process"
+        case "codex-ui": return "Codex frontend"
+        case "service": return "Shared service"
+        case "app": return "App details"
+        case "job": return "Managed job"
+        default: return "Details"
+        }
+    }
+
+    static func decode(_ d: [String: Any]) -> Owner? {
+        guard let id = str(d["owner_id"]) else { return nil }
+        let kind = str(d["kind"]) ?? "unknown"
+        var o = Owner(id: id, kind: kind, agent: str(d["agent"]) ?? kind,
+                      title: str(d["title"]) ?? id)
+        o.project = str(d["project"]); o.worktree = str(d["worktree"])
+        o.activity = str(d["activity"]); o.confidence = str(d["confidence"])
+        o.footprint = num(d["footprint_bytes"]); o.footprintReason = str(d["footprint_reason"])
+        o.cpu = num(d["cpu_cores"]); o.cpuCoverage = num(d["cpu_coverage"])
+        o.cpuReason = str(d["cpu_reason"])
+        o.growth = num(d["growth_bytes_per_10min"]); o.growthReason = str(d["growth_reason"])
+        o.memberCount = int(d["member_count"])
+        if let root = d["root"] as? [String: Any] {
+            o.rootPid = int(root["pid"])
+            o.rootStart = (root["start"] as? [Any])?.compactMap { num($0) }
+        }
+        o.token = str(d["token"])
+        o.actions = strs(d["actions"]) ?? []
+        o.jobs = (d["jobs"] as? [[String: Any]] ?? []).compactMap { j in
+            guard let jid = str(j["job_id"]) else { return nil }
+            return OwnerJob(id: jid, kind: str(j["kind"]) ?? "other",
+                            label: str(j["label"]) ?? "job",
+                            footprint: num(j["footprint_bytes"]),
+                            memberCount: int(j["member_count"]),
+                            token: str(j["token"]), action: str(j["action"]))
+        }
+        o.instances = (d["instances"] as? [[String: Any]])?.compactMap { i in
+            int(i["pid"]).map { AppInstanceInfo(pid: $0, launchDate: launchDate(i["launch_date"])) }
+        }
+        o.sharedWith = strs(d["shared_with"])
+        o.stopCommand = str(d["stop_command"])
+        o.usedBy = strs(d["used_by"])
+        o.hosts = strs(d["hosts"]) ?? []
+        o.hostsShells = d["hosts_shells"] as? Bool ?? false
+        o.category = str(d["category"])
+        return o
+    }
+}
+
+/// Names in a wrapped list keep their hyphens on one line ("api-gateway"),
+/// and the "… (+N)" tail is glued to the last name with no-break spaces.
+func unbroken<S: Sequence>(_ names: S) -> [String] where S.Element == String {
+    names.map { $0.replacingOccurrences(of: "-", with: "\u{2011}") }
+}
+
+/// launch_date is epoch seconds, the process start as a float.
+func launchDate(_ v: Any?) -> Double? { num(v) }
+
+struct OwnersSnap {
+    var ts: Double?, source: String?, inventory: String?, cpuWindow: Double?
+    var inventoryReason: String?, hiddenProcesses: Int?
+    /// memmon's own totals for the collapsed Unattributed row.
+    var unattributed: [String: Any]?
+    var system = SystemInfo()
+    var protection: Protection?
+    var gate = GateStats()
+    /// No gate object at all: its state is unknown, which is not "not installed".
+    var gateMissing = false
+    var runnerJobs: [ManagedJob] = []
+    var owners: [Owner] = []
+
+    var degraded: Bool { inventory == "degraded" }
+
+    var age: Double? { ts.map { nowTs() - $0 } }
+    var stale: Bool {
+        guard let age else { return true }
+        return age > (source == "sampler" ? 180 : 90)
+    }
+
+    static func decode(_ j: [String: Any]) -> OwnersSnap? {
+        guard let v = num(j["schema_version"]), v >= 2,
+              let list = j["owners"] as? [Any] else { return nil }
+        var s = OwnersSnap()
+        s.ts = num(j["ts"]); s.source = str(j["source"])
+        s.inventory = str(j["inventory"]); s.cpuWindow = num(j["cpu_window_s"])
+        s.inventoryReason = str(j["inventory_reason"]); s.hiddenProcesses = int(j["hidden_process_count"])
+        s.unattributed = j["unattributed"] as? [String: Any]
+        s.runnerJobs = (j["runner_jobs"] as? [[String: Any]] ?? []).map { d in
+            ManagedJob(id: str(d["id"]) ?? UUID().uuidString, resource: str(d["resource"]) ?? "heavy",
+                       label: str(d["label"]) ?? "command", state: str(d["state"]) ?? "unknown",
+                       reason: str(d["reason"]) ?? "", elapsed: int(d["elapsed_seconds"]) ?? 0)
+        }
+        if let y = j["system"] as? [String: Any] {
+            s.system = SystemInfo(ramBytes: num(y["ram_bytes"]), usedBytes: num(y["used_bytes"]),
+                                  pressureLevel: str(y["pressure_level"]),
+                                  scoreLevel: str(y["score_level"]),
+                                  ncpu: num(y["ncpu"]), cpuCores: num(y["cpu_cores"]),
+                                  cpuCoverage: num(y["cpu_coverage"]), cpuReason: str(y["cpu_reason"]),
+                                  reason: str(y["reason"]))
+            s.system.idleBytes = num(y["idle_bytes"]); s.system.cacheBytes = num(y["cache_bytes"])
+        }
+        if let p = j["protection"] as? [String: Any] {
+            s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
+                                      route: str(p["route"]),
+                                      unmanagedHeavy: int(p["unmanaged_heavy"]))
+        }
+        if let g = j["gate"] as? [String: Any] { s.gate = GateStats.decode(g) } else { s.gateMissing = true }
+        s.owners = list.compactMap { ($0 as? [String: Any]).flatMap(Owner.decode) }
+        return s
+    }
+
+    /// The owner list as displayed: every unattributed subtree collapses into one
+    /// "Unattributed" row, and totals stay partitioned because nothing is copied.
+    var rows: [Owner] {
+        let unknown = owners.filter { $0.isUnattributed }
+        var out = owners.filter { !$0.isUnattributed }
+        guard !unknown.isEmpty else { return out }
+        func sum(_ xs: [Double?]) -> Double? {
+            let have = xs.compactMap { $0 }
+            return have.isEmpty ? nil : have.reduce(0, +)
+        }
+        var g = Owner(id: "unknown:*", kind: "unknown", agent: "unknown", title: "Unattributed")
+        g.confidence = "unknown"
+        g.group = unknown
+        g.footprint = sum(unknown.map { $0.footprint })
+        // A partial sum would understate the row, so CPU shows only when every
+        // process of every unattributed tree was measured.
+        let cpus = unknown.compactMap { $0.cpu }
+        let full = cpus.count == unknown.count && unknown.allSatisfy { ($0.cpuCoverage ?? 0) >= 1 }
+        g.cpu = full ? cpus.reduce(0, +) : nil
+        g.cpuReason = unknown.first { $0.cpu == nil }?.cpuReason ?? (cpus.isEmpty ? "not measured" : "partly measured")
+        g.growth = nil
+        g.growthReason = "not tracked"
+        g.memberCount = unknown.reduce(0) { $0 + ($1.memberCount ?? 1) }
+        if let u = unattributed {
+            g.footprint = num(u["footprint_bytes"]) ?? g.footprint
+            g.memberCount = int(u["member_count"]) ?? g.memberCount
+            g.growth = num(u["growth_bytes_per_10min"])
+            g.growthReason = str(u["growth_reason"]) ?? "not enough history"
+        }
+        out.append(g)
+        return out
+    }
+}
+
+enum SortKey: String, CaseIterable {
+    // Growth is not a sort: it needs ten minutes of unbroken history, so the
+    // column was mostly empty. It is shown where it is known instead.
+    case memory, cpu
+    var label: String { rawValue == "cpu" ? "CPU" : rawValue.capitalized }
+    var columnHeader: String {
+        switch self {
+        case .memory: return "Memory"
+        case .cpu: return "CPU cores"
+        }
+    }
+    func metric(_ o: Owner) -> Double? {
+        switch self {
+        case .memory: return o.footprint
+        case .cpu: return o.cpu
+        }
+    }
+}
+
+/// Unavailable values sort last whichever metric is chosen; ties fall back to
+/// memory, then title, so the order does not shuffle between refreshes.
+// MARK: - sections
+
+/// The popover's owner sections, in display order.
+enum OwnerSection: String, CaseIterable, Identifiable {
+    case claude, codex, job, browser, dev, app, service, background
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude sessions"
+        case .codex: return "Codex"
+        case .job: return "Managed jobs"
+        case .browser: return "Browsers"
+        case .dev: return "Terminals & editors"
+        case .app: return "Mac apps"
+        case .service: return "Shared services"
+        case .background: return "Background"
+        }
+    }
+
+    /// Open until the user closes it: the sections that hold agent work.
+    /// Every section starts collapsed: the headers are the overview, and a
+    /// section opens on a click or for the row the user is acting on.
+    var openByDefault: Bool { false }
+
+    /// At most this many rows show before "Show N more".
+    static let cap = 6
+    /// Below this, an owner with nothing to act on is background noise.
+    static let smallBytes = 100.0 * 1024 * 1024
+}
+
+/// memmon's category, or one derived from the kind for a payload without it.
+func ownerCategory(_ o: Owner) -> String {
+    if let c = o.category { return c }
+    switch o.kind {
+    case "claude": return "claude"
+    case "codex", "codex-ui": return "codex"
+    case "job": return "job"
+    case "app": return "app"
+    case "service", "codex-app": return "service"
+    default: return "unknown"
+    }
+}
+
+/// An app or service with nothing to act on, hosting nothing, and a known
+/// footprint under 100 MiB: a helper or widget, not something to look at first.
+func isSmallOwner(_ o: Owner) -> Bool {
+    guard ["browser", "dev", "app", "service"].contains(ownerCategory(o)) else { return false }
+    guard !o.actions.contains(where: { o.can($0) }), o.hosts.isEmpty else { return false }
+    guard let fp = o.footprint else { return false }
+    return fp < OwnerSection.smallBytes
+}
+
+func ownerSection(_ o: Owner) -> OwnerSection {
+    if !o.group.isEmpty || o.isUnattributed || isSmallOwner(o) { return .background }
+    return OwnerSection(rawValue: ownerCategory(o)).flatMap { $0 == .background ? nil : $0 } ?? .background
+}
+
+/// Rows grouped into their sections, each sorted by `key`; empty sections
+/// are left out.
+func sectionedOwners(_ rows: [Owner], by key: SortKey) -> [(OwnerSection, [Owner])] {
+    let sorted = sortOwners(rows, by: key)
+    return OwnerSection.allCases.compactMap { sec in
+        let mine = sorted.filter { ownerSection($0) == sec }
+        return mine.isEmpty ? nil : (sec, mine)
+    }
+}
+
+/// The header's count, worded for the section.
+func sectionCount(_ sec: OwnerSection, _ rows: [Owner]) -> (shown: String, spoken: String) {
+    guard sec == .background else {
+        return ("\(rows.count)", plural(rows.count, "owner"))
+    }
+    let small = rows.filter { $0.group.isEmpty && !$0.isUnattributed }.count
+    let unattributed = rows.filter { !$0.group.isEmpty || $0.isUnattributed }
+        .reduce(0) { $0 + ($1.memberCount ?? 1) }
+    var shown: [String] = [], spoken: [String] = []
+    if small > 0 {
+        shown.append("\(small) small")
+        spoken.append(plural(small, "small owner"))
+    }
+    if unattributed > 0 {
+        shown.append("\(unattributed) unattributed")
+        spoken.append(plural(unattributed, "unattributed process", "unattributed processes"))
+    }
+    return (shown.joined(separator: " · "), spoken.joined(separator: " and "))
+}
+
+// MARK: - memory ring
+
+/// One arc of the memory ring.
+struct RingSegment: Identifiable {
+    enum Kind: Equatable { case section(OwnerSection), system }
+    var kind: Kind
+    var id: String {
+        if case .section(let s) = kind { return s.rawValue }
+        return "system"
+    }
+    var name: String {
+        if case .section(let s) = kind { return s.title }
+        return "System & other"
+    }
+    /// What the legend says: the section's own memory.
+    var bytes: Double
+    /// What the ring draws; never more in total than memory in use.
+    var arc: Double
+    /// A section with an unmeasured row is a lower bound, and then System &
+    /// other, being the remainder, is an upper bound.
+    var bound: Bound = .exact
+    enum Bound { case exact, atLeast, atMost }
+    var shown: String {
+        switch bound {
+        case .exact: return gb(bytes)
+        case .atLeast: return "≥ " + gb(bytes)
+        case .atMost: return "≤ " + gb(bytes)
+        }
+    }
+    var spoken: String {
+        switch bound {
+        case .exact: return gb(bytes)
+        case .atLeast: return "at least " + gb(bytes)
+        case .atMost: return "at most " + gb(bytes)
+        }
+    }
+}
+
+/// The ring's arcs: one per section with memory, in section order, then
+/// "System & other" for used memory no section accounts for. Owners
+/// partition processes, so section totals add up without double counting;
+/// if they ever exceed used memory (footprint and physical "used" are
+/// measured differently), the arcs are scaled down so the ring never claims
+/// more than is in use, and System & other is zero, never negative.
+func ringSegments(_ rows: [Owner], used: Double?) -> [RingSegment] {
+    var out: [RingSegment] = sectionedOwners(rows, by: .memory).compactMap { sec, owners in
+        guard let total = sectionTotal(owners), total > 0 else { return nil }
+        let partial = owners.contains { $0.footprint == nil }
+        return RingSegment(kind: .section(sec), bytes: total, arc: total, bound: partial ? .atLeast : .exact)
+    }
+    guard let used else { return out }
+    let sum = out.reduce(0) { $0 + $1.bytes }
+    if sum > used, sum > 0 {
+        let k = used / sum
+        for i in out.indices { out[i].arc = out[i].bytes * k }
+    }
+    let system = max(used - sum, 0)
+    let unmeasured = rows.contains { $0.footprint == nil }
+    out.append(RingSegment(kind: .system, bytes: system, arc: system, bound: unmeasured ? .atMost : .exact))
+    return out
+}
+
+/// The pressure word in the ring's centre.
+func pressureWord(_ level: String?) -> String {
+    switch level {
+    case "HEALTHY": return "Normal"
+    case "WATCH": return "Watch"
+    case "DANGER": return "Danger"
+    case "CRITICAL": return "Critical"
+    default: return "Unknown"
+    }
+}
+
+/// The section's memory: owners partition processes, so known footprints add up.
+func sectionTotal(_ rows: [Owner]) -> Double? {
+    let known = rows.compactMap { $0.footprint }
+    return known.isEmpty ? nil : known.reduce(0, +)
+}
+
+func sortOwners(_ owners: [Owner], by key: SortKey) -> [Owner] {
+    owners.sorted { a, b in
+        switch (key.metric(a), key.metric(b)) {
+        case let (x?, y?) where x != y: return x > y
+        case (nil, _?): return false
+        case (_?, nil): return true
+        default:
+            let fa = a.footprint ?? -1, fb = b.footprint ?? -1
+            return fa != fb ? fa > fb : a.title < b.title
+        }
+    }
+}
+
+// MARK: - running memmon
+
+struct CLIResult {
+    var exit: Int32?
+    var stdout: Data
+    var timedOut = false
+    var launchError: String?
+}
+
+enum CLI {
+    static var python = "/usr/bin/python3"
+    static var script = NSString(string: "~/.claude/memmon/memmon.py").expandingTildeInPath
+    static var ownersTimeout = 10.0
+    static var actTimeout = 25.0
+
+    /// posix_spawn rather than Process: quit-app hands the actions.lock
+    /// descriptor to `memmon act verify-app`, and Process closes every fd above 2.
+    ///
+    /// A call that outlives its timeout is never signalled: the caller gets a
+    /// timeout at once and the child is reaped on a background thread whenever
+    /// it ends. `onExit` runs exactly once on every path (reaped, timed out
+    /// and later reaped, or never started), so a caller can avoid starting
+    /// another while one is still running without ever wedging.
+    static func run(_ args: [String], timeout: Double, inheritFD: Int32? = nil,
+                    onExit: (() -> Void)? = nil) -> CLIResult {
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else {
+            onExit?()
+            return CLIResult(exit: nil, stdout: Data(), launchError: "could not create a pipe")
+        }
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_adddup2(&actions, fds[1], 1)
+        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        if let fd = inheritFD { posix_spawn_file_actions_addinherit_np(&actions, fd) }
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT))
+        var argv: [UnsafeMutablePointer<CChar>?] = ([python, script] + args).map { strdup($0) }
+        argv.append(nil)
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, python, &actions, &attr, &argv, environ)
+        argv.forEach { free($0) }
+        posix_spawn_file_actions_destroy(&actions)
+        posix_spawnattr_destroy(&attr)
+        close(fds[1])
+        guard rc == 0 else {
+            close(fds[0])
+            onExit?()
+            return CLIResult(exit: nil, stdout: Data(),
+                             launchError: "could not start memmon (\(String(cString: strerror(rc))))")
+        }
+
+        let readFD = fds[0]
+        let collected = DataBox()
+        let readDone = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = read(readFD, &buf, buf.count)
+                if n > 0 { collected.append(buf, n) } else if n < 0 && errno == EINTR { continue } else { break }
+            }
+            close(readFD)
+            readDone.signal()
+        }
+
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var status: Int32 = 0
+        while true {
+            let r = waitpid(pid, &status, WNOHANG)
+            if r == pid { break }
+            if r < 0 && errno != EINTR {
+                onExit?()
+                return CLIResult(exit: nil, stdout: Data(), launchError: "lost track of memmon")
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                DispatchQueue.global(qos: .utility).async {
+                    var s: Int32 = 0
+                    while waitpid(pid, &s, 0) < 0 && errno == EINTR {}
+                    onExit?()
+                }
+                return CLIResult(exit: nil, stdout: Data(), timedOut: true)
+            }
+            usleep(20_000)
+        }
+        onExit?()
+        // A grandchild that kept stdout open must not hang the caller.
+        _ = readDone.wait(timeout: .now() + 2)
+        let exited = (status & 0x7f) == 0
+        return CLIResult(exit: exited ? (status >> 8) & 0xff : nil, stdout: collected.data,
+                         launchError: exited ? nil : "memmon was terminated by a signal")
+    }
+}
+
+final class DataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buf = Data()
+    func append(_ bytes: [UInt8], _ n: Int) { lock.lock(); buf.append(bytes, count: n); lock.unlock() }
+    var data: Data { lock.lock(); defer { lock.unlock() }; return buf }
+}
+
+/// The flock memmon act takes for every action. Quit-app holds it here, across
+/// verify-app, terminate() and the watch, so no other action interleaves.
+enum ActionsLock {
+    static var path = NSString(string: "~/.claude/memmon/runner/coord/actions.lock")
+        .expandingTildeInPath
+
+    enum Acquired { case held(Int32), busy, failed(String) }
+
+    /// LOCK_NB polling with the same 5 s limit as memmon act.
+    static func acquire(timeout: Double = 5) -> Acquired {
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return .failed("cannot open actions.lock") }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            if ProcessInfo.processInfo.systemUptime >= deadline { close(fd); return .busy }
+            usleep(100_000)
+        }
+        return .held(fd)
+    }
+
+    static func release(_ fd: Int32) { flock(fd, LOCK_UN); close(fd) }
+}
+
+// MARK: - action outcomes
+
+struct ActOutcome {
+    var result: String
+    var reason: String?
+    var exited: Int?
+    var captured: Int?
+    var remaining: Int = 0
+    var kept: [String] = []
+    var forceToken: String?
+    var usedBefore: Double?, usedAfter: Double?
+    /// The restart watch after an end-session failed; the stop itself stands.
+    var watchError: String?
+    /// Per-instance liveness from verify-app's instances[].status.
+    var alive: InstanceLiveness?
+    /// verify-app's freshly minted token, for the next check under the lock.
+    var token: String?
+
+    /// On a Force result: how many it signalled that are now gone. `exited`
+    /// also counts survivors that ended by themselves, which were not killed.
+    var killed: Int?
+    /// Observed processes the force token could not carry (it lists at most
+    /// a fixed number); assumed still running.
+    var observedUnlisted = 0
+
+    /// Named survivors Force left alone (protected, or the signal could not
+    /// be delivered) that are gone anyway.
+    var exitedUnsignalled = 0
+
+    /// remaining[] rows, counted by what they are: the ones the force token
+    /// names (`forceable`), the ones only observed outside what was stopped
+    /// (`role: observed`), and held `memmon run` wrappers (`role: runner`),
+    /// which are never signalled and exit once their job ends.
+    var forceableRows = 0
+    var observedRows = 0
+    var runnerRows = 0
+
+    /// How many listed survivors Force would act on, and how many it would
+    /// not. Runner wrappers are neither.
+    var forceSplit: (forceable: Int, outside: Int) { (forceableRows, observedRows) }
+
+    static func runnerText(_ n: Int) -> String {
+        n == 1 ? "1 memmon run wrapper — exits once its job ends"
+            : "\(n) memmon run wrappers — exit once their job ends"
+    }
+
+    /// Processes still running outside what was stopped, listed or not, and
+    /// any runner wrappers, which are not outside it.
+    var outsideParts: [String] {
+        var parts: [String] = []
+        if observedRows > 0 { parts.append("\(observedRows) still running outside what was stopped") }
+        if observedUnlisted > 0 {
+            parts.append("\(observedUnlisted) more still running that memmon could not list")
+        }
+        if runnerRows > 0 { parts.append(ActOutcome.runnerText(runnerRows)) }
+        return parts
+    }
+
+    /// Named survivors gone without being signalled by this Force: they had
+    /// already exited, or ended while protected.
+    var alreadyGone: Int { max((exited ?? 0) - (killed ?? 0) - exitedUnsignalled, 0) }
+
+    /// What Force did: killed versus gone by themselves, never one count.
+    var goneParts: [String] {
+        var parts: [String] = []
+        if alreadyGone > 0 { parts.append("\(alreadyGone) had already exited") }
+        if exitedUnsignalled > 0 {
+            parts.append("\(exitedUnsignalled) ended on \(exitedUnsignalled == 1 ? "its" : "their") own while protected")
+        }
+        return parts
+    }
+
+    var forceParts: [String] {
+        guard let k = killed else { return ["\(exited ?? 0) force-stopped"] }
+        return ["\(k) force-stopped"] + goneParts
+    }
+
+    static func decode(_ data: Data) -> ActOutcome? {
+        guard let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let result = str(j["result"]) else { return nil }
+        var o = ActOutcome(result: result, reason: str(j["reason"]), exited: int(j["exited"]),
+                           captured: int(j["captured"]),
+                           remaining: (j["remaining"] as? [Any])?.count ?? 0,
+                           kept: strs(j["kept"]) ?? [], forceToken: str(j["force_token"]),
+                           usedBefore: num(j["used_bytes_before"]),
+                           usedAfter: num(j["used_bytes_after"]))
+        o.watchError = str(j["watch_error"])
+        o.token = str(j["token"])
+        o.killed = int(j["killed"])
+        if let rows = j["remaining"] as? [[String: Any]] {
+            o.forceableRows = rows.filter { $0["forceable"] as? Bool == true }.count
+            o.observedRows = rows.filter { str($0["role"]) == "observed" }.count
+            o.runnerRows = rows.filter { str($0["role"]) == "runner" }.count
+        }
+        o.observedUnlisted = int(j["observed_unlisted"]) ?? 0
+        o.exitedUnsignalled = int(j["exited_unsignalled"]) ?? 0
+        if let list = j["instances"] as? [[String: Any]] {
+            var alive: InstanceLiveness = [:]
+            for i in list {
+                guard let pid = int(i["pid"]), let status = str(i["status"]) else { continue }
+                alive[Int32(pid)] = status == "exited" ? .exited : status == "running" ? .running : .unverified
+            }
+            o.alive = alive
+        }
+        return o
+    }
+}
+
+enum ActView {
+    case success(ActOutcome)
+    case partial(ActOutcome)
+    case refused(ActOutcome)
+    case error(String)
+
+    var name: String {
+        switch self {
+        case .success: return "success"
+        case .partial: return "partial"
+        case .refused: return "refused"
+        case .error: return "error"
+        }
+    }
+
+    /// Stdout JSON first, then the exit code it must agree with. Exit 0, 3 and 4
+    /// carry a result; anything else, a mismatch, a timeout or unreadable output
+    /// is an error, because the real outcome is unknown.
+    static func classify(_ r: CLIResult, timeout: Double) -> ActView {
+        if r.timedOut {
+            return .error("memmon did not answer within \(String(format: "%g", timeout)) s. It may still be finishing.")
+        }
+        if let e = r.launchError { return .error(e) }
+        let outcome = ActOutcome.decode(r.stdout)
+        guard let exit = r.exit else { return .error("memmon exited abnormally.") }
+        guard let o = outcome else {
+            return .error(exit == 1 ? "memmon reported an error." : "memmon's answer could not be read.")
+        }
+        switch (exit, o.result) {
+        case (0, "stopped"), (0, "force_stopped"), (0, "already_exited"), (0, "respawned"),
+             (3, "respawned"):
+            return .success(o)
+        case (3, "partial"):
+            return .partial(o)
+        case (4, "refused"):
+            return .refused(o)
+        case (1, _):
+            return .error(o.reason.map { "memmon reported an error: \($0)." } ?? "memmon reported an error.")
+        default:
+            return .error("memmon's answer did not match its exit status.")
+        }
+    }
+}
+
+// MARK: - quitting GUI apps
+
+/// What the quit flow needs from a running app. NSRunningApplication already
+/// has this shape; tests substitute a fake so no real app is ever touched.
+protocol RunningAppHandle: AnyObject {
+    var bundleIdentifier: String? { get }
+    var launchDate: Date? { get }
+    var isTerminated: Bool { get }
+    func terminate() -> Bool
+    func forceTerminate() -> Bool
+}
+
+extension NSRunningApplication: RunningAppHandle {}
+
+protocol AppControl {
+    func app(pid: Int32) -> RunningAppHandle?
+    func now() -> Double
+    func sleep(_ seconds: Double)
+}
+
+struct SystemApps: AppControl {
+    func app(pid: Int32) -> RunningAppHandle? { NSRunningApplication(processIdentifier: pid) }
+    func now() -> Double { ProcessInfo.processInfo.systemUptime }
+    func sleep(_ seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
+}
+
+struct AppTokenInstance { var pid: Int32; var launchDate: Double? }
+
+/// The quit-app token minted by owners --json: unsigned base64 JSON naming the
+/// bundle and each instance's PID and launch date.
+struct AppToken {
+    var bundleId: String
+    var instances: [AppTokenInstance]
+
+    static func decode(_ token: String) -> AppToken? {
+        var b64 = token.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              str(j["action"]) == "quit-app",
+              let bundle = str(j["bundle_id"]),
+              let list = j["instances"] as? [[String: Any]], !list.isEmpty else { return nil }
+        let instances = list.compactMap { i -> AppTokenInstance? in
+            guard let pid = int(i["pid"]) else { return nil }
+            return AppTokenInstance(pid: Int32(pid), launchDate: launchDate(i["launch_date"]))
+        }
+        guard instances.count == list.count else { return nil }
+        return AppToken(bundleId: bundle, instances: instances)
+    }
+}
+
+enum InstanceState: String {
+    case exited, running, changed
+    case alreadyExited = "already_exited"
+    case forceStopped = "force_stopped"
+    /// No NSRunningApplication for this PID: a helper or widget, not something
+    /// that can be asked to quit. It is never reported as quit.
+    case notAnApp = "not_an_app"
+    /// The final check by process identity could not be made.
+    case unverified
+
+    var done: Bool { self == .exited || self == .alreadyExited || self == .forceStopped }
+    var label: String {
+        switch self {
+        case .exited: return "quit"
+        case .running: return "still running"
+        case .changed: return "changed since the sample, not touched"
+        case .alreadyExited: return "had already quit"
+        case .forceStopped: return "force-quit"
+        case .notAnApp: return "is not an app memmon can quit, so it was left alone"
+        case .unverified: return "could not be verified"
+        }
+    }
+}
+
+struct InstanceOutcome {
+    var pid: Int32
+    var state: InstanceState
+}
+
+/// One instance as memmon's identity check saw it. `unverified` (its start
+/// time could not be read) is neither running nor exited, and is never
+/// reported as quit or force-quit.
+enum Live { case running, exited, unverified }
+
+/// Per-instance liveness by process identity, as `memmon act verify-app`
+/// reports it; nil when that check failed.
+typealias InstanceLiveness = [Int32: Live]
+
+struct QuitApp {
+    let control: AppControl
+    /// Asks memmon, by libproc identity, which instances are still running.
+    /// Only this decides that an instance has exited.
+    let verify: () -> InstanceLiveness?
+    var watch = 10.0
+    var poll = 0.2
+    var launchTolerance = 2.0
+
+    private enum Identity { case notAnApp, changed, same(RunningAppHandle) }
+
+    /// An instance is only touched while its bundle identifier and launch date
+    /// still match the token; a PID reused by anything else is left alone.
+    private func identity(_ i: AppTokenInstance, _ bundle: String) -> Identity {
+        guard let h = control.app(pid: i.pid) else { return .notAnApp }
+        guard h.bundleIdentifier == bundle,
+              let expected = i.launchDate, let actual = h.launchDate?.timeIntervalSince1970,
+              abs(actual - expected) <= launchTolerance else { return .changed }
+        return .same(h)
+    }
+
+    func quit(_ t: AppToken, alive initial: InstanceLiveness?) -> [InstanceOutcome] {
+        var out = t.instances.map { InstanceOutcome(pid: $0.pid, state: .running) }
+        var sent: [(Int, RunningAppHandle)] = []
+        var vanished: [Int] = []
+        for (k, inst) in t.instances.enumerated() {
+            switch initial?[inst.pid] {
+            case .exited?: out[k].state = .alreadyExited; continue
+            case .unverified?: out[k].state = .unverified; continue
+            default: break
+            }
+            switch identity(inst, t.bundleId) {
+            case .notAnApp: vanished.append(k)
+            case .changed: out[k].state = .changed
+            case .same(let h): _ = h.terminate(); sent.append((k, h))
+            }
+        }
+        settle(sent, t, &out, as: .exited, vanished: vanished, vanishedExit: .alreadyExited)
+        return out
+    }
+
+    /// forceTerminate() is a separate choice, and only for instances the quit
+    /// reported as still running.
+    func force(_ t: AppToken, after prior: [InstanceOutcome]) -> [InstanceOutcome] {
+        var out = prior
+        var sent: [(Int, RunningAppHandle)] = []
+        var vanished: [Int] = []
+        for (k, o) in prior.enumerated() where o.state == .running {
+            guard let inst = t.instances.first(where: { $0.pid == o.pid }) else { continue }
+            switch identity(inst, t.bundleId) {
+            case .notAnApp: vanished.append(k)
+            case .changed: out[k].state = .changed
+            case .same(let h): _ = h.forceTerminate(); sent.append((k, h))
+            }
+        }
+        settle(sent, t, &out, as: .forceStopped, vanished: vanished)
+        return out
+    }
+
+    /// Watches the signalled instances for up to `watch` seconds, then lets
+    /// memmon's identity check, not AppKit, decide which of them exited. An
+    /// instance AppKit has no app for (`vanished`) was not signalled: it
+    /// exited on its own (`vanishedExit`) or it is not reachable as an app.
+    private func settle(_ sent: [(Int, RunningAppHandle)], _ t: AppToken,
+                        _ out: inout [InstanceOutcome], as finished: InstanceState,
+                        vanished: [Int] = [], vanishedExit: InstanceState = .exited) {
+        guard !sent.isEmpty || !vanished.isEmpty else { return }
+        let deadline = control.now() + watch
+        var pending = sent
+        while true {
+            pending.removeAll { k, h in
+                if h.isTerminated { return true }
+                if case .same = identity(t.instances[k], t.bundleId) { return false }
+                return true
+            }
+            if pending.isEmpty || control.now() >= deadline { break }
+            control.sleep(poll)
+        }
+        let alive = verify()
+        for (k, _) in sent {
+            switch alive?[t.instances[k].pid] {
+            case .exited?: out[k].state = finished
+            case .running?: out[k].state = .running
+            case .unverified?, nil: out[k].state = .unverified
+            }
+        }
+        for k in vanished {
+            switch alive?[t.instances[k].pid] {
+            case .exited?: out[k].state = vanishedExit
+            case .running?: out[k].state = .notAnApp
+            case .unverified?, nil: out[k].state = .unverified
+            }
+        }
+    }
+}
+
+// MARK: - copy for outcomes
+
+struct Banner {
+    enum Tone { case success, warning, error }
+    var tone: Tone
+    var title: String
+    var body: String
+    var note: String?
+    var offersRefresh = false
+}
+
+enum Copy {
+    static let staleForce = "this result is more than 2 minutes old. Refresh and try again."
+
+    static func measured(_ o: ActOutcome) -> (String?, String?) {
+        guard let before = o.usedBefore, let after = o.usedAfter else { return (nil, nil) }
+        let drop = before - after
+        let text = drop >= 0.05 * GB
+            ? "used memory \(gb(drop)) lower at the next sample"
+            : "used memory not lower at the next sample"
+        return (text, "(measured; other apps also change)")
+    }
+
+    static func refusal(_ reason: String?, noun: String, forcing: Bool) -> (String, Bool) {
+        switch reason {
+        case "stale_token" where forcing:
+            return (staleForce, true)
+        case "target_changed", "ownership_changed", "stale_token", "instance_changed", "lease_mismatch":
+            return ("this \(noun) changed since the list was sampled. Refresh and try again.", true)
+        case "busy":
+            return ("another stop is still in progress. Try again in a moment.", false)
+        case "protected":
+            return ("this \(noun) is protected: it is the session itself or belongs to another owner.", false)
+        case "degraded_identity":
+            return ("process identity is unavailable (limited inventory), so nothing can be stopped safely.", false)
+        case "hosts_sessions":
+            return ("this app hosts agent sessions; quit it from the app itself.", false)
+        case "not_stoppable":
+            return ("memmon cannot stop this kind of owner.", false)
+        case "attributed":
+            return ("this process now belongs to a session or app. Refresh and try again.", true)
+        case "bad_token", "bad_args", "unknown_action", "wrong_action":
+            return ("memmon could not read this request; nothing was signalled. Refresh and try again.", true)
+        case "bad_lock_fd":
+            return ("memmon could not confirm it held the action lock, so nothing was signalled. Try again.", false)
+        case let r?:
+            return ("memmon declined (\(r.replacingOccurrences(of: "_", with: " "))).", false)
+        default:
+            return ("memmon declined.", false)
+        }
+    }
+
+    /// `kept` lists owner ids left running inside what was stopped: nested
+    /// agent sessions, or an app or VM started from it.
+    static func keptParts(_ kept: [String]) -> [String] {
+        let sessions = kept.filter { id in ["claude:", "codex:", "codex-proc:"].contains { id.hasPrefix($0) } }.count
+        let others = kept.count - sessions
+        let names = [sessions > 0 ? plural(sessions, "nested session") : nil,
+                     others > 0 ? plural(others, "app or service", "apps or services") : nil].compactMap { $0 }
+        return names.isEmpty ? [] : [names.joined(separator: " and ") + " kept running"]
+    }
+
+    /// Survivors are never reported as success: whatever the result word, a
+    /// listed survivor makes the banner a partial one.
+    static func partial(_ o: ActOutcome, subject: String) -> Banner {
+        let running = o.remaining - o.runnerRows
+        let left = plural(running, "process", "processes")
+        switch o.reason {
+        case "root_exited":
+            return Banner(tone: .warning, title: "\(subject) had exited",
+                          body: "— but \(o.remaining) of its processes are still running · nothing was signalled",
+                          offersRefresh: true)
+        case "outside_force":
+            return Banner(tone: .warning, title: "\(subject) partly stopped",
+                          body: "· " + (o.forceParts + o.outsideParts).joined(separator: " · "),
+                          offersRefresh: true)
+        default:
+            let force = o.killed != nil ? o.forceParts : []
+            let unlisted = o.observedUnlisted > 0
+                ? ["\(o.observedUnlisted) more still running that memmon could not list"] : []
+            let runners = o.runnerRows > 0 ? [ActOutcome.runnerText(o.runnerRows)] : []
+            let still = running > 0 ? ["\(left) still running"] : []
+            return Banner(tone: .warning, title: "\(subject) partly stopped",
+                          body: "· " + (force + still + unlisted + runners).joined(separator: " · "),
+                          offersRefresh: true)
+        }
+    }
+
+    static func banner(_ view: ActView, subject: String, noun: String, forcing: Bool = false) -> Banner {
+        var b = outcomeBanner(view, subject: subject, noun: noun, forcing: forcing)
+        if case .success(let o) = view, o.watchError != nil {
+            let gap = "memmon could not keep watching for a restart"
+            if let n = b.note, n.hasSuffix(")") { b.note = n.dropLast() + "; \(gap))" } else {
+                b.note = [b.note, "(\(gap))"].compactMap { $0 }.joined(separator: " · ")
+            }
+        }
+        return b
+    }
+
+    private static func outcomeBanner(_ view: ActView, subject: String, noun: String, forcing: Bool) -> Banner {
+        switch view {
+        case .success(let o):
+            if o.remaining > 0 || o.observedUnlisted > 0 { return partial(o, subject: subject) }
+            let (m, note) = measured(o)
+            var parts: [String] = []
+            let title: String
+            switch o.result {
+            case "already_exited":
+                title = "\(subject) had already exited"
+                parts.append("nothing was signalled")
+            case "respawned":
+                // The worker came back under the same job, so nothing is
+                // left to force; the honest outcome is that it runs again.
+                return Banner(tone: .warning, title: "Session restarted by Claude",
+                              body: "— it is running again.", offersRefresh: true)
+            case "force_stopped":
+                title = "\(subject) force-stopped"
+            default:
+                title = "\(subject) stopped"
+            }
+            if o.result == "force_stopped", let k = o.killed {
+                // The title already says force-stopped; the body splits what
+                // Force ended from what had ended by itself.
+                parts.append("\(k) ended by force")
+                parts += o.goneParts
+            } else if let n = o.exited, o.result != "already_exited" {
+                parts.append("\(n) of \(o.captured ?? n + o.remaining) processes exited")
+            }
+            parts += keptParts(o.kept)
+            if let m { parts.append(m) }
+            return Banner(tone: .success, title: title, body: "· " + parts.joined(separator: " · "), note: note)
+        case .refused(let o):
+            let (text, refresh) = refusal(o.reason, noun: noun, forcing: forcing)
+            let verb = noun == "app" ? "quit" : "stopped"
+            return Banner(tone: .warning, title: forcing ? "Not force-\(verb)" : "Not \(verb)",
+                          body: "— " + text, offersRefresh: refresh)
+        case .partial(let o):
+            return partial(o, subject: subject)
+        case .error(let message):
+            return Banner(tone: .error, title: "Result unknown",
+                          body: "— \(message) Refresh to see what is still running.", offersRefresh: true)
+        }
+    }
+
+    static func appBanner(_ title: String, _ results: [InstanceOutcome], forced: Bool) -> Banner {
+        let n = results.count
+        let done = results.filter { $0.state.done }.count
+        let detail = results.enumerated().map { k, r in "instance \(k + 1) \(r.state.label)" }
+            .joined(separator: " · ")
+        if done == n {
+            // Force-quit only if Force actually ended one; the re-check before
+            // it may have found every instance already gone.
+            let usedForce = forced && results.contains { $0.state == .forceStopped }
+            return Banner(tone: .success, title: usedForce ? "\(title) force-quit" : "\(title) quit",
+                          body: (forced && !usedForce ? "· nothing needed forcing " : "")
+                              + "· \(done) of \(n) instances exited · " + detail,
+                          note: "(used memory updates at the next sample)")
+        }
+        if results.contains(where: { $0.state == .running }) {
+            return Banner(tone: .warning, title: "\(title) still running",
+                          body: "— " + detail, offersRefresh: true)
+        }
+        // Retrying only helps an instance that changed or could not be checked.
+        let retry = results.contains { $0.state == .changed || $0.state == .unverified }
+        return Banner(tone: .warning, title: "Not fully quit",
+                      body: "— " + detail + (retry ? ". Refresh and try again." : "."), offersRefresh: true)
+    }
+}
+
+// MARK: - view model
+
+struct ConfirmRequest {
+    enum Kind {
+        case job(OwnerJob)
+        case endSession
+        case quitApp
+        case stopCommand
+    }
+    enum Phase {
+        case ask
+        case working
+        case partial(ActOutcome)
+        /// `token` is the one memmon minted at its last check, which Force
+        /// re-verifies before signalling. `watchEnded` is when the 10 s watch
+        /// finished, on a clock that keeps running through sleep; Force is
+        /// refused once that is more than 120 s ago.
+        case appPartial(AppToken, [InstanceOutcome], token: String, watchEnded: Double)
+    }
+    var kind: Kind
+    var owner: Owner
+    var phase: Phase = .ask
+    /// The pending result came from Force, so a refusal is about Force.
+    var forcing = false
+}
+
+final class Model: ObservableObject {
+    @Published var snap: OwnersSnap?
+    @Published var loadError: String?
+    @Published var refreshing = false
+    /// A scan that timed out is still running; no second one is started.
+    @Published var stillSampling = false
+    @Published var sort: SortKey = .memory
+    @Published var expanded: String?
+    /// Sections the user opened or closed; the rest use openByDefault.
+    @Published var sectionOpen: [OwnerSection: Bool] = [:]
+    /// Sections showing every row instead of the first six.
+    @Published var showAll: Set<OwnerSection> = []
+    /// A section the ring's legend asked to bring into view.
+    @Published var scrollTarget: OwnerSection?
+    /// The ring legend's Free row is expanded into its parts.
+    @Published var freeOpen = false
+    func toggleFree() { freeOpen.toggle() }
+    @Published var techOpen: Set<String> = []
+    @Published var confirm: ConfirmRequest?
+    @Published var banner: Banner?
+    @Published var tick = 0
+
+    var appControl: AppControl = SystemApps()
+    /// Off for fixtures: a rendered or audited state must never call memmon.
+    /// Confirmed actions are recorded in `actionLog` instead.
+    var live = true
+    var actionLog: [String] = []
+    /// Which overlay button holds keyboard focus, as reported by the overlay.
+    var overlayFocus: String?
+
+    /// The row the user is looking at, or acting on, is never hidden inside a
+    /// collapsed section or behind "Show N more".
+    func holds(_ o: Owner) -> Bool {
+        o.id == expanded || o.id == confirm?.owner.id
+    }
+
+    func isOpen(_ sec: OwnerSection, _ rows: [Owner]) -> Bool {
+        if rows.contains(where: holds) { return true }
+        return sectionOpen[sec] ?? sec.openByDefault
+    }
+
+    func toggle(_ sec: OwnerSection, _ rows: [Owner]) {
+        if isOpen(sec, rows) {
+            sectionOpen[sec] = false
+            if rows.contains(where: { $0.id == expanded }) { expanded = nil }
+        } else {
+            sectionOpen[sec] = true
+        }
+    }
+
+    /// The rows an open section shows, and how many "Show N more" hides.
+    func visible(_ sec: OwnerSection, _ rows: [Owner]) -> ([Owner], Int) {
+        let cap = OwnerSection.cap
+        guard rows.count > cap, !showAll.contains(sec),
+              !rows.dropFirst(cap).contains(where: holds) else { return (rows, 0) }
+        return (Array(rows.prefix(cap)), rows.count - cap)
+    }
+
+    /// The clock the app-Force age bound reads. CLOCK_MONOTONIC keeps
+    /// counting while the Mac sleeps, unlike systemUptime; tests move it.
+    var clock: () -> Double = { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9 }
+    /// Whether the popover is on screen. A partial result that lands while it
+    /// is closed becomes a banner, never a Force overlay waiting to be found.
+    var popoverShown = true
+    static let forceTTL = 120.0
+    private var ticker: Timer?
+    private var scannerBusy = false
+    private var refreshQueued = false
+    /// Every owners scan spawned, for the single-flight self-test.
+    var scansStarted = 0
+
+    /// Keeps "Sampled Ns ago" honest while the popover stays open.
+    func startTicking(every seconds: Double = 5) {
+        ticker?.invalidate()
+        ticker = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in
+            self?.tick += 1
+        }
+    }
+
+    func stopTicking() { ticker?.invalidate(); ticker = nil }
+
+    var loaded: Bool { snap != nil }
+
+    /// Full sync. The previous snapshot stays on screen meanwhile so the UI never
+    /// blanks; a failure keeps it and says so instead of silently ageing.
+    ///
+    /// Single flight: while a scan (even a timed-out one) is still running, a
+    /// request is queued and runs once that scan ends, so a post-action refresh
+    /// is never dropped and scanners never pile up on a loaded machine.
+    func refresh() {
+        guard live else { return }
+        if refreshing || scannerBusy { refreshQueued = true; return }
+        refreshing = true
+        scannerBusy = true
+        scansStarted += 1
+        // Listening-port lookups cost CPU, so memmon only runs them for the
+        // owner that is open here; that is what tells a server from a build.
+        var args = ["owners", "--json", "--cpu-window", "1.0"]
+        if let open = expanded, open != "unknown:*" { args += ["--expand", open] }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout, onExit: {
+                DispatchQueue.main.async {
+                    self.scannerBusy = false
+                    self.stillSampling = false
+                    // The scan this error was about has ended.
+                    if self.loadError?.hasSuffix(Model.stillSamplingNote) == true { self.loadError = nil }
+                    self.runQueued()
+                }
+            })
+            var parsed: OwnersSnap?
+            var failure: String?
+            if r.timedOut {
+                failure = "memmon did not answer within \(String(format: "%g", CLI.ownersTimeout)) s"
+            } else if let e = r.launchError {
+                failure = e
+            } else if let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any],
+                      let s = OwnersSnap.decode(j) {
+                parsed = s
+            } else {
+                failure = r.exit == 0 ? "memmon's answer could not be read" : "memmon reported an error"
+            }
+            DispatchQueue.main.async {
+                if let parsed {
+                    self.snap = parsed; self.loadError = nil
+                    self.rebindConfirm(parsed)
+                } else {
+                    // Only while that scan is still running: its reaper may
+                    // already have run.
+                    self.loadError = (failure ?? "") + (r.timedOut && self.scannerBusy ? Model.stillSamplingNote : "")
+                }
+                self.refreshing = false
+                self.stillSampling = self.scannerBusy
+                self.runQueued()
+            }
+        }
+    }
+
+    static let stillSamplingNote = "; it is still sampling"
+
+    /// A confirm still being asked about follows the fresh list: the same
+    /// owner (same root, same instances, same job) gets the new token; one
+    /// that changed or left is closed rather than acted on with an old token.
+    func rebindConfirm(_ s: OwnersSnap) {
+        guard var c = confirm, case .ask = c.phase else { return }
+        let fresh = s.owners.first { $0.id == c.owner.id }
+        func same(_ a: Owner, _ b: Owner) -> Bool {
+            a.rootPid == b.rootPid && a.rootStart == b.rootStart
+                && a.instances?.map { $0.pid } == b.instances?.map { $0.pid }
+        }
+        guard let o = fresh, same(o, c.owner) else {
+            confirm = nil
+            banner = Banner(tone: .warning, title: "Nothing done",
+                            body: "— \(c.owner.title) changed while this was open. Check the list and try again.")
+            return
+        }
+        switch c.kind {
+        case .job(let j) where j.kind == "managed" && j.id == o.id:
+            // A top-level `memmon run` job is the owner itself, not a row of
+            // o.jobs: it follows the owner's own token.
+            guard o.can("stop-managed-job") else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(o.title) can no longer be stopped from here. Check the list and try again.")
+                return
+            }
+            c.kind = .job(OwnerJob(id: o.id, kind: "managed", label: o.title,
+                                   token: o.token, action: "stop-managed-job"))
+        case .job(let j):
+            guard let nj = o.jobs.first(where: { $0.id == j.id }) else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(j.label) is no longer running in \(o.title).")
+                return
+            }
+            // A build that turned out to be a server (or back) is a different
+            // stop: the confirm the user read no longer describes it.
+            guard nj.stopAction == j.stopAction else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Nothing done",
+                                body: "— \(j.label) changed while this was open. Check the list and try again.")
+                return
+            }
+            c.kind = .job(nj)
+        case .quitApp:
+            // Only quit-app can lose its action on the same instances: the
+            // app has started hosting agent sessions since it was listed.
+            guard o.can("quit-app") else {
+                confirm = nil
+                banner = Banner(tone: .warning, title: "Not quit",
+                                body: o.hosts.isEmpty
+                                    ? "— memmon no longer offers a quit for \(o.title). Check the list and try again."
+                                    : "— \(o.title) now hosts agent sessions; quit it from the app itself.")
+                return
+            }
+        case .endSession, .stopCommand:
+            break
+        }
+        c.owner = o
+        confirm = c
+    }
+
+    private func runQueued() {
+        guard refreshQueued, !refreshing, !scannerBusy else { return }
+        refreshQueued = false
+        refresh()
+    }
+
+    /// A legend row opens its section and scrolls the list to it.
+    func openFromLegend(_ sec: OwnerSection) {
+        sectionOpen[sec] = true
+        scrollTarget = sec
+    }
+
+    func dismissBlocked(_ id: String) {
+        // One argv for both paths, so a fixture logs exactly what memmon would get.
+        let args = ["--dismiss-blocked", id]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = CLI.run(args, timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    func toggleGate(_ pause: Bool) {
+        guard live else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = CLI.run([pause ? "--off" : "--on"], timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    func ask(_ kind: ConfirmRequest.Kind, _ owner: Owner) {
+        banner = nil
+        confirm = ConfirmRequest(kind: kind, owner: owner)
+    }
+
+    /// Cancel, Leave running or Esc. Leaving a partial result says what was
+    /// left running instead of dropping the outcome.
+    func cancel() {
+        guard let c = confirm else { return }
+        if case .working = c.phase { return }
+        confirm = nil
+        switch c.phase {
+        case .partial(let o):
+            banner = Copy.partial(o, subject: subject(c).0)
+            refresh()
+        case .appPartial(_, let results, _, _):
+            banner = Copy.appBanner(c.owner.title, results, forced: false)
+            refresh()
+        default:
+            break
+        }
+    }
+
+    func subject(_ c: ConfirmRequest) -> (String, String) {
+        switch c.kind {
+        case .job(let j):
+            let noun = j.kind == "server" ? "server" : (j.kind == "test" ? "test run" : "build")
+            return (j.displayName.components(separatedBy: " · ").first ?? j.label, noun)
+        case .endSession: return (c.owner.title, "session")
+        case .quitApp, .stopCommand: return (c.owner.title, "app")
+        }
+    }
+
+    func perform() {
+        guard var c = confirm else { return }
+        guard live else { actionLog.append("perform"); return }
+        switch c.kind {
+        case .stopCommand:
+            confirm = nil
+            return
+        case .quitApp:
+            guard let tok = c.owner.token, let t = AppToken.decode(tok) else {
+                confirm = nil
+                banner = Banner(tone: .error, title: "Not quit",
+                                body: "— the quit request could not be read. Refresh and try again.",
+                                offersRefresh: true)
+                return
+            }
+            c.phase = .working; confirm = c
+            let control = appControl
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Model.quitApp(token: tok, parsed: t, control: control)
+                DispatchQueue.main.async { self.applyApp(result, c, t, forced: false) }
+            }
+        case .job(let j):
+            run(["act", j.stopAction, "--target", j.token ?? ""], c)
+        case .endSession:
+            run(["act", "end-session", "--target", c.owner.token ?? ""], c)
+        }
+    }
+
+    func force() {
+        guard var c = confirm else { return }
+        if case .appPartial(_, _, _, let ended) = c.phase, clock() - ended > Model.forceTTL {
+            confirm = nil
+            banner = Banner(tone: .warning, title: "Not force-quit",
+                            body: "— " + Copy.staleForce, offersRefresh: true)
+            refresh()
+            return
+        }
+        guard live else { actionLog.append("force"); return }
+        c.forcing = true
+        switch c.phase {
+        case .partial(let o):
+            guard let tok = o.forceToken else { cancel(); return }
+            run(["act", "force", "--target", tok], c)
+        case .appPartial(let t, let prior, let tok, _):
+            c.phase = .working; confirm = c
+            let control = appControl
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Model.forceApp(token: tok, t, prior, control: control)
+                DispatchQueue.main.async { self.applyApp(result, c, t, forced: true) }
+            }
+        default:
+            break
+        }
+    }
+
+    private func run(_ args: [String], _ c: ConfirmRequest) {
+        var c = c
+        c.phase = .working; confirm = c
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = CLI.run(args, timeout: CLI.actTimeout)
+            let view = ActView.classify(r, timeout: CLI.actTimeout)
+            DispatchQueue.main.async { self.apply(view, c) }
+        }
+    }
+
+    func apply(_ view: ActView, _ c: ConfirmRequest) {
+        if !c.forcing, popoverShown, case .partial(let o) = view, o.forceToken != nil,
+           o.forceSplit.forceable > 0 {
+            var next = c
+            next.phase = .partial(o)
+            confirm = next
+            return
+        }
+        let (subject, noun) = self.subject(c)
+        confirm = nil
+        banner = Copy.banner(view, subject: subject, noun: noun, forcing: c.forcing)
+        refresh()
+    }
+
+    /// The overlay is not kept across a closed popover: a partial result
+    /// reopened later would offer a Force on a stale picture.
+    func popoverClosed() {
+        popoverShown = false
+        if case .working? = confirm?.phase { return }
+        if confirm != nil { cancel() }
+    }
+
+    enum AppResult {
+        case refused(ActOutcome)
+        case error(String)
+        /// `token` is the one minted by memmon's last check, for a later Force.
+        case done([InstanceOutcome], token: String)
+    }
+
+    /// verify-app with the held lock's descriptor inherited.
+    static func verifyApp(_ token: String, fd: Int32) -> ActView {
+        verifyView(CLI.run(["act", "verify-app", "--target", token, "--lock-fd", "\(fd)"],
+                           timeout: CLI.actTimeout, inheritFD: fd))
+    }
+
+    /// Liveness from a verify-app answer: every instance gone, or the
+    /// per-instance statuses; nil when memmon could not say.
+    static func liveness(_ view: ActView, _ t: AppToken) -> InstanceLiveness? {
+        guard case .success(let o) = view else { return nil }
+        if o.result == "already_exited" {
+            // memmon found nothing running: every instance is gone, except
+            // one whose start it could not read.
+            return Dictionary(uniqueKeysWithValues: t.instances.map {
+                ($0.pid, o.alive?[$0.pid] == .unverified ? Live.unverified : Live.exited)
+            })
+        }
+        return o.alive
+    }
+
+    /// Each verify-app answer carries a fresh token; the next check uses it,
+    /// so a post-watch or pre-Force check is never refused for the age of
+    /// the list the user first saw.
+    final class TokenChain {
+        private(set) var current: String
+        init(_ token: String) { current = token }
+        func verify(fd: Int32) -> ActView {
+            let v = verifyApp(current, fd: fd)
+            if case .success(let o) = v, let t = o.token { current = t }
+            return v
+        }
+    }
+
+    /// Lock, have memmon verify every instance, quit and watch, then have
+    /// memmon check again by process identity, all while holding the lock.
+    static func quitApp(token: String, parsed: AppToken, control: AppControl,
+                        watch: Double = 10) -> AppResult {
+        switch ActionsLock.acquire() {
+        case .busy:
+            return .refused(ActOutcome(result: "refused", reason: "busy"))
+        case .failed(let e):
+            return .error(e)
+        case .held(let fd):
+            defer { ActionsLock.release(fd) }
+            let chain = TokenChain(token)
+            let first = chain.verify(fd: fd)
+            switch first {
+            case .refused(let o): return .refused(o)
+            case .error(let e): return .error(e)
+            default: break
+            }
+            let engine = QuitApp(control: control, verify: { liveness(chain.verify(fd: fd), parsed) },
+                                 watch: watch)
+            let out = engine.quit(parsed, alive: liveness(first, parsed))
+            return .done(out, token: chain.current)
+        }
+    }
+
+    static func verifyView(_ r: CLIResult) -> ActView {
+        if r.timedOut { return .error("memmon did not answer within \(String(format: "%g", CLI.actTimeout)) s.") }
+        if let e = r.launchError { return .error(e) }
+        guard let o = ActOutcome.decode(r.stdout), let exit = r.exit else {
+            return .error("memmon's answer could not be read.")
+        }
+        switch (exit, o.result) {
+        case (0, "verified"), (0, "already_exited"): return .success(o)
+        case (4, "refused"): return .refused(o)
+        default: return .error("memmon could not verify the app.")
+        }
+    }
+
+    static func forceApp(token: String, _ t: AppToken, _ prior: [InstanceOutcome],
+                         control: AppControl, watch: Double = 10) -> AppResult {
+        switch ActionsLock.acquire() {
+        case .busy: return .refused(ActOutcome(result: "refused", reason: "busy"))
+        case .failed(let e): return .error(e)
+        case .held(let fd):
+            defer { ActionsLock.release(fd) }
+            // memmon checks every instance again, under this lock, right
+            // before anything is force-quit: a refusal means nothing is signalled.
+            let chain = TokenChain(token)
+            let pre = chain.verify(fd: fd)
+            switch pre {
+            case .refused(let o): return .refused(o)
+            case .error(let e): return .error(e)
+            default: break
+            }
+            var before = prior
+            if let alive = liveness(pre, t) {
+                // Gone since the quit: nothing to force. Unreadable: not
+                // touched, and never reported as force-quit.
+                for k in before.indices where before[k].state == .running {
+                    switch alive[before[k].pid] {
+                    case .exited?: before[k].state = .exited
+                    case .unverified?: before[k].state = .unverified
+                    default: break
+                    }
+                }
+            }
+            let engine = QuitApp(control: control, verify: { liveness(chain.verify(fd: fd), t) },
+                                 watch: watch)
+            return .done(engine.force(t, after: before), token: chain.current)
+        }
+    }
+
+    func applyApp(_ result: AppResult, _ c: ConfirmRequest, _ t: AppToken, forced: Bool) {
+        switch result {
+        case .refused(let o):
+            confirm = nil
+            banner = Copy.banner(.refused(o), subject: c.owner.title, noun: "app", forcing: forced)
+        case .error(let e):
+            confirm = nil
+            banner = Copy.banner(.error(e), subject: c.owner.title, noun: "app")
+        case .done(let outcomes, let token):
+            if !forced, popoverShown, outcomes.contains(where: { $0.state == .running }) {
+                var next = c
+                next.phase = .appPartial(t, outcomes, token: token, watchEnded: clock())
+                confirm = next
+                return
+            }
+            confirm = nil
+            banner = Copy.appBanner(c.owner.title, outcomes, forced: forced)
+        }
+        refresh()
+    }
+}
+
 // MARK: - building blocks
 
-struct Card<Content: View>: View {
-    var tint: Color = P.stroke
-    @ViewBuilder var content: Content
-    var body: some View {
-        content
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 14).fill(P.card))
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(tint, lineWidth: 1))
-    }
-}
-
-struct Badge: View {
+struct Chip: View {
     var text: String
-    var color: Color
+    var tint: Color? = nil
     var body: some View {
-        Text(text.uppercased())
-            .font(.system(size: 9, weight: .heavy, design: .rounded))
-            .tracking(0.4)
-            .foregroundColor(color)
-            .lineLimit(1).minimumScaleFactor(0.72)
-            .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(Capsule().fill(color.opacity(0.16)))
+        Text(text)
+            .font(ft(11))
+            .foregroundColor(tint ?? P.muted)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 6)
+            .frame(height: 16)
+            .background(Capsule().fill(tint.map { $0.opacity(0.16) } ?? P.soft))
     }
 }
 
-struct Meter: View {
-    var value: Double            // 0…1
-    var tint: Color
-    var height: CGFloat = 5
+struct ConfidenceChip: View {
+    var confidence: String?
     var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.09))
-                Capsule()
-                    .fill(LinearGradient(colors: [tint.opacity(0.75), tint],
-                                         startPoint: .leading, endPoint: .trailing))
-                    .frame(width: max(2, g.size.width * min(max(value, 0), 1)))
-            }
-        }
-        .frame(height: height)
-    }
-}
-
-/// The big RAM / SWAP tiles.
-struct StatTile: View {
-    var icon: String, label: String
-    var value: String, unit: String, caption: String
-    var progress: Double, tint: Color
-    var badge: String?
-    var body: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: icon).font(.system(size: 10, weight: .bold))
-                        .foregroundColor(tint)
-                    Text(label.uppercased())
-                        .font(.system(size: 9, weight: .heavy, design: .rounded))
-                        .tracking(0.5).foregroundColor(P.dim)
-                    Spacer(minLength: 4)
-                    if let badge { Badge(text: badge, color: tint) }
-                }
-                HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(value)
-                        .font(.system(size: 27, weight: .bold, design: .rounded))
-                        .foregroundColor(P.text)
-                    Text(unit).font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(P.dim)
-                }
-                Meter(value: progress, tint: tint)
-                Text(caption).font(.system(size: 9.5)).foregroundColor(P.faint)
-                    .lineLimit(1)
-            }
-        }
+        let c = confidence ?? "unknown"
+        Chip(text: c.capitalized)
+            .accessibilityElement()
+            .accessibilityLabel("ownership confidence: \(c)")
     }
 }
 
@@ -503,651 +1946,1846 @@ struct Chevron: View {
     var open: Bool
     var body: some View {
         Image(systemName: "chevron.right")
-            .font(.system(size: 8, weight: .black))
-            .foregroundColor(P.faint)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(P.muted)
             .rotationEffect(.degrees(open ? 90 : 0))
     }
 }
 
-/// Collapsible section. Everything below the top two tiles lives in one of
-/// these so a machine with 11 sessions is still readable in a 620pt popover.
-struct Section<Content: View>: View {
+struct ActionButton: View {
+    enum Variant { case primary, danger, secondaryDanger, secondary, link, icon }
     var title: String
-    var count: Int
-    var tint: Color = P.dim
-    @Binding var open: Bool
-    @ViewBuilder var content: Content
+    var icon: String? = nil
+    var variant: Variant = .secondary
+    var action: () -> Void
+    @State private var hover = false
+
+    private var fg: Color {
+        switch variant {
+        case .primary, .danger: return P.onTint
+        case .secondaryDanger: return P.red
+        case .secondary: return P.text
+        case .link, .icon: return hover ? P.text : P.muted
+        }
+    }
+    private var fill: Color {
+        switch variant {
+        case .primary: return P.accent
+        case .danger: return P.red
+        case .secondary, .secondaryDanger: return hover ? P.selected : P.soft
+        case .link, .icon: return .clear
+        }
+    }
+    private var outlined: Bool { variant == .secondary || variant == .secondaryDanger }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Button { withAnimation(.easeInOut(duration: 0.16)) { open.toggle() } } label: {
-                HStack(spacing: 6) {
-                    Chevron(open: open)
-                    Text(title.uppercased())
-                        .font(.system(size: 9, weight: .heavy, design: .rounded))
-                        .tracking(0.7).foregroundColor(tint)
-                    Spacer()
-                    Text("\(count)")
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundColor(tint.opacity(0.9))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(tint.opacity(0.15)))
-                }
-                .contentShape(Rectangle())
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if let icon { Image(systemName: icon).font(.system(size: 11, weight: .semibold)) }
+                if variant != .icon { Text(title).font(ft(12)).lineLimit(1) }
             }
-            .buttonStyle(.plain)
-            if open { content }
+            .foregroundColor(fg)
+            .padding(.horizontal, variant == .icon ? 4 : (variant == .link ? 6 : 11))
+            .padding(.vertical, variant == .icon ? 4 : 6)
+            .background(RoundedRectangle(cornerRadius: 8).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(outlined ? P.border : .clear, lineWidth: 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .onHover { hover = $0 }
+        .accessibilityLabel(title)
+    }
+}
+
+/// The installed app's own icon, looked up locally by bundle id. Only the
+/// running app enables it; renders and tests keep the glyphs, so their
+/// pictures do not depend on what this Mac has installed.
+/// What only the running app turns on; renders and probes stay deterministic.
+func enableLiveOnlyFeatures() { AppIcons.enabled = true }
+
+enum AppIcons {
+    static var enabled = false
+    private static var cache: [String: NSImage?] = [:]
+
+    static func icon(for owner: Owner) -> NSImage? {
+        guard enabled, owner.id.hasPrefix("app:") || owner.kind == "service" else { return nil }
+        let bundle = owner.id.hasPrefix("app:") ? String(owner.id.dropFirst(4)) : nil
+        guard let bundle, !bundle.isEmpty else { return nil }
+        if let hit = cache[bundle] { return hit }
+        let image = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle)
+            .map { NSWorkspace.shared.icon(forFile: $0.path) }
+        cache[bundle] = image
+        return image
+    }
+}
+
+struct OwnerIcon: View {
+    var owner: Owner
+    var selected: Bool
+    /// The tile's side; the compact list row uses a smaller one.
+    var size: CGFloat = 32
+    var symbol: String {
+        if !owner.group.isEmpty || owner.isUnattributed { return "questionmark" }
+        switch owner.category {
+        case "browser": return "globe"
+        case "dev": return "chevron.left.forwardslash.chevron.right"
+        case "app": return "macwindow"
+        default: break
+        }
+        switch owner.agent {
+        case "claude", "job": return "terminal"
+        case "codex": return "curlybraces"
+        case "app": return "globe"
+        case "service": return "shippingbox"
+        default: return "questionmark"
+        }
+    }
+    var body: some View {
+        if let icon = AppIcons.icon(for: owner) {
+            Image(nsImage: icon)
+                .resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.41, weight: .medium))
+                .foregroundColor(selected ? P.accent : P.muted)
+                .frame(width: size, height: size)
+                .background(RoundedRectangle(cornerRadius: size * 0.28).fill(P.panel))
+                .overlay(RoundedRectangle(cornerRadius: size * 0.28).stroke(P.border, lineWidth: 1))
+                .accessibilityHidden(true)
         }
     }
 }
 
-/// Without this nothing in the card explains itself — the dot colours and the
-/// pink outline both had to be asked about.
-struct Legend: View {
-    private let items: [(Color, String)] = [
-        (P.green, "completed"), (P.dim, "working"),
-        (P.amber, "idle"), (P.blue, "terminal"),
-    ]
+/// The right-hand column: the sort metric first, then memory or CPU, and a
+/// visible reason wherever a value is unavailable — never a zero.
+struct UsageColumn: View {
+    var owner: Owner
+    var sort: SortKey
+
+    private var memText: String { owner.footprint.map(gb) ?? "— \(memReason)" }
+    private var memReason: String { owner.footprintReason ?? "not measured" }
+    private var cpuReason: String { owner.cpuReason ?? "warming up" }
+    /// Nothing about the owner could be measured: one state, not two reasons.
+    private var unmeasured: Bool { owner.footprint == nil && owner.cpu == nil }
+
+    var lines: (String, String, String?) {
+        // Same slots as any other row: the missing figures, then one reason.
+        if unmeasured {
+            return ("—", sort == .cpu ? "— GB" : "— cores", "memory and CPU \(memReason)")
+        }
+        switch sort {
+        case .memory:
+            if owner.footprint == nil { return ("—", owner.cpu.map(coresText) ?? "— cores", memReason) }
+            return (memText, owner.cpu.map(coresText) ?? "— cores",
+                    owner.cpu == nil ? "CPU \(cpuReason)" : nil)
+        case .cpu:
+            if let c = owner.cpu { return (coresText(c), memText, nil) }
+            return ("—", memText, "CPU \(cpuReason)")
+        }
+    }
+
+    var spoken: String {
+        let mem = owner.footprint.map { $0 < 0.05 * GB ? "less than 0.1 GB" : gb($0) }
+            ?? "memory not available, \(memReason)"
+        let cpu = owner.cpu.map(coresText) ?? "CPU not available, \(cpuReason)"
+        if unmeasured { return "memory and CPU not available, \(memReason)" }
+        switch sort {
+        case .memory: return "\(mem), \(cpu)"
+        case .cpu: return "\(cpu), \(mem)"
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 9) {
-                ForEach(items, id: \.1) { c, label in
-                    HStack(spacing: 3) {
-                        Circle().fill(c).frame(width: 5, height: 5)
-                        Text(label).font(.system(size: 8.5)).foregroundColor(P.faint)
-                    }
-                }
-            }
-            HStack(spacing: 4) {
-                RoundedRectangle(cornerRadius: 2)
-                    .stroke(P.red.opacity(0.6), lineWidth: 1)
-                    .frame(width: 12, height: 7)
-                Text("outlined = over half its memory is swapped to disk")
-                    .font(.system(size: 8.5)).foregroundColor(P.faint)
+        let (primary, secondary, reason) = lines
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(primary).font(ft(16, .medium)).foregroundColor(P.text)
+            Text(secondary).font(ft(12)).foregroundColor(P.muted)
+                .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
+            if let reason {
+                Text(reason).font(ft(11)).foregroundColor(P.muted)
+                    .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.bottom, 1)
+        .monospacedDigit()
+    }
+}
+
+/// One line per owner: icon, title, a short status and the sort metric.
+/// Everything the old three-line row said stays in the accessibility label;
+/// the rest is in the inline detail the row opens.
+struct OwnerRow: View {
+    var owner: Owner
+    var sort: SortKey
+    var expanded: Bool
+    var onTap: () -> Void
+
+    /// What it is doing, or what it is when nothing is known.
+    var status: String {
+        if !owner.group.isEmpty { return plural(owner.memberCount ?? owner.group.count, "process", "processes") }
+        return owner.activity ?? owner.agentLabel
+    }
+
+    var body: some View {
+        let usage = UsageColumn(owner: owner, sort: sort)
+        // A measured helper of a few MB is not zero.
+        let tiny = sort == .memory && (owner.footprint ?? 1 * GB) < 0.05 * GB
+        let metric = tiny ? "< 0.1 GB" : usage.lines.0
+        Button(action: onTap) {
+            HStack(spacing: 8) {
+                OwnerIcon(owner: owner, selected: expanded, size: 18)
+                // The status truncates, but only while some of it still fits:
+                // a lone "…" says nothing, so then the title shows alone.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        Text(owner.title).font(ft(12)).foregroundColor(P.text)
+                            .lineLimit(1).fixedSize()
+                        Text(status).font(ft(11)).foregroundColor(P.muted)
+                            .lineLimit(1).truncationMode(.tail)
+                            .frame(minWidth: 60, idealWidth: 60, maxWidth: .infinity, alignment: .leading)
+                    }
+                    Text(owner.title).font(ft(12)).foregroundColor(P.text)
+                        .lineLimit(1).truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Spacer(minLength: 6)
+                Text(metric).font(ft(12)).monospacedDigit()
+                    .foregroundColor(metric == "—" ? P.muted : P.text)
+                    .lineLimit(1).fixedSize()
+            }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: 8).fill(expanded ? P.selected : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(owner.title), \(owner.line2), \(owner.line3), "
+            + "ownership confidence: \(owner.confidence ?? "unknown"), "
+            + usage.spoken)
+        .accessibilityValue(expanded ? "expanded" : "collapsed")
+        .accessibilityHint(expanded ? "Hides details" : "Shows details")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// A section's one-line header: open state, title, count and total memory.
+/// The section's total in the selected sort's unit. Memory and CPU sum to a
+/// lower bound ("≥") when a row is unmeasured; growth can be negative, so a
+/// partial sum would mislead and is not shown.
+func sectionMetric(_ rows: [Owner], _ sort: SortKey) -> String? {
+    switch sort {
+    case .memory:
+        let partial = rows.contains { $0.footprint == nil }
+        return sectionTotal(rows).map { (partial ? "≥ " : "") + gb($0) }
+    case .cpu:
+        let known = rows.compactMap { $0.cpu }
+        guard !known.isEmpty else { return nil }
+        return (known.count < rows.count ? "≥ " : "") + coresText(known.reduce(0, +))
+    }
+}
+
+struct SectionHeader: View {
+    var section: OwnerSection
+    var rows: [Owner]
+    var open: Bool
+    var sort: SortKey = .memory
+    var onTap: () -> Void
+
+    var body: some View {
+        let count = sectionCount(section, rows)
+        let total = sectionMetric(rows, sort)
+        Button(action: onTap) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(P.muted)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+                    .frame(width: 12)
+                Circle().fill(P.section(section)).frame(width: 7, height: 7)
+                Text(section.title).font(ft(13, .semibold)).foregroundColor(P.text).lineLimit(1)
+                Text("· " + count.shown).font(ft(12)).foregroundColor(P.muted)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                if let total {
+                    Text(total).font(ft(13, .semibold)).foregroundColor(P.text).monospacedDigit().fixedSize()
+                }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 7)
+            // A tinted band, so a header never reads as one more row.
+            .background(RoundedRectangle(cornerRadius: 8).fill(P.section(section).opacity(open ? 0.14 : 0.08)))
+            .padding(.top, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(section.title), \(count.spoken), \((total?.replacingOccurrences(of: "≥ ", with: "at least ")) ?? (sort == .memory ? "memory not measured" : "\(sort.label) not available")), "
+            + (open ? "expanded" : "collapsed"))
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+struct KeptMarker: View {
+    var text = "Kept"
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "checkmark.shield").font(.system(size: 11, weight: .semibold))
+            Text(text).font(ft(11))
+        }
+        .foregroundColor(P.green)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("kept running")
+    }
+}
+
+struct ChildJobRow: View {
+    var job: OwnerJob
+    var owner: Owner
+    var enabled: Bool
+    var onStop: () -> Void
+
+    private var meta: String {
+        var parts = [job.footprint.map(gb) ?? "— not measured"]
+        if job.isConversation {
+            parts.append("stays open when you stop a build")
+        } else if let n = job.memberCount {
+            parts.append(plural(n, "process", "processes"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.isConversation ? "Conversation" : job.displayName)
+                    .font(ft(13, .medium)).foregroundColor(P.text)
+                Text(meta).font(ft(12)).foregroundColor(P.muted).monospacedDigit()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel((job.isConversation ? "Conversation" : job.displayName) + ", " + meta)
+            if job.isConversation {
+                KeptMarker()
+            } else if job.token != nil && enabled {
+                ActionButton(title: job.stopLabel, icon: "stop.circle", variant: .secondaryDanger,
+                             action: onStop)
+                    .accessibilityLabel("\(job.stopLabel): \(job.displayName) in \(owner.title)")
+            }
+        }
+        .padding(.vertical, 10)
+        .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .bottom)
     }
 }
 
 struct DetailLine: View {
     var left: String, right: String
-    var tint: Color = P.faint
     var body: some View {
-        HStack(spacing: 6) {
-            Text(left).font(.system(size: 9)).foregroundColor(tint).lineLimit(1)
-            Spacer(minLength: 4)
-            Text(right).font(.system(size: 9, design: .rounded))
-                .foregroundColor(P.faint)
-        }
-    }
-}
-
-struct SessionCard: View {
-    var s: Sess
-    @Binding var expanded: Bool
-    var onEnd: () -> Void
-    @State private var hoverClose = false
-
-    private var swapShare: Double { s.total > 0 ? s.swap / s.total : 0 }
-    private var hot: Bool { swapShare > 0.5 }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
-                Chevron(open: expanded)
-                Circle().fill(P.stateColor(s.state)).frame(width: 6, height: 6)
-                Text(s.name).font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(P.text).lineLimit(1)
-                Spacer(minLength: 6)
-                Text(human(s.total))
-                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
-                    .foregroundColor(P.text)
-                Button(action: onEnd) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .black))
-                        .foregroundColor(hoverClose ? .white : P.faint)
-                        .frame(width: 15, height: 15)
-                        .background(Circle().fill(hoverClose ? P.red : P.cardHi))
-                }
-                .buttonStyle(.plain)
-                .onHover { hoverClose = $0 }
-                .help("End this session")
-            }
-            // RAM vs swap in one bar — the swapped share is what hurts.
-            GeometryReader { g in
-                HStack(spacing: 2) {
-                    Capsule().fill(P.ram.opacity(0.9))
-                        .frame(width: max(2, g.size.width * (1 - swapShare)))
-                    Capsule().fill(hot ? P.red : P.swap.opacity(0.85))
-                }
-            }
-            .frame(height: 4)
-            HStack(spacing: 6) {
-                Text("RAM \(human(s.ram))").font(.system(size: 9, weight: .medium))
-                    .foregroundColor(P.ram)
-                Text("SWAP \(human(s.swap))").font(.system(size: 9, weight: .medium))
-                    .foregroundColor(hot ? P.red : P.swap)
-                Text("· \(s.procs)p").font(.system(size: 9)).foregroundColor(P.faint)
-                Spacer(minLength: 2)
-                if s.subActive > 0 {
-                    Badge(text: s.subActive == 1 ? "1 agent" : "\(s.subActive) agents", color: P.violet)
-                }
-            }
-            if !s.doing.isEmpty {
-                Text(s.doing).font(.system(size: 9.5)).foregroundColor(P.faint)
-                    .lineLimit(expanded ? 2 : 1).truncationMode(.tail)
-            }
-
-            if expanded {
-                // Only what a reader cannot infer from the collapsed row: the
-                // work this session spawned, and who is running right now.
-                let hasDetail = !s.children.isEmpty || !s.agents.isEmpty
-                    || !s.started.isEmpty
-                if hasDetail { Divider().overlay(P.stroke).padding(.vertical, 1) }
-
-                if !s.children.isEmpty {
-                    Text("SPAWNED").font(.system(size: 8, weight: .heavy))
-                        .tracking(0.5).foregroundColor(P.faint)
-                    ForEach(s.children) { c in
-                        DetailLine(
-                            left: c.worktree.isEmpty ? c.tag : "\(c.tag) · \(c.worktree)",
-                            right: human(c.mem),
-                            tint: P.dim)
-                    }
-                }
-                if !s.agents.isEmpty {
-                    Text("SUBAGENTS RUNNING").font(.system(size: 8, weight: .heavy))
-                        .tracking(0.5).foregroundColor(P.faint).padding(.top, 2)
-                    ForEach(s.agents) { a in
-                        HStack(spacing: 5) {
-                            Circle().fill(P.violet).frame(width: 4, height: 4)
-                            Text(a.kind).font(.system(size: 9, weight: .medium))
-                                .foregroundColor(P.violet).lineLimit(1)
-                            Spacer(minLength: 2)
-                        }
-                    }
-                }
-                if !s.started.isEmpty {
-                    HStack(spacing: 5) {
-                        Text("STARTED").font(.system(size: 8, weight: .heavy))
-                            .tracking(0.5).foregroundColor(P.faint)
-                        Text(s.started.joined(separator: " · "))
-                            .font(.system(size: 9)).foregroundColor(P.blue.opacity(0.85))
-                    }
-                    .padding(.top, 2)
-                }
-                if !hasDetail {
-                    Text("no spawned work — the session process is all of it")
-                        .font(.system(size: 9)).foregroundColor(P.faint)
-                }
-            }
-        }
-        .padding(.vertical, 8).padding(.horizontal, 11)
-        .background(RoundedRectangle(cornerRadius: 12).fill(
-            expanded ? P.cardHi : P.card))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .stroke(hot ? P.red.opacity(0.40)
-                    : (expanded ? P.strokeHi : P.stroke), lineWidth: 1))
-        .contentShape(Rectangle())
-        .onTapGesture { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } }
-    }
-}
-
-/// Where the score sits between named tiers. An unlabelled progress bar told the
-/// reader nothing — the zones have to carry their own names and boundaries.
-struct LevelTrack: View {
-    var score: Int
-    var level: String
-
-    // (name, first point in zone, width in points)
-    private let zones: [(String, Int, Int)] = [
-        ("HEALTHY", 0, 2), ("WATCH", 2, 2), ("DANGER", 4, 3), ("CRITICAL", 7, 2),
-    ]
-    private func color(_ name: String) -> Color { P.tint(name) }
-
-    var body: some View {
-        VStack(spacing: 3) {
-            GeometryReader { g in
-                let total = CGFloat(zones.reduce(0) { $0 + $1.2 })
-                HStack(spacing: 2) {
-                    ForEach(zones, id: \.0) { name, start, width in
-                        let w = g.size.width * CGFloat(width) / total - 2
-                        let filled = min(max(score - start, 0), width)
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(color(name).opacity(0.16))
-                            Capsule().fill(color(name))
-                                .frame(width: w * CGFloat(filled) / CGFloat(width))
-                        }
-                        .frame(width: max(w, 2))
-                    }
-                }
-            }
-            .frame(height: 5)
-            HStack(spacing: 2) {
-                ForEach(zones, id: \.0) { name, _, width in
-                    Text(name)
-                        .font(.system(size: 7, weight: name == level ? .black : .medium,
-                                      design: .rounded))
-                        .foregroundColor(name == level ? color(name) : P.faint)
-                        .frame(maxWidth: .infinity)
-                }
-            }
-        }
-    }
-}
-
-struct FooterButton: View {
-    var icon: String, label: String
-    var tint: Color = P.dim
-    var action: () -> Void
-    @State private var hover = false
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 10, weight: .bold))
-                Text(label).font(.system(size: 10.5, weight: .medium))
-            }
-            .foregroundColor(hover ? P.text : tint)
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Capsule().fill(hover ? P.cardHi : P.card))
-        }
-        .buttonStyle(.plain)
-        .onHover { hover = $0 }
-    }
-}
-
-struct DecisionRow: View {
-    var level: String, result: String
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(level)
-                .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                .foregroundColor(P.tint(level)).frame(width: 66, alignment: .leading)
-            Text(result).font(.system(size: 9.5)).foregroundColor(P.dim)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(left).foregroundColor(P.muted).frame(width: 96, alignment: .leading)
+            Text(right).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
+        .font(ft(11)).monospacedDigit()
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct OwnerDetailCard: View {
+    var owner: Owner
+    var degraded: Bool
+    @Binding var techOpen: Bool
+    var animation: Animation?
+    var onAsk: (ConfirmRequest.Kind) -> Void
+
+    private var jobs: [OwnerJob] { owner.jobs }
+
+    /// Memory, CPU and growth together, with a reason where one is missing.
+    private var usageLine: String {
+        let mem = owner.footprint.map(gb) ?? "memory \(owner.footprintReason ?? "not measured")"
+        let cpu = owner.cpu.map(coresText) ?? "CPU \(owner.cpuReason ?? "warming up")"
+        let growth = owner.growth.map { growthText($0) + " per 10 min" }
+            ?? "growth: \(owner.growthReason ?? "not enough history")"
+        return [mem, cpu, growth].joined(separator: " · ")
+    }
+
+    /// What a destructive footer action ends. It is not shown as a caption
+    /// next to the button: it goes into the button's label and tooltip, and
+    /// the confirm states it again.
+    private var footScope: String? {
+        if degraded { return nil }
+        if owner.can("end-session") { return "stops the conversation and all its processes" }
+        if owner.can("quit-app") {
+            if owner.kind == "service" { return "quits the VM and stops all its containers" }
+            return "quits its " + plural(owner.instances?.count ?? 1, "instance")
+        }
+        if owner.can("stop-managed-job") { return "stops the job and its memmon run wrapper" }
+        return nil
+    }
+
+    /// A caption only where the footer offers no destructive action.
+    private var footText: String? {
+        if footScope != nil { return nil }
+        if !owner.hosts.isEmpty {
+            return "Hosts \(plural(owner.hosts.count, "session")) — quit it from the app itself"
+        }
+        if owner.stopCommand != nil { return "No app to quit" }
+        if owner.kind == "codex-app" { return "Shared by its threads — stop it from Codex" }
+        if owner.kind == "service" { return "Shared — stop it from the app that owns it" }
+        if owner.kind == "codex-ui" { return "Ending this window does not end the thread" }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 10) {
+                    Text(owner.title).font(ft(14, .medium)).foregroundColor(P.text).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(owner.detailTag).font(ft(11)).foregroundColor(P.accent)
+                }
+                // What the old three-line row said, now that the row is one line.
+                Text(owner.line2).font(ft(12)).foregroundColor(P.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 4) {
+                    Text(owner.line3 + " ·").lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    ConfidenceChip(confidence: owner.confidence)
+                }
+                .font(ft(11)).foregroundColor(P.muted)
+                Text(usageLine).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 13).padding(.vertical, 11)
+            .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .bottom)
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(jobs) { j in
+                    ChildJobRow(job: j, owner: owner, enabled: !degraded) {
+                        onAsk(.job(j))
+                    }
+                }
+                if !owner.group.isEmpty {
+                    ForEach(Array(owner.group.enumerated()), id: \.offset) { k, o in
+                        ChildJobRow(job: OwnerJob(id: o.id, kind: "tree",
+                                                  label: "Process tree \(k + 1)",
+                                                  footprint: o.footprint,
+                                                  memberCount: o.memberCount, token: nil, action: nil),
+                                    owner: owner, enabled: false) {}
+                    }
+                }
+                if let shared = owner.sharedWith, !shared.isEmpty {
+                    Text(sharedLine(shared)).font(ft(12)).foregroundColor(P.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 10)
+                }
+                if let inst = owner.instances, inst.count > 1 {
+                    Text("\(inst.count) instances · each is checked before it is asked to quit")
+                        .font(ft(12)).foregroundColor(P.muted).padding(.top, 10)
+                }
+                if degraded && !owner.actions.isEmpty {
+                    Text("Stopping is off while process identity is unavailable.")
+                        .font(ft(12)).foregroundColor(P.amber).padding(.top, 10)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                technical
+            }
+            .padding(.horizontal, 13).padding(.bottom, 10)
+
+            if footText != nil || footScope != nil {
+                HStack(spacing: 10) {
+                    if let footText {
+                        Text(footText).font(ft(12)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    footButton
+                }
+                .padding(.leading, 13).padding(.trailing, 9).padding(.vertical, 7)
+                .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
+            }
+        }
+        .panel(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(owner.title) details")
+    }
+
+    private func sharedLine(_ names: [String]) -> String {
+        let head = unbroken(names.prefix(3)).joined(separator: ", ")
+        let more = names.count > 3 ? "\u{00A0}…\u{00A0}(+\(names.count - 3))" : ""
+        let what = owner.kind == "codex-app" ? "Threads" : "Containers"
+        return "\(what): \(head)\(more)"
+    }
+
+    @ViewBuilder private var footButton: some View {
+        if degraded {
+            EmptyView()
+        } else if owner.can("end-session") {
+            ActionButton(title: "End session…", variant: .secondaryDanger) { onAsk(.endSession) }
+                .help("End session: " + (footScope ?? ""))
+                .accessibilityLabel("End session \(owner.title): \(footScope ?? "") (asks to confirm)")
+        } else if owner.can("quit-app") {
+            ActionButton(title: "Quit app…", variant: .secondaryDanger) { onAsk(.quitApp) }
+                .help("Quit app: " + (footScope ?? ""))
+                .accessibilityLabel("Quit \(owner.title): \(footScope ?? "") (asks to confirm)")
+        } else if owner.can("stop-managed-job") {
+            ActionButton(title: "Stop job…", variant: .secondaryDanger) {
+                onAsk(.job(OwnerJob(id: owner.id, kind: "managed", label: owner.title,
+                                    footprint: owner.footprint, memberCount: owner.memberCount,
+                                    token: owner.token, action: "stop-managed-job")))
+            }
+            .help("Stop job: " + (footScope ?? ""))
+            .accessibilityLabel("Stop job \(owner.title): \(footScope ?? "") (asks to confirm)")
+        } else if owner.stopCommand != nil {
+            ActionButton(title: "Stop command…", variant: .link) { onAsk(.stopCommand) }
+                .accessibilityLabel("Show the command that stops \(owner.title)")
+        }
+    }
+
+    private var technical: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button { withAnimation(animation) { techOpen.toggle() } } label: {
+                HStack(spacing: 5) {
+                    Chevron(open: techOpen)
+                    Text("Technical details").font(ft(11)).foregroundColor(P.muted)
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Technical details")
+            .accessibilityValue(techOpen ? "expanded" : "collapsed")
+            if techOpen {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let pid = owner.rootPid { DetailLine(left: "Root PID", right: "\(pid)") }
+                    if let start = owner.rootStart, let sec = start.first {
+                        let usec = start.count > 1 ? start[1] : 0
+                        DetailLine(left: "Started", right: eventClock(sec + usec / 1e6, seconds: true))
+                    }
+                    if let n = owner.memberCount { DetailLine(left: "Processes", right: "\(n)") }
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text("Confidence").foregroundColor(P.muted).frame(width: 96, alignment: .leading)
+                        ConfidenceChip(confidence: owner.confidence)
+                        Text(confidenceNote).foregroundColor(P.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(ft(11))
+                    ForEach(jobs.filter { !$0.isConversation }) { j in
+                        if let pid = j.rootPid {
+                            DetailLine(left: "\(j.displayName.components(separatedBy: " · ")[0]) PID",
+                                       right: pid)
+                        }
+                    }
+                    ForEach(Array(owner.group.enumerated()), id: \.offset) { k, o in
+                        DetailLine(left: "Tree \(k + 1) root", right: o.rootPid.map { "PID \($0)" } ?? o.id)
+                    }
+                    if let inst = owner.instances {
+                        ForEach(Array(inst.enumerated()), id: \.offset) { k, i in
+                            DetailLine(left: "Instance \(k + 1)",
+                                       right: "PID \(i.pid)" + (i.launchDate.map { " · launched \(eventClock($0))" } ?? ""))
+                        }
+                    }
+                    if let cov = owner.cpuCoverage, cov < 1, owner.cpu != nil {
+                        DetailLine(left: "CPU coverage", right: String(format: "%.0f%% of processes measured", cov * 100))
+                    }
+                    if owner.growth == nil {
+                        DetailLine(left: "Growth", right: owner.growthReason ?? "not enough history")
+                    }
+                    DetailLine(left: "Owner ID", right: owner.id)
+                }
+                .padding(.top, 4).padding(.bottom, 2)
+            }
+        }
+        .padding(.top, 9)
+    }
+
+    private var confidenceNote: String {
+        switch owner.confidence {
+        case "exact": return "process tree under the owner's root"
+        case "inferred": return "matched by working directory and start time"
+        case "shared": return "one process serves several owners"
+        default: return "no owning session or app found"
+        }
+    }
+}
+
+struct OutcomeBanner: View {
+    var banner: Banner
+    var onRefresh: () -> Void
+    var onDismiss: () -> Void
+
+    private var icon: (String, Color) {
+        switch banner.tone {
+        case .success: return ("checkmark.circle", P.green)
+        case .warning: return ("exclamationmark.triangle", P.amber)
+        case .error: return ("xmark.octagon", P.red)
+        }
+    }
+
+    private var text: Text {
+        let title = Text(banner.title).fontWeight(.medium).foregroundColor(P.text)
+        let body = Text(banner.body).foregroundColor(P.text)
+        guard let note = banner.note else { return Text("\(title) \(body)") }
+        return Text("\(title) \(body) \(Text(note).foregroundColor(P.muted))")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon.0).font(.system(size: 13, weight: .semibold))
+                .foregroundColor(icon.1).frame(width: 16).padding(.top, 1)
+                .accessibilityHidden(true)
+            text.font(ft(12)).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(banner.title + " " + banner.body + (banner.note.map { " " + $0 } ?? ""))
+            HStack(spacing: 2) {
+                if banner.offersRefresh {
+                    ActionButton(title: "Refresh", icon: "arrow.clockwise", action: onRefresh)
+                        .accessibilityLabel("Refresh the process list")
+                }
+                ActionButton(title: "Dismiss", icon: "xmark", variant: .icon, action: onDismiss)
+            }
+            .padding(.top, -3)
+        }
+        .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 10)
+            .fill(banner.tone == .success ? P.selected : P.panel))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .stroke(banner.tone == .success ? Color.clear : P.border, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Outcome")
+    }
+}
+
+struct CopyCommandField: View {
+    var command: String
+    @State private var copied = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(command).font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ActionButton(title: copied ? "Copied" : "Copy", icon: "doc.on.doc") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+                copied = true
+            }
+            .accessibilityLabel("Copy command \(command)")
+        }
+        .padding(.leading, 10).padding(.trailing, 6).padding(.vertical, 6)
+        .panel(8)
+    }
+}
+
+/// The in-view confirmation that replaces NSAlert: it keeps the target row
+/// visible behind the scrim, renders offscreen, and starts on the safe button.
+struct ConfirmOverlay: View {
+    var request: ConfirmRequest
+    var onCancel: () -> Void
+    var onConfirm: () -> Void
+    var onForce: () -> Void
+    var onFocus: (String?) -> Void = { _ in }
+
+    enum Field: Hashable { case safe, act }
+    @FocusState private var focus: Field?
+
+    private var owner: Owner { request.owner }
+    private var working: Bool { if case .working = request.phase { return true }; return false }
+
+    private var keepsConversation: Bool { owner.agent == "claude" || owner.agent == "codex" }
+
+    private struct Content {
+        var icon: String, tint: Color, title: String
+        var target: String
+        var sub: String? = nil
+        var list: [String] = []
+        var warn = false
+        var message: String
+        var safe: String?
+        var command: String?
+        var safeButton: String, safeSpoken: String
+        var actButton: String?, actSpoken: String = "", actVariant: ActionButton.Variant = .danger
+    }
+
+    private var content: Content {
+        switch request.phase {
+        case .partial(let o):
+            // Force acts only on the survivors its token names; anything only
+            // observed (outside what was stopped) is counted but never signalled.
+            let (n, k) = o.forceSplit
+            let r = o.runnerRows
+            let m = n + k + r
+            let label: String
+            if case .job(let j) = request.kind { label = "\(j.displayName.components(separatedBy: " · ")[0]) in \(owner.title)" } else { label = owner.title }
+            let exited = o.exited ?? 0
+            let them = n == 1 ? "it" : "them"
+            return Content(icon: "exclamationmark.triangle", tint: P.amber,
+                           title: "\(plural(m, "process", "processes")) still running",
+                           target: label,
+                           sub: "\(exited) of \(o.captured ?? exited + n) exited · \(m) still running after 10 s",
+                           message: (k > 0
+                                     ? "\(n) of \(m) can be force-stopped; \(k == 1 ? "the other is" : "the other \(k) are") outside what was stopped and won't be signalled. Force stop ends \(them) immediately, and any output not yet written is lost."
+                                     : r > 0
+                                     ? "\(n) of \(m) can be force-stopped. Force stop ends \(them) immediately, and any output not yet written is lost."
+                                     : "They have not answered the polite stop signal. Force stop ends them immediately; any output they have not written is lost.")
+                               + (r > 0 ? " " + (r == 1 ? "1 is a memmon run wrapper; it exits once its job ends."
+                                                       : "\(r) are memmon run wrappers; they exit once their job ends.") : "")
+                               + (owner.agent == "codex" && isEndSession
+                                  ? " A Codex terminal stopped this way may need `reset` afterwards." : ""),
+                           safe: isEndSession ? nil : (keepsConversation ? "The conversation keeps running either way." : nil),
+                           safeButton: "Leave running", safeSpoken: "Leave the \(plural(m, "remaining process", "remaining processes")) running",
+                           actButton: n < m ? "Force stop \(n)" : "Force stop",
+                           actSpoken: "Force stop \(n) of the \(plural(m, "remaining process", "remaining processes"))",
+                           actVariant: .secondaryDanger)
+        case .appPartial(_, let results, _, _):
+            let running = results.filter { $0.state == .running }.count
+            let list = results.enumerated().map { k, r in "Instance \(k + 1) · \(r.state.label)" }
+            return Content(icon: "exclamationmark.triangle", tint: P.amber,
+                           title: "\(plural(running, "instance")) still running",
+                           target: owner.title,
+                           sub: "\(results.filter { $0.state.done }.count) of \(results.count) instances quit after 10 s",
+                           list: list,
+                           message: "It has not answered the quit request. Force quit ends it immediately; unsaved work in it is lost."
+                               + (owner.hostsShells ? " " + Owner.shellWarning : ""),
+                           safeButton: "Leave running", safeSpoken: "Leave \(owner.title) running",
+                           actButton: "Force quit", actSpoken: "Force quit the \(plural(running, "remaining instance"))",
+                           actVariant: .secondaryDanger)
+        case .ask, .working:
+            return askContent
+        }
+    }
+
+    private var isEndSession: Bool { if case .endSession = request.kind { return true }; return false }
+
+    private var blastList: [String] {
+        var list: [String] = []
+        if let shared = owner.sharedWith, !shared.isEmpty {
+            let head = unbroken(shared.prefix(3)).joined(separator: ", ")
+            let more = shared.count > 3 ? "\u{00A0}…\u{00A0}(+\(shared.count - 3))" : ""
+            list.append(owner.kind == "codex-app"
+                        ? "\(plural(shared.count, "thread")) end: \(head)\(more)"
+                        : "\(plural(shared.count, "container")) stop: \(head)\(more)")
+        }
+        if owner.kind == "service" {
+            switch owner.usedBy {
+            case let used? where !used.isEmpty:
+                list.append("Used by sessions: \(used.joined(separator: ", ")) (inferred)")
+            case _?:
+                list.append("Used by sessions: none found (inferred)")
+            case nil:
+                list.append("Used by sessions: unknown")
+            }
+        }
+        if owner.hostsShells { list.append(Owner.shellWarning) }
+        if let inst = owner.instances, inst.count > 1 {
+            list.append("\(inst.count) instances, each checked before it is asked to quit")
+        }
+        return list
+    }
+
+    private var askContent: Content {
+        let size = owner.footprint.map { gb($0) + " now" }
+        switch request.kind {
+        case .job(let j) where j.kind == "managed" && j.id == owner.id:
+            // A top-level `memmon run` job: the owner is the job, and it stops
+            // together with its runner.
+            let sub = [owner.memberCount.map { plural($0, "process", "processes") }, size]
+                .compactMap { $0 }.joined(separator: " · ")
+            return Content(icon: "stop.circle", tint: P.red, title: "Stop \(owner.title)?",
+                           target: "\(owner.title) · memmon run job", sub: sub.isEmpty ? nil : sub,
+                           message: "The job and its memmon run wrapper get a polite stop signal first; nothing is force-killed unless you choose it.",
+                           safe: nil,
+                           safeButton: "Cancel", safeSpoken: "Cancel, keep the job running",
+                           actButton: j.stopLabel,
+                           actSpoken: "\(j.stopLabel): send stop signal to \(owner.memberCount.map { plural($0, "process", "processes") } ?? "its processes")")
+        case .job(let j):
+            let name = j.displayName.components(separatedBy: " · ")[0]
+            let sub = [j.memberCount.map { plural($0, "process", "processes") }, j.footprint.map { gb($0) + " now" }]
+                .compactMap { $0 }.joined(separator: " · ")
+            return Content(icon: "stop.circle", tint: P.red, title: "Stop \(name.lowercased())?",
+                           target: "\(name) in \(owner.title)", sub: sub.isEmpty ? nil : sub,
+                           message: "Processes get a polite stop signal first; nothing is force-killed unless you choose it.",
+                           safe: keepsConversation ? "The conversation keeps running." : "\(owner.title) keeps running.",
+                           safeButton: "Cancel", safeSpoken: "Cancel, keep the \(j.kind == "server" ? "server" : "job") running",
+                           actButton: j.stopLabel,
+                           actSpoken: "\(j.stopLabel): send stop signal to \(j.memberCount.map { plural($0, "process", "processes") } ?? "its processes")")
+        case .endSession:
+            let sub = [owner.memberCount.map { plural($0, "process", "processes") }, size]
+                .compactMap { $0 }.joined(separator: " · ")
+            let work = owner.jobs.filter { !$0.isConversation }.map { $0.label }
+            return Content(icon: "xmark.octagon", tint: P.red, title: "End \(owner.title)?",
+                           target: owner.title, sub: sub.isEmpty ? nil : sub,
+                           list: work.isEmpty ? [] : ["Includes: " + work.joined(separator: ", ")],
+                           message: "The conversation and all the processes it started get a polite stop signal. Anything not yet written to disk is lost.",
+                           safe: "Other sessions, including any nested inside it, keep running.",
+                           safeButton: "Cancel", safeSpoken: "Cancel, keep the session running",
+                           actButton: "End session", actSpoken: "End session \(owner.title)")
+        case .quitApp:
+            return Content(icon: "exclamationmark.triangle", tint: P.amber, title: "Quit \(owner.title)?",
+                           target: [owner.title, size].compactMap { $0 }.joined(separator: " · "),
+                           list: blastList, warn: true,
+                           message: owner.kind == "service"
+                               ? "Sessions that call these services will get connection errors until the VM is started again."
+                               : "The app is asked to quit normally so it can save first. Nothing is force-quit unless you choose it.",
+                           safeButton: "Cancel", safeSpoken: "Cancel, keep \(owner.title) running",
+                           actButton: "Quit app", actSpoken: "Quit \(owner.title)")
+        case .stopCommand:
+            return Content(icon: "exclamationmark.triangle", tint: P.amber, title: "Stop \(owner.title)?",
+                           target: [owner.title, size].compactMap { $0 }.joined(separator: " · "),
+                           list: blastList, warn: true,
+                           message: "No app to quit — this VM runs without a window. Run this in a terminal:",
+                           command: owner.stopCommand,
+                           safeButton: "Close", safeSpoken: "Close")
+        }
+    }
+
+    var body: some View {
+        let c = content
+        VStack(alignment: .leading, spacing: 0) {
+            Image(systemName: c.icon).font(.system(size: 18, weight: .medium))
+                .foregroundColor(c.tint).accessibilityHidden(true)
+            Text(c.title).font(ft(18, .medium)).foregroundColor(P.text)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 10).padding(.bottom, 10)
+                .accessibilityAddTraits(.isHeader)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(c.target).font(ft(13, .medium)).foregroundColor(P.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let sub = c.sub {
+                    Text(sub).font(ft(12)).foregroundColor(P.muted).monospacedDigit()
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !c.list.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(c.list, id: \.self) { item in
+                            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                                Text("•").accessibilityHidden(true)
+                                Text(item).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .font(ft(12)).foregroundColor(P.muted).padding(.top, 4)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12).padding(.vertical, 11)
+            .background(RoundedRectangle(cornerRadius: 9).fill(P.soft))
+            .overlay(RoundedRectangle(cornerRadius: 9)
+                .stroke(c.warn ? P.amber.opacity(0.62) : Color.clear, lineWidth: 1))
+            .accessibilityElement(children: .combine)
+            .padding(.bottom, 12)
+
+            Text(c.message).font(ft(13)).foregroundColor(P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 12)
+            if let cmd = c.command {
+                CopyCommandField(command: cmd).padding(.bottom, 16)
+            }
+            if let safe = c.safe {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.shield").font(.system(size: 12, weight: .semibold))
+                    Text(safe).font(ft(12)).fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundColor(P.green)
+                .accessibilityElement(children: .combine)
+                .padding(.bottom, 16)
+            }
+            if working {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting up to 10 s for the processes to exit…")
+                        .font(ft(12)).foregroundColor(P.muted)
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    // Explicitly focusable: with Keyboard navigation off (the
+                    // macOS default) a button never takes focus otherwise, so
+                    // focus could not start on the safe choice.
+                    ActionButton(title: c.safeButton, action: onCancel)
+                        .accessibilityLabel(c.safeSpoken)
+                        .keyboardShortcut(.cancelAction)
+                        .focusable()
+                        .focused($focus, equals: .safe)
+                    if let act = c.actButton {
+                        ActionButton(title: act, variant: c.actVariant) {
+                            if case .ask = request.phase { onConfirm() } else { onForce() }
+                        }
+                        .accessibilityLabel(c.actSpoken)
+                        .focusable()
+                        .focused($focus, equals: .act)
+                    }
+                }
+                .focusSection()
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 17).fill(P.panel))
+        .overlay(RoundedRectangle(cornerRadius: 17).stroke(P.border, lineWidth: 1))
+        .onAppear { focus = .safe }
+        .task(id: focus) { onFocus(focus.map { $0 == .safe ? "safe" : "act" }) }
+        .onExitCommand { if !working { onCancel() } }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(c.title)
+        .accessibilityAddTraits(.isModal)
+    }
+}
+
+/// "Healthy runs · Watch warns · Danger warns · Critical stops", each level in its colour.
+struct PolicyStrip: View {
+    var levels: [(String, String)]
+    var body: some View {
+        levels.enumerated().reduce(Text("")) { acc, item in
+            let (k, (level, verb)) = item
+            let head = Text(level.prefix(1) + level.dropFirst().lowercased()).foregroundColor(P.tint(level))
+            return acc + (k == 0 ? Text("") : Text("  ")) + head + Text(" " + verb).foregroundColor(P.muted)
+        }
+        .font(ft(10.5, .medium))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// What a gate rule means in everyday words, and why it counts as heavy.
+func gateKind(_ c: GateClassification?) -> (what: String, why: String) {
+    guard let c else { return ("a memory-heavy command", "It matched memmon's list of memory-heavy commands.") }
+    if c.source == "learned" {
+        let seen = c.observedPeak.map { " (about \(gb($0)) last time)" } ?? ""
+        return ("a command this Mac has seen use a lot of memory",
+                "memmon learned it is heavy from earlier runs on this Mac\(seen); learned rules only ever warn.")
+    }
+    let r = (c.rule + " " + c.shape).lowercased()
+    func has(_ words: String...) -> Bool { words.contains { r.contains($0) } }
+    if has("tsc", "typecheck", "type-check") { return ("a type check", "Type checkers like tsc load the whole project into memory.") }
+    if has("vitest", "jest", "pytest", "playwright", "mocha", " test") {
+        return ("a test run", "Test runners start many workers at once, and each takes memory.")
+    }
+    if has("install", "pnpm i", "npm i", "yarn") && !has("build") {
+        return ("a package install", "Installs unpack and link many packages at once.")
+    }
+    if has("docker", "colima", "compose") { return ("a container start", "Containers reserve memory for their virtual machine.") }
+    if has("dev", "serve", "start") { return ("a dev server", "Dev servers keep a bundler and a watcher in memory.") }
+    if has("lint", "eslint", "biome") { return ("a lint run", "Linters parse every file of the project.") }
+    if has("build", "webpack", "vite", "next", "cargo", "gradle", "bazel", "xcodebuild", "make", "swift") {
+        return ("a build", "Builds compile many files in parallel.")
+    }
+    return ("a memory-heavy command", "It matched memmon's list of memory-heavy commands.")
+}
+
+/// Pressure levels as people say them.
+func levelPhrase(_ level: String) -> String {
+    switch level.uppercased() {
+    case "HEALTHY": return "normal"
+    case "WATCH": return "getting tight"
+    case "DANGER": return "high"
+    case "CRITICAL": return "critical"
+    default: return "unknown"
     }
 }
 
 struct GateEventCard: View {
     var event: GateEvent
-    @State private var expanded = false
+    var animation: Animation?
+    @State private var expanded: Bool
+
+    init(event: GateEvent, animation: Animation?, startExpanded: Bool = false) {
+        self.event = event
+        self.animation = animation
+        _expanded = State(initialValue: startExpanded)
+    }
+    @State private var fullCommand = false
 
     private var stopped: Bool { event.action == "block" }
     private var tint: Color { stopped ? P.red : P.amber }
     private var sessionLabel: String {
-        event.sessionName ?? (event.sessionID.isEmpty ? "Unknown session" : event.sessionID)
+        event.sessionName ?? (event.sessionID.isEmpty ? "an unknown session" : event.sessionID)
     }
-    private var matchLabel: String {
-        guard let c = event.classification else { return "Rule match not recorded" }
-        if c.source == "learned" {
-            let observed = c.samples.map { " · \($0) observations" } ?? ""
-            return "Learned rule: \(c.rule)\(observed) · warning only"
-        }
-        return "Built-in rule: \(c.rule)"
+    private var kind: (what: String, why: String) { gateKind(event.classification) }
+    private var memory: String { levelPhrase(event.level) }
+
+    /// The one-line summary under the session name.
+    private var summary: String {
+        (stopped ? "Held back \(kind.what)" : "Ran \(kind.what)") + " while memory was \(memory)"
     }
-    private var fullMatchLabel: String {
-        guard event.classification != nil else {
-            return "Not recorded — this event predates rule tracking"
-        }
-        return matchLabel
+    /// What happened, for VoiceOver; the card itself shows it as tags.
+    private var story: String {
+        stopped
+            ? "Held back \(kind.what) before it started; memory was \(memory)."
+            : "\(capitalised(kind.what)) started while memory was \(memory); it still ran."
     }
-    private var outcome: String {
+    private var nextStep: String {
         if stopped {
-            return "Stopped before running · "
-                + (event.retryStatus == "waiting" ? "waiting to retry" : "not waiting to retry")
+            return event.retryStatus == "waiting"
+                ? "Waiting in the blocked list. Retry once memory is normal."
+                : "Nothing waiting: retried, dismissed or expired."
         }
-        return "Warning added to the session’s context; command ran"
+        return "Nothing needed. If memory keeps climbing, stop an idle session."
     }
+    /// "a type check" → "Type check".
+    private var kindTag: String {
+        let w = kind.what
+        let bare = w.hasPrefix("an ") ? String(w.dropFirst(3)) : w.hasPrefix("a ") ? String(w.dropFirst(2)) : w
+        return capitalised(bare)
+    }
+    private var memoryLine: String {
+        capitalised(event.reasons.isEmpty ? memory : event.reasons.joined(separator: " · "))
+            + " at " + eventTime(event.ts)
+    }
+    private func capitalised(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: expanded ? 8 : 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(stopped ? "■" : "▲")
-                    .font(.system(size: 8, weight: .black)).foregroundColor(tint)
-                Text(stopped ? "STOPPED · COMMAND DID NOT RUN" : "WARNED · COMMAND RAN")
-                    .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                    .tracking(0.25).foregroundColor(tint)
+        VStack(alignment: .leading, spacing: expanded ? 8 : 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle().fill(tint).frame(width: 6, height: 6).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                (Text(stopped ? "Stopped" : "Warned").foregroundColor(tint).fontWeight(.semibold)
+                    + Text(" · " + sessionLabel).foregroundColor(P.text))
+                    .font(ft(12)).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 4)
-                Text(eventTime(event.ts)).font(.system(size: 8.5)).foregroundColor(P.faint)
+                Text(relative(event.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
-
-            Text(event.commandDisplay)
-                .font(.system(size: 9.5, design: .monospaced))
-                .foregroundColor(P.text)
-                .lineLimit(expanded ? nil : 2)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-
             if expanded {
-                eventDetail("Session", sessionLabel)
-                eventDetail("Command match", fullMatchLabel)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Memory at \(eventClock(event.ts))")
-                        .font(.system(size: 8, weight: .heavy)).foregroundColor(P.faint)
-                    Text(event.level)
-                        .font(.system(size: 9.5, weight: .heavy, design: .rounded))
-                        .foregroundColor(P.tint(event.level))
-                    ForEach(Array(event.reasons.enumerated()), id: \.offset) { _, reason in
-                        Text(reason).font(.system(size: 9.5)).foregroundColor(P.dim)
+                // What happened, as tags: the kind of command, how memory was, the outcome.
+                HStack(spacing: 5) {
+                    eventTag(kindTag, P.muted)
+                    eventTag("Memory " + memory, tint)
+                    eventTag(stopped ? "Held back" : "Ran anyway", stopped ? P.red : P.muted)
+                }
+                .padding(.leading, 12)
+                VStack(alignment: .leading, spacing: 5) {
+                    eventRow("Why") { eventValue(kind.why) }
+                    eventRow("Memory") { eventValue(memoryLine) }
+                    eventRow("Next") { eventValue(nextStep) }
+                    eventRow("Command") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(fullCommand ? event.commandDisplay : (event.commandShort ?? event.commandDisplay))
+                                .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                                .lineLimit(fullCommand ? nil : 1).truncationMode(.middle)
+                                .fixedSize(horizontal: false, vertical: fullCommand)
+                                .textSelection(.enabled)
+                            if event.commandShort != nil && event.commandShort != event.commandDisplay {
+                                Button(fullCommand ? "Show less" : "Show full command") { fullCommand.toggle() }
+                                    .buttonStyle(.plain).font(ft(10, .medium)).foregroundColor(P.accent)
+                            }
+                        }
                     }
                 }
-                eventDetail("Outcome", outcome)
+                .padding(.leading, 12)
             } else {
-                Text("Session \(sessionLabel) · \(relative(event.ts))")
-                    .font(.system(size: 8.5)).foregroundColor(P.faint).lineLimit(1)
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text("\(matchLabel) + \(event.level) memory → \(stopped ? "stopped" : "warned")")
-                        .font(.system(size: 8.5)).foregroundColor(P.dim)
-                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    Text(summary)
+                        .font(ft(11)).foregroundColor(P.muted).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 2)
                     Chevron(open: false)
                 }
-                if stopped && event.retryStatus == "waiting" {
-                    Text("WAITING TO RETRY")
-                        .font(.system(size: 8, weight: .heavy, design: .rounded))
-                        .foregroundColor(P.red)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(P.red.opacity(0.14)))
-                }
+                .padding(.leading, 12)
             }
         }
-        .padding(10)
+        .padding(.horizontal, 10).padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(0.62), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 8).fill(P.panel))
         .contentShape(Rectangle())
-        .onTapGesture { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } }
+        .help(event.commandDisplay)
+        .onTapGesture { withAnimation(animation) { expanded.toggle() } }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(stopped ? "Stopped" : "Warned"), \(sessionLabel), \(relative(event.ts)): \(story) "
+            + (expanded ? "Why: \(kind.why) Memory: \(memoryLine). Next: \(nextStep) " : "")
+            + "Command: \(event.commandDisplay).")
+        .accessibilityValue(expanded ? "expanded" : "collapsed")
+        .accessibilityAddTraits(.isButton)
     }
 
-    private func eventDetail(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 8, weight: .heavy)).foregroundColor(P.faint)
-            Text(value).font(.system(size: 9.5)).foregroundColor(P.dim)
-                .fixedSize(horizontal: false, vertical: true)
+    private func eventTag(_ text: String, _ color: Color) -> some View {
+        Text(text).font(ft(10, .medium)).foregroundColor(color).lineLimit(1)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(color.opacity(0.13)))
+    }
+
+    /// A short label on the left, its value beside it.
+    private func eventRow<V: View>(_ label: String, @ViewBuilder _ value: () -> V) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).font(ft(11)).foregroundColor(P.muted).frame(width: 60, alignment: .leading)
+            value()
         }
+    }
+
+    private func eventValue(_ s: String) -> some View {
+        Text(s).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
     }
 }
 
 struct MissingGateEventCard: View {
     var item: PendingRetry
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 5) {
-                Text("■").font(.system(size: 8, weight: .black)).foregroundColor(P.red)
-                Text("STOPPED · COMMAND DID NOT RUN")
-                    .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                    .foregroundColor(P.red)
-                Spacer()
-                Text(eventTime(item.ts)).font(.system(size: 8.5)).foregroundColor(P.faint)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle().fill(P.red).frame(width: 6, height: 6).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                Text(item.commandShort ?? item.commandDisplay)
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(relative(item.ts)).font(ft(11)).foregroundColor(P.muted).fixedSize()
             }
-            Text(item.commandDisplay)
-                .font(.system(size: 9.5, design: .monospaced)).foregroundColor(P.text)
-                .lineLimit(2).textSelection(.enabled)
-            Text("Session \(item.sessionName ?? item.sessionID) · \(relative(item.ts))")
-                .font(.system(size: 8.5)).foregroundColor(P.faint)
-            Text("Stopped earlier · event details are no longer retained")
-                .font(.system(size: 8.5)).foregroundColor(P.dim)
-            Text("WAITING TO RETRY")
-                .font(.system(size: 8, weight: .heavy, design: .rounded))
-                .foregroundColor(P.red)
+            Text("\(item.sessionName ?? item.sessionID) · event details no longer retained")
+                .font(ft(11)).foregroundColor(P.muted).lineLimit(1).padding(.leading, 12)
         }
-        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+        .padding(.horizontal, 10).padding(.vertical, 7).frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(P.panel))
+        .help(item.commandDisplay)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Stopped, command did not run: \(item.commandDisplay) · Session "
+            + "\(item.sessionName ?? item.sessionID) · \(relative(item.ts)) · "
+            + "Stopped earlier · event details are no longer retained")
     }
+}
+
+struct FooterButton: View {
+    var icon: String, label: String
+    var action: () -> Void
+    @State private var hover = false
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+                Text(label).font(ft(11, .medium))
+            }
+            .foregroundColor(hover ? P.text : P.muted)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Capsule().fill(hover ? P.selected : P.soft))
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .onHover { hover = $0 }
+        .accessibilityLabel(label)
+    }
+}
+
+struct BodyHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+struct ChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value += nextValue() }
 }
 
 // MARK: - main view
 
+// MARK: - header pill and memory ring
+
+/// The ring sweeps in and the live dot pulses only when motion is allowed;
+/// renders and Reduce Motion get the finished, still picture.
+func ringSweeps(reduceMotion: Bool, animate: Bool) -> Bool { animate && !reduceMotion }
+func dotPulses(reduceMotion: Bool) -> Bool { !reduceMotion }
+/// The header face moves only when motion is allowed.
+func moodAnimates(reduceMotion: Bool) -> Bool { !reduceMotion }
+
+/// The header's face: how the machine feels, from the sample on screen. A
+/// stale or missing sample never looks calm.
+enum Mood: String {
+    case calm, watch, strained, critical, unsure, asleep
+
+    static func of(_ s: OwnersSnap?) -> Mood {
+        guard let s, s.age != nil else { return .unsure }
+        if s.stale { return .asleep }
+        switch s.system.scoreLevel?.uppercased() {
+        case "HEALTHY": return .calm
+        case "WATCH": return .watch
+        case "DANGER": return .strained
+        case "CRITICAL": return .critical
+        default: return .unsure
+        }
+    }
+
+    var face: String {
+        switch self {
+        case .calm: return "😌"
+        case .watch: return "😐"
+        case .strained: return "😰"
+        case .critical: return "🥵"
+        case .unsure: return "🤔"
+        case .asleep: return "😴"
+        }
+    }
+
+    var spoken: String {
+        switch self {
+        case .calm: return "calm, memory pressure is normal"
+        case .watch: return "watchful, memory pressure is rising"
+        case .strained: return "strained, memory pressure is high"
+        case .critical: return "overheating, memory pressure is critical"
+        case .unsure: return "unsure, memory pressure is unknown"
+        case .asleep: return "asleep, the sample is stale"
+        }
+    }
+
+    /// Breathing for calm, a faster breath when watchful, a wobble when
+    /// strained and a shake when critical.
+    var motion: (scale: CGFloat, angle: Double, period: Double) {
+        switch self {
+        case .calm: return (1.06, 0, 2.4)
+        case .watch: return (1.08, 0, 1.3)
+        case .strained: return (1.0, 6, 0.35)
+        case .critical: return (1.1, 10, 0.16)
+        case .unsure: return (1.0, 8, 1.6)
+        case .asleep: return (0.95, 0, 3.0)
+        }
+    }
+}
+
+struct MoodFace: View {
+    var mood: Mood
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var phase = false
+
+    var body: some View {
+        let m = mood.motion
+        Text(mood.face)
+            .font(.system(size: 19))
+            .scaleEffect(phase ? m.scale : 1)
+            .rotationEffect(.degrees(phase ? m.angle : (m.angle == 0 ? 0 : -m.angle)))
+            .onAppear {
+                // Renders and Reduce Motion get the still face.
+                guard moodAnimates(reduceMotion: reduceMotion) else { return }
+                withAnimation(.easeInOut(duration: m.period).repeatForever(autoreverses: true)) { phase = true }
+            }
+    }
+}
+
+/// What the header's status pill says about the sample on screen.
+struct StatusState: Equatable {
+    enum Kind: String { case live, syncing, sampling, stale }
+    var kind: Kind
+    var text: String
+    var spoken: String
+}
+
+func statusState(_ s: OwnersSnap?, refreshing: Bool, stillSampling: Bool) -> StatusState {
+    var sampled = "No sample yet"
+    if let s {
+        if let age = s.age {
+            sampled = "Sampled \(ageText(age)) ago by the \(s.source == "sampler" ? "background sampler" : "live reader")"
+                + (s.stale ? ", stale" : "")
+        } else {
+            sampled = "Sample time unknown"
+        }
+    }
+    // A stale sample stays visibly stale while a refresh runs: scans that keep
+    // timing out would otherwise show "Syncing…" over old data indefinitely.
+    let staleNow = s.map { $0.stale } ?? false
+    if refreshing && !staleNow { return StatusState(kind: .syncing, text: "Syncing…", spoken: "Syncing; " + sampled) }
+    if stillSampling && !staleNow {
+        return StatusState(kind: .sampling, text: "Still sampling…", spoken: "Still sampling; " + sampled)
+    }
+    guard let s else { return StatusState(kind: .stale, text: "No sample", spoken: sampled) }
+    guard let age = s.age else { return StatusState(kind: .stale, text: "Time unknown", spoken: sampled) }
+    if s.stale { return StatusState(kind: .stale, text: "Stale · \(ageText(age))", spoken: sampled) }
+    return StatusState(kind: .live, text: "Live · \(ageText(age))", spoken: sampled)
+}
+
+struct StatusPill: View {
+    var state: StatusState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulse = false
+    @State private var spin = false
+
+    private var tint: Color {
+        switch state.kind {
+        case .live: return P.green
+        case .stale: return P.amber
+        case .syncing, .sampling: return P.accent
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            switch state.kind {
+            case .live:
+                Circle().fill(tint).frame(width: 7, height: 7)
+                    .overlay(Circle().stroke(tint, lineWidth: 1.5)
+                        .scaleEffect(pulse ? 2.4 : 1).opacity(pulse ? 0 : 0.7))
+                    .onAppear {
+                        guard dotPulses(reduceMotion: reduceMotion) else { return }
+                        withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { pulse = true }
+                    }
+            case .syncing, .sampling:
+                Circle().trim(from: 0, to: 0.72)
+                    .stroke(tint, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                    .frame(width: 9, height: 9)
+                    .rotationEffect(.degrees(spin ? 360 : 0))
+                    .onAppear {
+                        guard dotPulses(reduceMotion: reduceMotion) else { return }
+                        withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+                    }
+            case .stale:
+                Image(systemName: "clock").font(.system(size: 10, weight: .medium)).foregroundColor(tint)
+            }
+            Text(state.text).font(ft(11, .medium)).lineLimit(1)
+                .foregroundColor(state.kind == .stale ? P.amber : P.text)
+        }
+        .padding(.horizontal, 9).frame(height: 22)
+        .background(Capsule().fill(P.panel.opacity(0.7)))
+        .overlay(Capsule().stroke(state.kind == .stale ? P.amber.opacity(0.6) : P.border, lineWidth: 1))
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.spoken)
+    }
+}
+
+/// The memory ring: one arc per section, a grey arc for the rest of used
+/// memory, and free memory as the empty track.
+struct MemoryRing: View {
+    var segments: [RingSegment]
+    var used: Double?
+    var ram: Double?
+    var animate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appeared = false
+
+    static let lineWidth: CGFloat = 13
+
+    private var total: Double {
+        max(ram ?? 0, used ?? 0, segments.reduce(0) { $0 + $1.arc }, 1)
+    }
+
+    private func color(_ seg: RingSegment) -> Color {
+        if case .section(let s) = seg.kind { return P.section(s) }
+        return P.system
+    }
+
+    var body: some View {
+        let sweep: Double = ringSweeps(reduceMotion: reduceMotion, animate: animate) && !appeared ? 0 : 1
+        let gap = segments.count > 1 ? 0.006 : 0
+        ZStack {
+            Circle().stroke(P.track, lineWidth: Self.lineWidth)
+            if used != nil {
+                ForEach(Array(arcs.enumerated()), id: \.element.0.id) { _, item in
+                    let (seg, start, end) = item
+                    Circle()
+                        .trim(from: start * sweep, to: max(start, end - gap) * sweep)
+                        .stroke(color(seg), style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .butt))
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+        }
+        .animation(ringSweeps(reduceMotion: reduceMotion, animate: animate) ? .easeOut(duration: 0.6) : nil,
+                   value: segments.map { $0.arc })
+        .onAppear {
+            guard ringSweeps(reduceMotion: reduceMotion, animate: animate) else { return }
+            withAnimation(.easeOut(duration: 0.8)) { appeared = true }
+        }
+    }
+
+    /// Each segment's start and end as fractions of the whole ring.
+    private var arcs: [(RingSegment, Double, Double)] {
+        var at = 0.0
+        return segments.map { seg in
+            let start = at
+            at += seg.arc / total
+            return (seg, min(start, 1), min(at, 1))
+        }
+    }
+}
+
+/// A symbol and a number with little space between them.
+struct CompactLabel: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 3) {
+            configuration.icon.font(.system(size: 10, weight: .semibold))
+            configuration.title
+        }
+    }
+}
+
+/// A legend line: a colour dot, the name and its memory.
+struct LegendRow: View {
+    var color: Color
+    var outlined = false
+    var name: String
+    var value: String
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle().fill(outlined ? Color.clear : color).frame(width: 8, height: 8)
+                .overlay(Circle().stroke(outlined ? P.muted.opacity(0.6) : Color.clear, lineWidth: 1))
+            Text(name).font(ft(12)).foregroundColor(P.text).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 4)
+            Text(value).font(ft(12)).foregroundColor(P.muted).monospacedDigit().fixedSize()
+        }
+        .contentShape(Rectangle())
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: Model
     var onQuit: () -> Void
-    var onReap: () -> Void
-    var onEndSession: (Sess) -> Void = { _ in }
-    var onToggleGate: (Bool) -> Void = { _ in }
     /// ImageRenderer cannot lay out a ScrollView offscreen — it renders empty.
-    /// The preview drops the scroll container so the real content is exercised.
+    /// Renders drop the scroll container and take their natural height.
     var flattened = false
-    /// Preview only: force every session open so the drill-down layout is
-    /// exercised without needing to click.
-    var previewExpandAll = false
     var previewOpenGate = false
-    var frameHeight: CGFloat = 620
+    /// Renders only: gate events start expanded.
+    var previewOpenEvents = false
 
-    @State var openSessions = true
-    @State var openWorktrees = false
-    @State var openPool = false
-    @State var openApps = false
-    @State var openGate = true
-    // Reference material, not status: you read the rule list once and then know
-    // it. Left open it re-imposed ~150pt above the RAM/Swap tiles on every
-    // popover open, which is the opposite of what those tiles are for.
-    @State var openMatchRules = false
-    @State var showAllWarnings = false
-    @State var showAllStops = false
-    @State var expandedSessions: Set<String> = []
+    static let width: CGFloat = 380
+    static let maxHeight: CGFloat = 620
 
-    private var s: Snap { model.snap }
-    private var tint: Color { P.tint(s.level) }
-    private var finished: [Sess] {
-        s.sessions.filter { $0.state == "done" || $0.state == "stopped" }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var openGate = false
+    @State private var openMatchRules = false
+    @State private var showAllWarnings = false
+    @State private var showAllStops = false
+    @State private var bodyHeight: CGFloat = 0
+    @State private var chromeHeight: CGFloat = 0
+
+    private func motion(_ seconds: Double) -> Animation? {
+        reduceMotion ? nil : .easeInOut(duration: seconds)
     }
-    private var finishedCount: Int { finished.count }
-    private var finishedMem: Double { finished.reduce(0) { $0 + $1.total } }
-    private var sessionTotal: Double { s.sessions.reduce(0) { $0 + $1.total } }
 
     var body: some View {
-        ZStack {
-            LinearGradient(colors: [P.bgTop, P.bgBot],
-                           startPoint: .top, endPoint: .bottom)
-            VStack(spacing: 0) {
-                header
-                Divider().overlay(P.stroke)
-                if model.loaded {
-                    if flattened { body_; Spacer(minLength: 0) }
-                    else { ScrollView { body_ } }
-                } else {
-                    VStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("reading memory…").font(.system(size: 11))
-                            .foregroundColor(P.dim)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-                Divider().overlay(P.stroke)
-                footer
+        ZStack(alignment: .top) {
+            P.bg
+            column
+                .blur(radius: model.confirm == nil ? 0 : 4)
+                .allowsHitTesting(model.confirm == nil)
+                .disabled(model.confirm != nil)
+                .accessibilityHidden(model.confirm != nil)
+            if let request = model.confirm {
+                P.scrim.transition(.opacity)
+                ConfirmOverlay(request: request,
+                               onCancel: { withAnimation(motion(0.12)) { model.cancel() } },
+                               onConfirm: { model.perform() },
+                               onForce: { model.force() },
+                               onFocus: { model.overlayFocus = $0 })
+                    .padding(.horizontal, 14).padding(.top, 96)
+                    .transition(.opacity)
             }
         }
-        .frame(width: 380, height: frameHeight, alignment: .top)
+        .animation(motion(0.12), value: model.confirm == nil)
+        .frame(width: Self.width, height: flattened ? nil : min(bodyHeight + chromeHeight, Self.maxHeight),
+               alignment: .top)
+        .foregroundColor(P.text)
+    }
+
+    private var column: some View {
+        VStack(spacing: 0) {
+            header.background(GeometryReader { Color.clear.preference(key: ChromeHeightKey.self, value: $0.size.height) })
+            Rectangle().fill(P.border).frame(height: 1)
+            if let snap = model.snap {
+                if flattened {
+                    content(snap)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            content(snap).background(GeometryReader {
+                                Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height)
+                            })
+                        }
+                        .onChange(of: model.scrollTarget) { target in
+                            guard let target else { return }
+                            withAnimation(motion(0.25)) { proxy.scrollTo("section-" + target.rawValue, anchor: .top) }
+                            model.scrollTarget = nil
+                        }
+                    }
+                    .frame(height: min(bodyHeight, Self.maxHeight - chromeHeight))
+                }
+            } else {
+                loading
+                    .background(GeometryReader { Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height) })
+            }
+            footer.background(GeometryReader { Color.clear.preference(key: ChromeHeightKey.self, value: $0.size.height + 1) })
+        }
+        .onPreferenceChange(BodyHeightKey.self) { bodyHeight = $0 }
+        .onPreferenceChange(ChromeHeightKey.self) { chromeHeight = $0 }
+    }
+
+    private var loading: some View {
+        VStack(spacing: 8) {
+            if let e = model.loadError {
+                Image(systemName: "exclamationmark.triangle").foregroundColor(P.amber)
+                Text("Could not read memory: \(e).").font(ft(12)).foregroundColor(P.muted)
+                    .multilineTextAlignment(.center)
+                ActionButton(title: "Try again", icon: "arrow.clockwise") { model.refresh() }
+            } else {
+                ProgressView().controlSize(.small)
+                Text("Reading memory…").font(ft(12)).foregroundColor(P.muted)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, minHeight: 180)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
-            ZStack {
-                Circle().fill(LinearGradient(colors: [P.violet, P.blue],
-                                             startPoint: .topLeading,
-                                             endPoint: .bottomTrailing))
-                Image(systemName: "memorychip.fill")
-                    .font(.system(size: 14, weight: .bold)).foregroundColor(.white)
-            }
-            .frame(width: 30, height: 30)
+            let mood = Mood.of(model.snap)
+            MoodFace(mood: mood)
+                .id(mood)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 10).fill(P.panel.opacity(0.75)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.border, lineWidth: 1))
+                .help(mood.spoken)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("memmon mood: \(mood.spoken)")
             VStack(alignment: .leading, spacing: 1) {
-                Text("memmon").font(.system(size: 14, weight: .bold))
-                    .foregroundColor(P.text)
-                Text("Memory & command protection").font(.system(size: 9.5))
-                    .foregroundColor(P.faint)
+                Text("memmon").font(ft(16, .semibold)).tracking(-0.3).foregroundColor(P.text)
+                Text("Memory & sessions").font(ft(11)).foregroundColor(P.muted)
             }
             Spacer()
-            HStack(spacing: 5) {
-                Circle().fill(tint).frame(width: 7, height: 7)
-                Text(model.refreshing ? "Syncing…" : s.level)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundColor(tint)
-            }
-            .padding(.horizontal, 9).padding(.vertical, 5)
-            .background(Capsule().fill(tint.opacity(0.14)))
-            .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
+            StatusPill(state: statusState(model.snap, refreshing: model.refreshing,
+                                          stillSampling: model.stillSampling))
+                .id(model.tick)
         }
-        .padding(.horizontal, 14).padding(.vertical, 11)
+        .padding(.horizontal, 16).padding(.top, 13).padding(.bottom, 12)
+        .background(LinearGradient(colors: [P.headerTop, P.headerBottom], startPoint: .top, endPoint: .bottom))
     }
 
-    private var body_: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            verdict
-            if !s.jobs.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Managed jobs").font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(P.text)
-                    ForEach(s.jobs) { job in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("\(job.label) · \(job.state) · \(job.elapsed)s")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(P.text)
-                            Text("\(job.resource) — \(job.reason)")
-                                .font(.system(size: 10)).foregroundColor(P.dim)
+    private func content(_ s: OwnersSnap) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            protectionPill(s).padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 8)
+            healthCard(s).padding(.horizontal, 12).padding(.bottom, 12)
+            if s.degraded {
+                degradedBanner(s.inventoryReason).padding(.horizontal, 12).padding(.bottom, 10)
+            }
+            if let e = model.loadError {
+                OutcomeBanner(banner: Banner(tone: .warning, title: "Could not refresh",
+                                             body: "— \(e). Showing the previous sample."),
+                              onRefresh: { model.refresh() }, onDismiss: { model.loadError = nil })
+                    .padding(.horizontal, 12).padding(.bottom, 10)
+            }
+            if let b = model.banner {
+                OutcomeBanner(banner: b, onRefresh: { model.banner = nil; model.refresh() },
+                              onDismiss: { withAnimation(motion(0.12)) { model.banner = nil } })
+                    .padding(.horizontal, 12).padding(.bottom, 10)
+                    .transition(.opacity)
+            }
+            toolbar.padding(.horizontal, 16).padding(.bottom, 8)
+            HStack {
+                Text("Task / app")
+                Spacer()
+                Text(model.sort.columnHeader)
+            }
+            .font(ft(11)).foregroundColor(P.muted)
+            .padding(.horizontal, 18).padding(.bottom, 3)
+            .accessibilityHidden(true)
+            ownerList(s).padding(.horizontal, 8).padding(.bottom, 8)
+            // Without a Background section the line has nowhere else to go.
+            if !sectionedOwners(s.rows, by: model.sort).contains(where: { $0.0 == .background }) {
+                Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
+                    .padding(.horizontal, 18).padding(.bottom, 8)
+            }
+            if !s.runnerJobs.isEmpty {
+                managedJobs(s.runnerJobs).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
+            }
+            gateSection(s).padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 10)
+        }
+        .animation(motion(0.12), value: model.banner == nil)
+    }
+
+    // MARK: health
+
+    private func systemLine(_ s: OwnersSnap) -> String {
+        "System and other users: not itemised"
+            + (s.hiddenProcesses.flatMap { $0 > 0 ? " (\(plural($0, "process", "processes")))" : nil } ?? "")
+    }
+
+    private func healthCard(_ s: OwnersSnap) -> some View {
+        let sys = s.system
+        let level = sys.scoreLevel
+        let tint = P.tint(level)
+        let segments = ringSegments(s.rows, used: sys.usedBytes)
+        let used = sys.usedBytes, ram = sys.ramBytes
+        // A partial sum would understate the machine, so memmon sends a CPU
+        // total only when every process was measured (coverage exactly 1).
+        let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
+        let cpuMissing = s.degraded ? "CPU not measured"
+            : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU still measuring some processes"
+        let ncpu = sys.ncpu ?? Double(ProcessInfo.processInfo.activeProcessorCount)
+        let over = (used ?? 0) > (ram ?? .infinity)
+        let free = used.flatMap { u in ram.map { max($0 - u, 0) } }
+        let legend = Array(segments.filter { if case .section = $0.kind { return true }; return false }
+            .sorted { $0.bytes > $1.bytes }.prefix(4))
+            + segments.filter { $0.kind == .system }
+        let spokenMemory: String = {
+            guard let used else { return "Memory in use not available, pressure \(pressureWord(level).lowercased())" }
+            var head = "Memory " + String(format: "%.1f", used / GB)
+            head += ram.map { String(format: " of %.0f GB in use", $0 / GB) } ?? " GB in use"
+            if over { head += ", over the limit" }
+            head += ", pressure \(pressureWord(level).lowercased())"
+            let parts = segments.map { "\($0.name) \($0.spoken)" } + (free.map { ["free \(gb($0))"] } ?? [])
+            return head + "; " + parts.joined(separator: ", ")
+        }()
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 16) {
+                ZStack {
+                    MemoryRing(segments: segments, used: used, ram: ram, animate: !flattened)
+                        .help("Memory in use. Each section adds up its processes' footprints, compressed pages included; every process counts once, under its owner.")
+                    VStack(spacing: 1) {
+                        HStack(alignment: .firstTextBaseline, spacing: 2) {
+                            Text(used.map { String(format: "%.1f", $0 / GB) } ?? "—")
+                                .font(.system(size: 22, weight: .semibold)).foregroundColor(P.text)
+                            if used != nil {
+                                Text("GB").font(ft(10, .semibold)).foregroundColor(P.muted)
+                            }
+                        }
+                        Text(used == nil ? "not available" : ram.map { String(format: "in use of %.0f", $0 / GB) } ?? "in use")
+                            .font(ft(10)).foregroundColor(P.muted)
+                        Text(pressureWord(level)).font(ft(10, .semibold)).foregroundColor(tint)
+                            .padding(.horizontal, 7).padding(.vertical, 1)
+                            .background(Capsule().fill(tint.opacity(0.14)))
+                            .padding(.top, 2)
+                    }
+                    .monospacedDigit()
+                }
+                .frame(width: 112, height: 112)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(spokenMemory)
+                VStack(alignment: .leading, spacing: 5) {
+                    if used == nil {
+                        Text("Memory in use not available").font(ft(12)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    ForEach(legend) { seg in legendRow(seg, s) }
+                    if let free {
+                        let split = freeSplit(sys, free: free)
+                        Button { withAnimation(motion(0.16)) { model.toggleFree() } } label: {
+                            LegendRow(color: P.track, outlined: true, name: "Free", value: gb(free))
+                        }
+                        .buttonStyle(.plain)
+                        .help(split.sentence)
+                        .accessibilityLabel("Free \(gb(free)). " + split.sentence)
+                        .accessibilityValue(model.freeOpen ? "expanded" : "collapsed")
+                        if model.freeOpen {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(split.rows, id: \.0) { name, value in
+                                    HStack {
+                                        Text(name).font(ft(11)).foregroundColor(P.muted)
+                                        Spacer(minLength: 4)
+                                        Text(value).font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                                    }
+                                }
+                                Text("macOS hands cache back the moment an app needs it.")
+                                    .font(ft(10)).foregroundColor(P.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.leading, 16)
+                            .accessibilityElement(children: .combine)
                         }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12).background(P.card).cornerRadius(10)
             }
-
-            gateSection
-            HStack(spacing: 10) {
-                StatTile(icon: "cpu.fill", label: "RAM",
-                         value: String(format: "%.0f", s.ramUsed / s.ramTotal * 100),
-                         unit: "% used",
-                         caption: "\(human(s.ramUsed)) of \(human(s.ramTotal)) · \(human(s.compressed)) compressed",
-                         progress: s.ramUsed / s.ramTotal, tint: P.ram)
-                StatTile(icon: "internaldrive.fill", label: "Swap",
-                         value: human(s.swapUsed), unit: "on disk",
-                         caption: String(format: "%.2fx RAM size · load %.1f",
-                                         s.swapUsed / s.ramTotal, s.load),
-                         progress: min(s.swapUsed / s.ramTotal, 1),
-                         tint: s.swapUsed > s.ramTotal ? P.red : P.swap,
-                         badge: s.swapUsed > s.ramTotal ? "over" : nil)
-            }
-            if s.orphanTotal > 0 { orphanCard }
-
-
-            if !s.sessions.isEmpty {
-                Section(title: "Claude sessions", count: s.sessions.count,
-                        open: $openSessions) {
-                    VStack(spacing: 7) {
-                        Legend()
-                        if finishedMem > 0 {
-                            // Finished sessions are free memory: the work is done,
-                            // closing one costs nothing.
-                            Text("\(finishedCount) completed session"
-                                 + (finishedCount == 1 ? "" : "s")
-                                 + " still holding \(human(finishedMem)) — safe to close")
-                                .font(.system(size: 9)).foregroundColor(P.green)
-                        }
-                        ForEach(s.sessions) { sess in
-                            SessionCard(
-                                s: sess,
-                                expanded: Binding(
-                                    get: { previewExpandAll
-                                           || expandedSessions.contains(sess.name) },
-                                    set: { on in
-                                        if on { expandedSessions.insert(sess.name) }
-                                        else { expandedSessions.remove(sess.name) }
-                                    }),
-                                onEnd: { onEndSession(sess) })
-                        }
-                    }
-                }
-            }
-            if !s.worktrees.isEmpty {
-                Section(title: "Work by worktree", count: s.worktrees.count,
-                        open: $openWorktrees) {
-                    VStack(spacing: 6) { ForEach(s.worktrees) { worktreeRow($0) } }
-                }
-            }
-            if !s.apps.isEmpty {
-                Section(title: "Other apps", count: s.apps.count,
-                        open: $openApps) {
-                    VStack(spacing: 6) {
-                        ForEach(s.apps.prefix(6)) { a in
-                            HStack(spacing: 8) {
-                                Circle().fill(P.faint).frame(width: 5, height: 5)
-                                Text(a.name).font(.system(size: 10.5, weight: .medium))
-                                    .foregroundColor(P.text).lineLimit(1)
-                                Text("\(a.procs)p").font(.system(size: 8.5))
-                                    .foregroundColor(P.faint)
-                                Spacer(minLength: 4)
-                                Text(human(a.mem))
-                                    .font(.system(size: 11, weight: .bold,
-                                                  design: .rounded))
-                                    .foregroundColor(a.mem > sessionTotal
-                                                     ? P.amber : P.text)
-                            }
-                            .padding(.vertical, 5).padding(.horizontal, 11)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
-                        }
-                        if let biggest = s.apps.first, biggest.mem > sessionTotal {
-                            Text("\(biggest.name) alone outweighs every Claude "
-                                 + "session combined (\(human(sessionTotal)))")
-                                .font(.system(size: 9)).foregroundColor(P.amber)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-            }
-            if s.idleSpares > 0 {
-                Section(title: "Claude runtime pool", count: s.idleSpares,
-                        open: $openPool) {
-                    Text("\(s.idleSpares) idle prewarm process(es) holding "
-                         + "\(human(s.idleSpareMem)). Claimed sessions are counted "
-                         + "above and are never reclaimable.")
-                        .font(.system(size: 9.5)).foregroundColor(P.faint)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+            // Plain words on the card; the raw score and kernel level are for hover.
+            Text("\(cpuNow.map { String(format: "CPU %.1f of %.0f cores busy", $0, ncpu) } ?? cpuMissing)"
+                 + (sys.reason.map { " · memory reading failed: \($0)" } ?? ""))
+                .font(ft(11)).foregroundColor(P.muted).monospacedDigit()
+                .fixedSize(horizontal: false, vertical: true)
+                .help("Pressure score \(level ?? "unavailable") · macOS memory pressure \(sys.pressureLevel ?? "unavailable")")
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
+        .panel(13)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("System memory")
     }
 
-    private var verdict: some View {
-        Card(tint: tint.opacity(0.40)) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: s.level == "HEALTHY"
-                          ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
-                        .font(.system(size: 11, weight: .bold)).foregroundColor(tint)
-                    Text("MEMORY NOW · \(s.level)")
-                        .font(.system(size: 12, weight: .heavy, design: .rounded))
-                        .foregroundColor(tint)
-                        .lineLimit(1).minimumScaleFactor(0.75)
-                    Spacer()
-                    // Only once something is actually wrong. A red "~19 min left"
-                    // sitting on a green HEALTHY card contradicts itself, and the
-                    // projection is too noisy to be worth alarming about while
-                    // the machine is fine.
-                    if let h = s.headroom, h < 120, s.level != "HEALTHY" {
-                        Badge(text: String(format: "~%.0f min to low headroom", h),
-                              color: P.red)
+    /// Free memory, split when the reader knows how much is truly empty.
+    private func freeSplit(_ sys: SystemInfo, free: Double) -> (rows: [(String, String)], sentence: String) {
+        guard let idle = sys.idleBytes, let cache = sys.cacheBytes else {
+            return ([], "Memory no app is using right now.")
+        }
+        return ([("Empty now", gb(idle)), ("Cache macOS can reclaim", gb(cache))],
+                "\(gb(idle)) empty right now and \(gb(cache)) of file cache macOS reclaims when an app needs it.")
+    }
+
+    @ViewBuilder private func legendRow(_ seg: RingSegment, _ s: OwnersSnap) -> some View {
+        switch seg.kind {
+        case .section(let sec):
+            Button {
+                withAnimation(motion(0.16)) { model.openFromLegend(sec) }
+            } label: {
+                LegendRow(color: P.section(sec), name: seg.name, value: seg.shown)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show \(seg.name) in the list, \(seg.spoken)")
+        case .system:
+            LegendRow(color: P.system, name: seg.name, value: seg.shown)
+                .help(systemLine(s))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("System & other, \(seg.spoken). " + systemLine(s))
+        }
+    }
+
+    private func protectionPill(_ s: OwnersSnap) -> some View {
+        let p = s.protection
+        let (short, full, tint): (String, String, Color) = {
+            switch p?.summary {
+            case "on": return ("Protection on", "Protection on · no heavy processes outside memmon run", P.green)
+            case "partial":
+                let n = p?.unmanagedHeavy ?? 0
+                return ("Protection partial · \(n) outside memmon run",
+                        "Protection partial · \(plural(n, "heavy process", "heavy processes")) not started through memmon run",
+                        P.amber)
+            case "paused": return ("Protection paused", "Protection paused · commands run without a memory check", P.amber)
+            case "off": return ("Protection off", "Protection off · the command gate is not installed or is disabled", P.muted)
+            default: return ("Protection unknown", "Protection status unknown", P.muted)
+            }
+        }()
+        return HStack(spacing: 5) {
+            Image(systemName: p?.summary == "on" ? "checkmark.shield" : "shield")
+                .font(.system(size: 11, weight: .semibold))
+            Text(short).font(ft(11, .medium)).lineLimit(1)
+        }
+        .foregroundColor(tint)
+        .padding(.horizontal, 9).frame(height: 22)
+        .background(Capsule().fill(tint.opacity(0.13)))
+        .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
+        .fixedSize()
+        .help(full)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(full)
+    }
+
+    private func degradedBanner(_ reason: String?) -> some View {
+        // The producer's reason may already name libproc; say it only once.
+        let cause = reason.map { $0.localizedCaseInsensitiveContains("libproc") ? $0 : "libproc is unavailable (\($0))" }
+            ?? "libproc is unavailable"
+        let detail = cause + ", so memory comes from top and stop actions are off."
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle").foregroundColor(P.amber).padding(.top, 1)
+                .accessibilityHidden(true)
+            Text("\(Text("Limited process details").fontWeight(.medium)) — \(detail)")
+                .font(ft(12)).foregroundColor(P.text)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.amber.opacity(0.16)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Limited process details: " + detail)
+    }
+
+    // MARK: owners
+
+    private var toolbar: some View {
+        HStack(spacing: 8) {
+            Text("Sessions & apps").font(ft(14, .medium))
+            Spacer()
+            HStack(spacing: 2) {
+                ForEach(SortKey.allCases, id: \.self) { key in
+                    let on = model.sort == key
+                    Button { model.sort = key } label: {
+                        Text(key.label).font(ft(12))
+                            .foregroundColor(on ? P.text : P.muted)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(on ? P.panel : Color.clear))
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(on ? P.border : Color.clear, lineWidth: 1))
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Sort by \(key.label)")
+                    .accessibilityAddTraits(on ? .isSelected : [])
                 }
-                LevelTrack(score: s.score, level: s.level)
-                // Names the actual offender rather than repeating canned advice.
-                Text(s.advice).font(.system(size: 10)).foregroundColor(P.dim)
-                    .fixedSize(horizontal: false, vertical: true)
-                if !s.reasons.isEmpty {
-                    Text("Memory signals now: " + s.reasons.joined(separator: " · "))
-                        .font(.system(size: 9)).foregroundColor(P.faint)
-                        .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(3)
+            .background(RoundedRectangle(cornerRadius: 8).fill(P.soft))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Sort owners")
+        }
+    }
+
+    private func ownerList(_ s: OwnersSnap) -> some View {
+        let sections = sectionedOwners(s.rows, by: model.sort)
+        return VStack(alignment: .leading, spacing: 0) {
+            if sections.isEmpty {
+                Text("No owners found in this sample.").font(ft(12)).foregroundColor(P.muted)
+                    .padding(10)
+            }
+            ForEach(sections, id: \.0) { sec, rows in
+                let open = model.isOpen(sec, rows)
+                SectionHeader(section: sec, rows: rows, open: open, sort: model.sort) {
+                    withAnimation(motion(0.16)) { model.toggle(sec, rows) }
+                }
+                .id("section-" + sec.rawValue)
+                if open {
+                    let (shown, hidden) = model.visible(sec, rows)
+                    VStack(alignment: .leading, spacing: 0) { ownerRows(shown, s) }
+                        .padding(.leading, 20).padding(.top, 3)
+                        .overlay(Rectangle().fill(P.section(sec).opacity(0.5)).frame(width: 2)
+                                    .padding(.leading, 13).padding(.vertical, 6),
+                                 alignment: .leading)
+                    if hidden > 0 {
+                        Button { withAnimation(motion(0.16)) { _ = model.showAll.insert(sec) } } label: {
+                            Text("Show \(hidden) more").font(ft(12)).foregroundColor(P.accent)
+                                .padding(.horizontal, 38).padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show \(hidden) more in \(sec.title)")
+                    }
+                    if sec == .background {
+                        Text(systemLine(s)).font(ft(11)).foregroundColor(P.muted)
+                            .padding(.horizontal, 10).padding(.top, 4)
+                    }
                 }
             }
         }
     }
 
+    private func ownerRows(_ rows: [Owner], _ s: OwnersSnap) -> some View {
+        ForEach(rows) { o in
+            let open = model.expanded == o.id
+            OwnerRow(owner: o, sort: model.sort, expanded: open) {
+                withAnimation(motion(0.16)) { model.expanded = open ? nil : o.id }
+            }
+            if open {
+                OwnerDetailCard(
+                    owner: o, degraded: s.degraded,
+                    techOpen: Binding(get: { model.techOpen.contains(o.id) },
+                                      set: { on in
+                                          if on { model.techOpen.insert(o.id) } else { model.techOpen.remove(o.id) }
+                                      }),
+                    animation: motion(0.16),
+                    onAsk: { kind in withAnimation(motion(0.12)) { model.ask(kind, o) } })
+                    .padding(.top, 2).padding(.bottom, 8)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    // MARK: managed jobs (memmon run)
+
+    private func managedJobs(_ jobs: [ManagedJob]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "list.bullet.rectangle").font(.system(size: 13, weight: .medium))
+                    .foregroundColor(P.muted).accessibilityHidden(true)
+                Text("Managed jobs").font(ft(13, .medium))
+                Spacer()
+                Text("memmon run").font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
+            }
+            .padding(.bottom, 4)
+            ForEach(jobs) { job in
+                let line = "\(job.label) · \(job.state) · \(ageText(Double(job.elapsed)))"
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(line).font(ft(12, .medium)).foregroundColor(P.text)
+                    Text(job.reason.isEmpty ? job.resource : "\(job.resource) — \(job.reason)")
+                        .font(ft(11)).foregroundColor(P.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Managed job \(line), \(job.resource)" + (job.reason.isEmpty ? "" : ", \(job.reason)"))
+            }
+        }
+        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 4)
+        .panel(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Managed jobs")
+    }
+
+    // MARK: gate (retained)
 
     private var recentWarnings: [GateEvent] {
-        s.gate.events.filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
+        (model.snap?.gate.events ?? []).filter { $0.action == "warn" }.sorted { $0.ts > $1.ts }
     }
     // Stops split by whether they still represent unfinished work. A command
     // that never ran and is still waiting is the one thing here nobody should
@@ -1156,19 +3794,19 @@ struct ContentView: View {
     // uncapped list grew with the log and pushed the rest of the popover down
     // for no benefit, since an already-retried stop is not actionable.
     private var pendingStops: [GateEvent] {
-        s.gate.events.filter { $0.action == "block" && $0.retryStatus == "waiting" }
+        (model.snap?.gate.events ?? []).filter { $0.action == "block" && $0.retryStatus == "waiting" }
             .sorted { $0.ts > $1.ts }
     }
     private var resolvedStops: [GateEvent] {
-        s.gate.events.filter { $0.action == "block" && $0.retryStatus != "waiting" }
+        (model.snap?.gate.events ?? []).filter { $0.action == "block" && $0.retryStatus != "waiting" }
             .sorted { $0.ts > $1.ts }
     }
 
-    private var policyCopy: String {
-        if s.gate.paused {
+    private func policyCopy(_ g: GateStats) -> String {
+        if g.paused {
             return "Command protection is paused. Every command runs without a memory check. History below is unchanged."
         }
-        switch s.gate.mode {
+        switch g.mode {
         case "block":
             return "Current policy: WATCH warns; DANGER or CRITICAL stops before running."
         case "warn":
@@ -1178,287 +3816,284 @@ struct ContentView: View {
         }
     }
 
-    private func policyResult(_ level: String) -> String {
-        if s.gate.paused { return "runs without a memory check" }
+    /// Opens the list of command rules; an info glyph beside the policy line.
+    private var matchRulesButton: some View {
+        Button { withAnimation(motion(0.16)) { openMatchRules.toggle() } } label: {
+            Image(systemName: openMatchRules ? "info.circle.fill" : "info.circle")
+                .font(.system(size: 12)).foregroundColor(P.muted)
+        }
+        .buttonStyle(.plain)
+        .help("What commands match?")
+        .accessibilityLabel("What commands match?")
+        .accessibilityValue(openMatchRules ? "expanded" : "collapsed")
+    }
+
+    /// One word per level for the policy strip: runs, warns or stops.
+    private func policyVerb(_ g: GateStats, _ level: String) -> String {
+        let r = policyResult(g, level)
+        if r.hasPrefix("stopped") { return "stops" }
+        if r.hasPrefix("warned") { return "warns" }
+        return "runs"
+    }
+
+    private func policyResult(_ g: GateStats, _ level: String) -> String {
+        if g.paused { return "runs without a memory check" }
         if level == "HEALTHY" { return "runs silently" }
-        if s.gate.mode == "warn" { return "warned; command ran" }
-        if s.gate.mode == "block" && (level == "DANGER" || level == "CRITICAL") {
+        if g.mode == "warn" { return "warned; command ran" }
+        if g.mode == "block" && (level == "DANGER" || level == "CRITICAL") {
             return "stopped before running"
         }
-        if s.gate.mode == "block-critical" && level == "CRITICAL" {
+        if g.mode == "block-critical" && level == "CRITICAL" {
             return "stopped before running"
         }
         return "warned; command ran"
     }
 
-    private var retryCopy: String {
-        if s.gate.paused {
-            return "Protection is paused; retrying now will run without a memory check."
+    private func retryCopy(_ s: OwnersSnap) -> (String, Color) {
+        let g = s.gate
+        if g.paused {
+            return ("Protection is paused; retrying now will run without a memory check.", P.amber)
         }
-        if s.level == "HEALTHY" {
-            return "Memory is HEALTHY now — waiting commands can be retried."
+        guard let level = s.system.scoreLevel else {
+            return ("Memory level is unknown right now; a retry may be stopped again.", P.amber)
         }
-        let stops = (s.level == "CRITICAL" && s.gate.mode != "warn")
-            || (s.level == "DANGER" && s.gate.mode == "block")
-        return stops
-            ? "If memory stays \(s.level), a retry will be stopped again."
-            : "If memory stays \(s.level), a retry will be warned and will run."
+        if level == "HEALTHY" {
+            return ("Memory is HEALTHY now — waiting commands can be retried.", P.green)
+        }
+        let stops = (level == "CRITICAL" && g.mode != "warn")
+            || (level == "DANGER" && g.mode == "block")
+        return (stops
+            ? "If memory stays \(level), a retry will be stopped again."
+            : "If memory stays \(level), a retry will be warned and will run.", P.amber)
     }
 
-    private var gateSection: some View {
+    private func gateSection(_ s: OwnersSnap) -> some View {
         let g = s.gate
         let isOpen = previewOpenGate || openGate
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 5) {
-                Button { withAnimation(.easeInOut(duration: 0.16)) { openGate.toggle() } } label: {
-                    HStack(spacing: 5) {
-                        Chevron(open: isOpen)
-                        Text("COMMAND WARNINGS & STOPS")
-                            .font(.system(size: 8.2, weight: .heavy, design: .rounded))
-                            .tracking(0.45).foregroundColor(P.dim)
-                    }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                Spacer(minLength: 3)
-                if g.installed {
-                    Circle().fill(g.paused ? P.amber : P.green).frame(width: 6, height: 6)
-                    Text(g.paused ? "PAUSED" : "ACTIVE")
-                        .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                        .foregroundColor(g.paused ? P.amber : P.green)
-                    FooterButton(icon: g.paused ? "play.fill" : "pause.fill",
-                                 label: g.paused ? "Resume" : "Pause",
-                                 tint: g.paused ? P.green : P.dim) {
-                        onToggleGate(!g.paused)
-                    }
-                    .help(g.paused ? "Resume command warnings and stops"
-                                   : "Pause command warnings and stops")
-                }
-            }
-
-            if !isOpen {
-                if !g.installed {
-                    Text("Command protection is not installed")
-                        .font(.system(size: 9)).foregroundColor(P.faint)
-                } else if g.paused {
-                    Text("Every command currently runs without a memory check")
-                        .font(.system(size: 9)).foregroundColor(P.faint)
-                } else {
-                    Text("Retained since \(retainedDate(g.since)) · \(g.warned) warned and ran · \(g.stopped) stopped")
-                        .font(.system(size: 9)).foregroundColor(P.faint)
-                    if !g.complete {
-                        Text("Older activity may be missing")
-                            .font(.system(size: 8.5)).foregroundColor(P.faint)
-                    }
-                }
-            } else if !g.installed {
-                Text("Command protection is not installed. Memory monitoring is active; commands are never warned or stopped.")
-                    .font(.system(size: 9.5)).foregroundColor(P.dim)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                VStack(alignment: .leading, spacing: 9) {
-                    if g.paused {
-                        Text(policyCopy).font(.system(size: 9.5)).foregroundColor(P.amber)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text("Only commands that match a memory-intensive rule are checked.")
-                            .font(.system(size: 9.5)).foregroundColor(P.dim)
-                        Text(policyCopy).font(.system(size: 9.5, weight: .medium))
-                            .foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Text("MATCHED COMMAND + MEMORY THEN → RESULT")
-                        .font(.system(size: 8, weight: .heavy, design: .rounded))
-                        .tracking(0.45).foregroundColor(P.faint)
-                    VStack(spacing: 3) {
-                        DecisionRow(level: "HEALTHY", result: policyResult("HEALTHY"))
-                        DecisionRow(level: "WATCH", result: policyResult("WATCH"))
-                        DecisionRow(level: "DANGER", result: policyResult("DANGER"))
-                        DecisionRow(level: "CRITICAL", result: policyResult("CRITICAL"))
-                    }
-
-                    Button { withAnimation(.easeInOut(duration: 0.16)) {
-                        openMatchRules.toggle()
-                    }} label: {
-                        HStack {
-                            Text("WHAT COMMANDS MATCH?")
-                                .font(.system(size: 8, weight: .heavy, design: .rounded))
-                                .tracking(0.45).foregroundColor(P.faint)
-                            Spacer()
-                            Chevron(open: openMatchRules)
-                        }.contentShape(Rectangle())
-                    }.buttonStyle(.plain)
-                    if openMatchRules {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Package tasks: typecheck, build, test, install, dev, lint")
-                            Text("Tools: tsc, Vitest, Jest, Playwright, pytest, Cargo, Gradle, Bazel, Xcodebuild, webpack, make, Next, Expo, Docker, Colima")
-                            Text("Verified commands learned from this Mac are labelled “Learned”.")
-                            Text("Other commands run without a memory check.")
-                        }
-                        .font(.system(size: 9)).foregroundColor(P.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if g.errors > 0 {
-                        Text("Command protection failed open \(g.errors) times. Those commands ran.")
-                            .font(.system(size: 9.5)).foregroundColor(P.amber)
-                    }
-
-                    if g.warned == 0 && g.stopped == 0 && g.pending.isEmpty {
-                        Text("No warnings or stops since \(retainedDate(g.since, includeTime: true)).")
-                            .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.green)
-                        Text("Matched commands run silently while memory is HEALTHY.\nAt WATCH or DANGER they run with a warning.\nAt CRITICAL they are stopped before running.")
-                            .font(.system(size: 9)).foregroundColor(P.dim)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        stoppedHistory
-                        warningHistory
-                    }
-
-                    if g.evaluated > 0 {
-                        Text("Retained activity since \(retainedDate(g.since, includeTime: true)).")
-                            .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        if !g.complete {
-                            Text("Older activity may be missing.")
-                                .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        }
-                        if let to = g.historyTo {
-                            Text("Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate(to, includeTime: true)).")
-                                .font(.system(size: 8.5)).foregroundColor(P.faint)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private var stoppedHistory: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("STOPPED BEFORE RUNNING")
-                    .font(.system(size: 8, weight: .heavy, design: .rounded))
-                    .tracking(0.45).foregroundColor(P.red)
-                Spacer()
-                Text("\(s.gate.stopped)").font(.system(size: 9, weight: .bold))
-                    .foregroundColor(P.red)
-            }
-            if !s.gate.pending.isEmpty {
-                Text("\(s.gate.pending.count) waiting to retry")
-                    .font(.system(size: 9.5, weight: .medium)).foregroundColor(P.red)
-                Text(retryCopy).font(.system(size: 9)).foregroundColor(
-                    s.level == "HEALTHY" || s.gate.paused ? P.green : P.amber)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            // Unfinished work first, never truncated.
-            ForEach(pendingStops) { GateEventCard(event: $0) }
-            ForEach(s.gate.pending.filter { !$0.eventRetained }) {
-                MissingGateEventCard(item: $0)
-            }
-            if showAllStops {
-                LazyVStack(spacing: 7) {
-                    ForEach(resolvedStops) { GateEventCard(event: $0) }
-                }
-            } else {
-                ForEach(Array(resolvedStops.prefix(3))) { GateEventCard(event: $0) }
-            }
-            if resolvedStops.count > 3 {
-                Button(showAllStops
-                       ? "Show only 3 recent stops"
-                       : "Show all \(resolvedStops.count) earlier stops") {
-                    withAnimation(.easeInOut(duration: 0.16)) { showAllStops.toggle() }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundColor(P.red)
-            }
-            if pendingStops.isEmpty && resolvedStops.isEmpty && s.gate.pending.isEmpty {
-                Text("No commands have been stopped since \(retainedDate(s.gate.since)).")
-                    .font(.system(size: 9)).foregroundColor(P.faint)
-            }
-        }
-    }
-
-    private var warningHistory: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("WARNED — COMMAND RAN")
-                    .font(.system(size: 8, weight: .heavy, design: .rounded))
-                    .tracking(0.45).foregroundColor(P.amber)
-                Spacer()
-                Text("\(s.gate.warned)").font(.system(size: 9, weight: .bold))
-                    .foregroundColor(P.amber)
-            }
-            if showAllWarnings {
-                LazyVStack(spacing: 7) {
-                    ForEach(recentWarnings) { GateEventCard(event: $0) }
-                }
-            } else {
-                ForEach(Array(recentWarnings.prefix(3))) { GateEventCard(event: $0) }
-            }
-            if recentWarnings.count > 3 {
-                Button(showAllWarnings
-                       ? "Show only 3 recent warnings"
-                       : "Show all \(s.gate.warned) retained warnings") {
-                    withAnimation(.easeInOut(duration: 0.16)) { showAllWarnings.toggle() }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundColor(P.amber)
-            }
-        }
-    }
-
-    private var orphanCard: some View {
-        Card(tint: P.red.opacity(0.45)) {
+        let status = s.gateMissing ? "Status unavailable" : !g.installed ? "Not installed"
+            : g.paused ? "Paused" : "Active"
+        let statusTint: Color? = s.gateMissing || !g.installed ? nil : g.paused ? P.amber : P.green
+        let counts = g.installed ? "\(g.warned) warned · \(g.stopped) stopped" : nil
+        return VStack(alignment: .leading, spacing: 8) {
+            // One row: what it is, its state and its counts; the row opens
+            // policy and history, the button pauses or resumes.
             HStack(spacing: 8) {
-                Image(systemName: "trash.fill").font(.system(size: 11, weight: .bold))
-                    .foregroundColor(P.red)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("\(human(s.orphanTotal)) reclaimable")
-                        .font(.system(size: 11.5, weight: .bold)).foregroundColor(P.text)
-                    Text("\(s.orphanCount) orphaned build process\(s.orphanCount == 1 ? "" : "es")")
-                        .font(.system(size: 9)).foregroundColor(P.faint)
+                Button { withAnimation(motion(0.16)) { openGate.toggle() } } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "shield").font(.system(size: 13, weight: .medium))
+                            .foregroundColor(statusTint ?? P.muted)
+                        Text("Command protection").font(ft(13, .medium)).lineLimit(1).fixedSize()
+                        Chip(text: status, tint: statusTint)
+                        if let counts {
+                            // Words when they fit; otherwise the warned and
+                            // stopped symbols the history uses, each with its count.
+                            ViewThatFits(in: .horizontal) {
+                                Text(counts).font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                                HStack(spacing: 6) {
+                                    Label("\(g.warned)", systemImage: "exclamationmark.triangle")
+                                        .foregroundColor(g.warned > 0 ? P.amber : P.muted)
+                                    Label("\(g.stopped)", systemImage: "nosign")
+                                        .foregroundColor(g.stopped > 0 ? P.red : P.muted)
+                                }
+                                .labelStyle(CompactLabel())
+                                .font(ft(11, .medium)).fixedSize()
+                                Color.clear.frame(width: 0, height: 0)
+                            }
+                        }
+                        Spacer(minLength: 2)
+                        Chevron(open: isOpen)
+                    }
+                    .contentShape(Rectangle())
                 }
-                Spacer()
-                FooterButton(icon: "bolt.fill", label: "Reap", tint: P.red,
-                             action: onReap)
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Command protection, \(status)" + (counts.map { ", \($0)" } ?? "")
+                                    + (g.installed ? ", policy and history" : ", what command protection does"))
+                .accessibilityValue(isOpen ? "expanded" : "collapsed")
+                .accessibilityAddTraits(.isButton)
+                if g.installed {
+                    ActionButton(title: "", icon: g.paused ? "play.fill" : "pause.fill", variant: .icon) {
+                        model.toggleGate(!g.paused)
+                    }
+                    .help(g.paused ? "Resume command protection" : "Pause command protection")
+                    .accessibilityLabel(g.paused ? "Resume command protection" : "Pause command protection")
+                }
+            }
+            if g.installed && g.paused {
+                Text(g.pausedUntil.map { "Paused until \(eventTime($0)) · every command runs without a memory check" }
+                     ?? "Paused · every command runs without a memory check")
+                    .font(ft(12)).foregroundColor(P.amber).fixedSize(horizontal: false, vertical: true)
+            }
+            if !g.pending.isEmpty {
+                let (copy, tint) = retryCopy(s)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(plural(g.pending.count, "blocked command")) waiting to retry")
+                        .font(ft(12, .medium))
+                    ForEach(g.pending.sorted { $0.ts > $1.ts }) { p in
+                        let who = p.sessionName ?? (p.sessionID.isEmpty ? "unknown session" : p.sessionID)
+                        let when = "blocked at \(p.pressureLevel) \(relative(p.ts))"
+                        HStack(alignment: .center, spacing: 6) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(p.commandShort ?? p.commandDisplay)
+                                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.text)
+                                    .lineLimit(1).truncationMode(.middle)
+                                Text("\(who) · \(when)").font(ft(11)).foregroundColor(P.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .help(p.commandDisplay)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("\(p.commandDisplay) · \(who) · \(when)")
+                            Spacer(minLength: 4)
+                            if let id = p.pendingID {
+                                ActionButton(title: "Dismiss", variant: .link) { model.dismissBlocked(id) }
+                                    .accessibilityLabel("Dismiss blocked \(p.commandShort ?? p.commandDisplay)")
+                            }
+                        }
+                    }
+                    Text(copy).font(ft(11)).foregroundColor(tint).fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.amber.opacity(0.62), lineWidth: 1))
+                .accessibilityElement(children: .contain)
+            }
+            if isOpen { gateDetail(s) }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .panel(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Command protection")
+    }
+
+    @ViewBuilder private func gateDetail(_ s: OwnersSnap) -> some View {
+        let g = s.gate
+        if s.gateMissing {
+            Text("memmon did not report the command gate's state this time.")
+                .font(ft(11)).foregroundColor(P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if !g.installed {
+            Text("Command protection is not installed. Memory monitoring is active; commands are never warned or stopped.")
+                .font(ft(11)).foregroundColor(P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            VStack(alignment: .leading, spacing: 9) {
+                if g.paused {
+                    Text(policyCopy(g)).font(ft(11)).foregroundColor(P.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    // The whole policy in one line; the sentence is for hover and VoiceOver.
+                    let sentence = policyCopy(g) + " Only commands that match a memory-intensive rule are checked."
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        PolicyStrip(levels: ["HEALTHY", "WATCH", "DANGER", "CRITICAL"].map { ($0, policyVerb(g, $0)) })
+                            .help(sentence)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(sentence)
+                        Spacer(minLength: 2)
+                        matchRulesButton
+                    }
+                }
+                if g.paused { matchRulesButton }
+                if openMatchRules {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Package tasks: typecheck, build, test, install, dev, lint")
+                        Text("Tools: tsc, Vitest, Jest, Playwright, pytest, Cargo, Gradle, Bazel, Xcodebuild, webpack, make, Next, Expo, Docker, Colima")
+                        Text("Verified commands learned from this Mac are labelled “Learned”.")
+                        Text("Other commands run without a memory check.")
+                    }
+                    .font(ft(11)).foregroundColor(P.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                if g.errors > 0 {
+                    Text("Command protection failed open \(g.errors) times. Those commands ran.")
+                        .font(ft(11)).foregroundColor(P.amber)
+                }
+                if g.warned == 0 && g.stopped == 0 && g.pending.isEmpty {
+                    Text("No warnings or stops since \(retainedDate(g.since, includeTime: true)).")
+                        .font(ft(11, .medium)).foregroundColor(P.green)
+                } else {
+                    recentHistory(g)
+                }
+                if g.evaluated > 0 {
+                    let detail = g.historyTo.map {
+                        "Event details retained from \(retainedDate(g.historyFrom, includeTime: true)) to \(retainedDate($0, includeTime: true))."
+                    } ?? ""
+                    Text("Since \(retainedDate(g.since, includeTime: true))" + (g.complete ? "" : " · older activity may be missing"))
+                        .font(ft(10)).foregroundColor(P.muted)
+                        .help(detail)
+                        .accessibilityLabel("Retained activity since \(retainedDate(g.since, includeTime: true))."
+                            + (g.complete ? "" : " Older activity may be missing.") + (detail.isEmpty ? "" : " " + detail))
+                }
             }
         }
     }
 
-    private func worktreeRow(_ wt: WT) -> some View {
-        let hot = wt.mem > 6 * GB
-        return HStack(spacing: 8) {
-            Circle().fill(hot ? P.red : P.violet).frame(width: 5, height: 5)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(wt.name).font(.system(size: 10.5, weight: .medium))
-                    .foregroundColor(P.text).lineLimit(1)
-                Text("\(wt.tag) · \(wt.procs)p"
-                     + (wt.orphans > 0 ? " · \(wt.orphans) orphaned" : ""))
-                    .font(.system(size: 8.5)).foregroundColor(P.faint)
+    /// Stops and warnings in one list, newest first. Unfinished stops lead and
+    /// are never hidden; the dot says which is which.
+    private func recentHistory(_ g: GateStats) -> some View {
+        let rest = (resolvedStops + recentWarnings).sorted { $0.ts > $1.ts }
+        return VStack(alignment: .leading, spacing: 5) {
+            Text("Recent").font(ft(11, .medium)).foregroundColor(P.muted)
+            ForEach(pendingStops) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
+            ForEach(g.pending.filter { !$0.eventRetained }) { MissingGateEventCard(item: $0) }
+            if showAllStops {
+                LazyVStack(spacing: 5) {
+                    ForEach(rest) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
+                }
+            } else {
+                ForEach(Array(rest.prefix(3))) { GateEventCard(event: $0, animation: motion(0.16), startExpanded: previewOpenEvents) }
             }
-            Spacer(minLength: 4)
-            Text(human(wt.mem))
-                .font(.system(size: 11, weight: .bold, design: .rounded))
-                .foregroundColor(hot ? P.red : P.text)
+            if rest.count > 3 {
+                Button(showAllStops ? "Show only the 3 most recent" : "Show all \(rest.count)") {
+                    withAnimation(motion(0.16)) { showAllStops.toggle() }
+                }
+                .buttonStyle(.plain)
+                .font(ft(11, .medium))
+                .foregroundColor(P.muted)
+            }
         }
-        .padding(.vertical, 6).padding(.horizontal, 11)
-        .background(RoundedRectangle(cornerRadius: 10).fill(P.card))
     }
 
     private var footer: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 8) {
             FooterButton(icon: "arrow.clockwise", label: "Sync") { model.refresh() }
-            Spacer()
-            if let t = model.lastSync {
-                Text(relative(t.timeIntervalSince1970))
-                    .font(.system(size: 9)).foregroundColor(P.faint)
-            }
+            Spacer(minLength: 4)
+            Spacer(minLength: 4)
             FooterButton(icon: "power", label: "Quit", action: onQuit)
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
+        .overlay(Rectangle().fill(P.border).frame(height: 1), alignment: .top)
     }
 }
 
 // MARK: - app
+
+/// The status-item title from the sampler's latest.json: a level dot and swap
+/// in use. An unknown level or a sample older than 180 s gets a neutral dot,
+/// never green.
+func statusTitle(_ j: [String: Any], now: Double) -> String? {
+    guard let used = num(j["swap_used"]) else { return nil }
+    let fresh = num(j["ts"]).map { now - $0 <= 180 } ?? false
+    let dot: String
+    switch fresh ? (j["pressure"] as? String) : nil {
+    case "CRITICAL"?, "DANGER"?: dot = "🔴"
+    case "WATCH"?: dot = "🟠"
+    case "HEALTHY"?: dot = "🟢"
+    default: dot = "⚪"
+    }
+    let text = used >= GB ? String(format: "%.1fG", used / GB) : String(format: "%.0fM", used / MB)
+    return "\(dot) \(text)"
+}
+
+/// The popover's content, shared by the app and the hosted-view self-test.
+/// The popover follows the view's own height, capped at 620 pt.
+@discardableResult
+func configurePopover(_ popover: NSPopover, model: Model, onQuit: @escaping () -> Void)
+    -> NSHostingController<ContentView> {
+    let host = NSHostingController(rootView: ContentView(model: model, onQuit: onQuit))
+    host.sizingOptions = [.preferredContentSize]
+    popover.contentViewController = host
+    return host
+}
 
 final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1468,19 +4103,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        model.popoverShown = false
 
-        popover.contentSize = NSSize(width: 380, height: 620)
+        configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
-            rootView: ContentView(model: model,
-                                  onQuit: { NSApp.terminate(nil) },
-                                  onReap: { [weak self] in self?.reap() },
-                                  onEndSession: { [weak self] s in
-                                      self?.endSession(s) },
-                                  onToggleGate: { [weak self] pause in
-                                      self?.toggleGate(pause) }))
 
         statusItem.button?.action = #selector(toggle)
         statusItem.button?.target = self
@@ -1496,287 +4124,951 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else if let b = statusItem.button {
             NSApp.activate(ignoringOtherApps: true)
+            model.popoverShown = true
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             model.refresh()          // sync on open — the only expensive work
+            model.startTicking()
         }
     }
 
-    func popoverDidClose(_ note: Notification) { updateTitleFromCache() }
+    func popoverDidClose(_ note: Notification) {
+        model.stopTicking()
+        model.popoverClosed()
+        updateTitleFromCache()
+    }
 
     /// Colour comes from the pressure model, not from swap usage: macOS grows
     /// swap on demand, so a large swapfile on its own means nothing.
     func updateTitleFromCache() {
         guard let d = FileManager.default.contents(atPath: cache),
               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-              let used = j["swap_used"] as? Double else { return }
-        let level = j["pressure"] as? String ?? "HEALTHY"
-        let dot: String
-        switch level {
-        case "CRITICAL", "DANGER": dot = "🔴"
-        case "WATCH": dot = "🟠"
-        default: dot = "🟢"
-        }
+              let title = statusTitle(j, now: Date().timeIntervalSince1970) else { return }
         statusItem.button?.attributedTitle = NSAttributedString(
-            string: "\(dot) \(human(used))",
-            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12,
-                                                                 weight: .regular)])
+            string: title,
+            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)])
     }
-
-    /// Ending a session destroys unsaved work in it, so the confirmation states
-    /// exactly what is being killed and is not the default button.
-    func endSession(_ s: Sess) {
-        let a = NSAlert()
-        a.alertStyle = .warning
-        a.messageText = "End “\(s.name)”?"
-        a.informativeText = """
-            This terminates the session and all \(s.procs) of its processes \
-            (\(human(s.total))), including any build it started.
-
-            Anything it has not written to disk is lost. It is sent SIGTERM, so \
-            it will try to flush its transcript first.
-            """
-        a.addButton(withTitle: "Cancel")
-        a.addButton(withTitle: "End session")
-        NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertSecondButtonReturn else { return }
-        model.run(["--end-session", "\(s.root)", "--apply"])
-        model.refresh()
-    }
-
-    /// No confirmation: pausing destroys nothing and is trivially reversible,
-    /// unlike reap and endSession.
-    func toggleGate(_ pause: Bool) {
-        model.run([pause ? "--off" : "--on"])
-        model.refresh()
-    }
-
-    func reap() {
-        let a = NSAlert()
-        a.messageText = "Reap orphaned build processes?"
-        a.informativeText = "Kills orphaned or stale build processes only. "
-            + "Claimed Claude sessions are never touched."
-        a.addButton(withTitle: "Reap")
-        a.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-        model.run(["--reap", "--apply"])
-        model.refresh()
-    }
-
 }
 
-// MARK: - offscreen render
+// MARK: - offscreen render, accessibility audit and self-tests
 //
-// `MemmonBar --render out.png` draws the popover with representative data and
-// exits. The UI is otherwise unreviewable without screen-recording permission,
-// and a layout that only breaks under DANGER with blocked commands is exactly
-// the state you cannot reproduce on demand.
+// `MemmonBar --render out.png --fixture f.json` draws the popover from a
+// synthetic owners payload and exits. The UI is otherwise unreviewable without
+// screen-recording permission, and a layout that only breaks under a partial
+// stop is exactly the state you cannot reproduce on demand.
 
-let PREVIEW_PAUSED = CommandLine.arguments.contains("--paused")
-let PREVIEW_EMPTY = CommandLine.arguments.contains("--empty")
-let PREVIEW_NOT_INSTALLED = CommandLine.arguments.contains("--not-installed")
+let ARGS = CommandLine.arguments
+
+func argValue(_ flag: String) -> String? {
+    guard let i = ARGS.firstIndex(of: flag), i + 1 < ARGS.count else { return nil }
+    return ARGS[i + 1]
+}
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    exit(2)
+}
+
+struct RenderOptions {
+    var dark = false
+    var select: String?
+    var confirm: String?
+    var outcome: String?
+    var sort: SortKey = .memory
+    var techOpen = false
+    var openGate = false
+    var openEvents = false
+    /// The outcome lands while the popover is closed.
+    var popoverClosed = false
+    /// Sections opened (or closed, with a "-" prefix) and sections showing every row.
+    var sections: [String] = []
+    var showAll: [String] = []
+}
+
+/// A fixture may name a `_base` fixture whose keys it overrides, and carries
+/// its own view state in `_view`; command-line flags win over both.
+func loadFixture(_ path: String) -> ([String: Any], [String: Any]) {
+    guard let d = FileManager.default.contents(atPath: path),
+          var j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+        fail("cannot read fixture \(path)")
+    }
+    let view = j["_view"] as? [String: Any] ?? [:]
+    if let base = j["_base"] as? String {
+        let dir = (path as NSString).deletingLastPathComponent
+        var (b, _) = loadFixture((dir as NSString).appendingPathComponent(base))
+        for (k, v) in j where k != "_base" && k != "_view" { b[k] = v }
+        j = b
+    }
+    return (j, view)
+}
+
+func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
+    var o = RenderOptions()
+    o.select = argValue("--select") ?? str(view["select"])
+    o.confirm = argValue("--confirm") ?? str(view["confirm"])
+    if let out = argValue("--outcome") {
+        o.outcome = out
+    } else if let out = str(view["outcome"]) {
+        o.outcome = (fixtureDir as NSString).appendingPathComponent(out)
+    }
+    o.sort = SortKey(rawValue: argValue("--sort") ?? str(view["sort"]) ?? "memory") ?? .memory
+    o.techOpen = ARGS.contains("--tech-open") || (view["tech_open"] as? Bool ?? false)
+    o.openGate = ARGS.contains("--open-gate") || (view["open_gate"] as? Bool ?? false)
+    o.openEvents = view["open_events"] as? Bool ?? false
+    o.dark = ARGS.contains("--dark")
+    o.popoverClosed = view["popover_closed"] as? Bool ?? false
+    // `--sections a,b` opens sections on top of the fixture's own view.
+    o.sections = (view["sections"] as? [String] ?? [])
+        + (argValue("--sections")?.split(separator: ",").map(String.init) ?? [])
+    o.showAll = view["show_all"] as? [String] ?? []
+    return o
+}
+
+/// Builds the model a fixture describes, including any confirm or outcome
+/// state, by driving the same decoders the live app uses.
+func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
+    if let now = num(json["_now"]) { clockOverride = now }
+    guard let snap = OwnersSnap.decode(json) else { fail("fixture is not an owners payload (schema 2)") }
+    let m = Model()
+    m.live = false
+    m.snap = snap
+    m.sort = o.sort
+    m.expanded = o.select
+    if o.techOpen, let s = o.select { m.techOpen = [s] }
+    for name in o.sections {
+        let closed = name.hasPrefix("-")
+        guard let sec = OwnerSection(rawValue: closed ? String(name.dropFirst()) : name) else {
+            fail("unknown section \(name)")
+        }
+        m.sectionOpen[sec] = !closed
+    }
+    for name in o.showAll {
+        guard let sec = OwnerSection(rawValue: name) else { fail("unknown section \(name)") }
+        m.showAll.insert(sec)
+    }
+    guard let action = o.confirm else {
+        if o.outcome != nil { fail("--outcome needs --confirm") }
+        return m
+    }
+    guard let id = o.select, let owner = snap.rows.first(where: { $0.id == id }) else {
+        fail("--confirm needs --select with an owner_id from the fixture")
+    }
+    let kind: ConfirmRequest.Kind
+    switch action {
+    case "end-session": kind = .endSession
+    case "quit-app": kind = .quitApp
+    case "stop-command": kind = .stopCommand
+    case "stop-managed-job" where owner.can("stop-managed-job"):
+        // A top-level `memmon run` job: the owner is the job.
+        kind = .job(OwnerJob(id: owner.id, kind: "managed", label: owner.title,
+                             token: owner.token, action: "stop-managed-job"))
+    default:
+        guard let job = owner.jobs.first(where: { $0.stopAction == action && $0.token != nil }) else {
+            fail("owner \(id) has no job with action \(action)")
+        }
+        kind = .job(job)
+    }
+    m.ask(kind, owner)
+    guard let path = o.outcome else { return m }
+    if o.popoverClosed { m.popoverShown = false }
+    guard let d = FileManager.default.contents(atPath: path),
+          let out = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+        fail("cannot read outcome \(path)")
+    }
+    if let app = out["app"] as? [String: Any] {
+        guard let tok = owner.token, let t = AppToken.decode(tok) else { fail("owner has no app token") }
+        let states = (app["results"] as? [[String: Any]] ?? []).map {
+            InstanceOutcome(pid: Int32(int($0["pid"]) ?? 0),
+                            state: InstanceState(rawValue: str($0["state"]) ?? "") ?? .running)
+        }
+        let forced = app["forced"] as? Bool ?? false
+        if let refused = app["refused"], JSONSerialization.isValidJSONObject(refused),
+           let o = ActOutcome.decode((try? JSONSerialization.data(withJSONObject: refused)) ?? Data()) {
+            m.applyApp(.refused(o), m.confirm!, t, forced: forced)
+        } else {
+            m.applyApp(.done(states, token: tok), m.confirm!, t, forced: forced)
+        }
+    } else {
+        var r = CLIResult(exit: int(out["exit"]).map { Int32($0) }, stdout: Data())
+        r.timedOut = out["timed_out"] as? Bool ?? false
+        if out["after_force"] as? Bool ?? false { m.confirm?.forcing = true }
+        if let s = out["stdout"] as? String {
+            r.stdout = s.data(using: .utf8) ?? Data()
+        } else if let obj = out["stdout"], JSONSerialization.isValidJSONObject(obj) {
+            r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+        }
+        m.apply(ActView.classify(r, timeout: CLI.actTimeout), m.confirm!)
+    }
+    m.refreshing = false
+    return m
+}
+
+/// The CLIResult an outcome fixture describes.
+func outcomeResult(_ path: String) -> CLIResult {
+    guard let d = FileManager.default.contents(atPath: path),
+          let out = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+        fail("cannot read outcome \(path)")
+    }
+    var r = CLIResult(exit: int(out["exit"]).map { Int32($0) }, stdout: Data())
+    r.timedOut = out["timed_out"] as? Bool ?? false
+    if let s = out["stdout"] as? String {
+        r.stdout = s.data(using: .utf8) ?? Data()
+    } else if let obj = out["stdout"], JSONSerialization.isValidJSONObject(obj) {
+        r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+    }
+    return r
+}
 
 @MainActor
-func renderPreview(to path: String) {
-    let m = Model()
-    var s = Snap()
-    s.ramUsed = 15.1 * GB; s.ramTotal = 16 * GB
-    s.swapUsed = 19.4 * GB; s.swapTotal = 21 * GB
-    s.compressed = 6.6 * GB; s.free = 18; s.load = 24.1
-    s.level = "DANGER"
-    s.reasons = ["swap 1.2x RAM size", "heavy thrashing 180 MB/s", "load 24 on 8 cores"]
-    s.headroom = 6
-    s.score = 6
-    s.nextLevel = "CRITICAL"; s.toNext = 1
-    s.advice = "web-checkout is running tsc typecheck (21.7G across 12 "
-             + "processes). Let it finish before starting another build."
-    s.jobs = [
-        ManagedJob(id: "preview-running", resource: "heavy", label: "api typecheck",
-                   state: "running", reason: "command running", elapsed: 42),
-        ManagedJob(id: "preview-waiting", resource: "heavy", label: "targeted tests",
-                   state: "waiting", reason: "resource held by api typecheck (PID 99036)", elapsed: 12),
-    ]
-    s.sessions = [
-        Sess(name: "api error handling", state: "working",
-             doing: "[agent] infra + flake audit",
-             total: 6.8 * GB, ram: 2.9 * GB, swap: 3.9 * GB, procs: 20,
-             subActive: 9, root: 52963,
-             children: [
-                Child(tag: "tsc typecheck", worktree: "web-checkout",
-                      mem: 3.5 * GB, pid: 99036, age: 1800),
-                Child(tag: "vitest", worktree: "", mem: 331 * MB, pid: 77908, age: 540),
-             ],
-             agents: [
-                Agent(kind: "infra-auditor", goal: "infra audit",
-                      active: true),
-                Agent(kind: "schema-auditor", goal: "schema audit",
-                      active: true),
-                Agent(kind: "Explore", goal: "adjacent callers", active: false),
-             ],
-             started: ["typecheck", "tests"]),
-        Sess(name: "docs sweep", state: "blocked",
-             doing: "waiting on the codegen step",
-             total: 1.4 * GB, ram: 1.0 * GB, swap: 0.4 * GB, procs: 7,
-             subActive: 0, root: 57020),
-        Sess(name: "checkout redesign", state: "done",
-             doing: "audit complete; 2 checks running",
-             total: 653 * MB, ram: 352 * MB, swap: 301 * MB, procs: 4,
-             subActive: 2, root: 17525),
-        Sess(name: "pr #412 review", state: "terminal",
-             doing: "reviewing the checkout diff",
-             total: 505 * MB, ram: 240 * MB, swap: 265 * MB, procs: 4,
-             subActive: 0, root: 57588),
-    ]
-    s.worktrees = [
-        WT(name: "web-checkout", tag: "tsc typecheck",
-           mem: 21.7 * GB, ram: 9.1 * GB, swap: 12.6 * GB, procs: 12, orphans: 2),
-        WT(name: "web-search", tag: "tsc typecheck",
-           mem: 12.0 * GB, ram: 5.2 * GB, swap: 6.8 * GB, procs: 7, orphans: 0),
-    ]
-    s.orphanTotal = 3.6 * GB; s.orphanCount = 2
-    s.idleSpares = 2; s.idleSpareMem = 186 * MB
-    let now = Date().timeIntervalSince1970
-    let builtin = GateClassification(source: "builtin", rule: "pnpm … typecheck",
-                                     shape: "pnpm typecheck", samples: nil,
-                                     observedPeak: nil, blockEligible: true)
-    let learned = GateClassification(source: "learned", rule: "codex.sh run",
-                                     shape: "codex.sh run", samples: 13,
-                                     observedPeak: 3.4 * GB, blockEligible: false)
-    let events = [
-        GateEvent(ts: now - 3800, action: "block", mode: "block-critical",
-                  sessionID: "829922b2", sessionName: nil,
-                  commandRaw: "/usr/bin/python3 ~/.claude/skills/linear/scripts/linear.py issue-get ABC-4573 --json",
-                  commandDisplay: "python3 …/linear.py issue-get ABC-4573 --json",
-                  classification: nil, legacy: true, level: "CRITICAL", score: 7,
-                  reasons: ["swap 31% of RAM size", "heavy thrashing 289 MB/s",
-                            "swap growing 5094 MB/min"],
-                  retryStatus: "waiting", ms: 74),
-        GateEvent(ts: now - 7200, action: "block", mode: "block-critical",
-                  sessionID: "4dcb56b8", sessionName: "docs sweep",
-                  commandRaw: "pnpm --filter dashboard typecheck",
-                  commandDisplay: "pnpm --filter dashboard typecheck",
-                  classification: builtin, legacy: false, level: "CRITICAL", score: 8,
-                  reasons: ["heavy thrashing 210 MB/s", "load 29 on 8 cores"],
-                  retryStatus: "waiting", ms: 78),
-        GateEvent(ts: now - 11000, action: "block", mode: "block-critical",
-                  sessionID: "73082786", sessionName: "checkout redesign",
-                  commandRaw: "docker compose build", commandDisplay: "docker compose build",
-                  classification: GateClassification(source: "builtin", rule: "docker compose build",
-                      shape: "docker compose build", samples: nil, observedPeak: nil,
-                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
-                  reasons: ["swap growing 1330 MB/min"], retryStatus: "not_waiting", ms: 71),
-        // Four resolved stops so the preview exercises the overflow control;
-        // with three or fewer it never renders and the path goes unreviewed.
-        GateEvent(ts: now - 96000, action: "block", mode: "block-critical",
-                  sessionID: "8ed32708", sessionName: "search indexing",
-                  commandRaw: "npx vitest run --coverage",
-                  commandDisplay: "npx vitest run --coverage",
-                  classification: GateClassification(source: "builtin", rule: "vitest",
-                      shape: "vitest run", samples: nil, observedPeak: nil,
-                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
-                  reasons: ["swap 39% of RAM size", "paging 138 MB/s"],
-                  retryStatus: "not_waiting", ms: 69),
-        GateEvent(ts: now - 180000, action: "block", mode: "block-critical",
-                  sessionID: "dd187cea", sessionName: "checkout redesign",
-                  commandRaw: "pnpm install --frozen-lockfile",
-                  commandDisplay: "pnpm install --frozen-lockfile",
-                  classification: GateClassification(source: "builtin", rule: "pnpm … install",
-                      shape: "pnpm install", samples: nil, observedPeak: nil,
-                      blockEligible: true), legacy: false, level: "CRITICAL", score: 9,
-                  reasons: ["heavy thrashing 301 MB/s", "load 44 on 8 cores"],
-                  retryStatus: "not_waiting", ms: 81),
-        GateEvent(ts: now - 250000, action: "block", mode: "block-critical",
-                  sessionID: "70c9a8bb", sessionName: nil,
-                  commandRaw: "turbo run build", commandDisplay: "turbo run build",
-                  classification: GateClassification(source: "builtin", rule: "turbo … build",
-                      shape: "turbo build", samples: nil, observedPeak: nil,
-                      blockEligible: true), legacy: false, level: "CRITICAL", score: 7,
-                  reasons: ["swap 44% of RAM size", "paging 85 MB/s"],
-                  retryStatus: "not_waiting", ms: 66),
-        GateEvent(ts: now - 900, action: "warn", mode: "block-critical",
-                  sessionID: "8d63269a", sessionName: "api error handling",
-                  commandRaw: "~/.claude/skills/codex/scripts/codex.sh run ABC-4573",
-                  commandDisplay: "codex.sh run ABC-4573", classification: learned,
-                  legacy: false, level: "DANGER", score: 5,
-                  reasons: ["paging 73 MB/s", "swap growing 1947 MB/min"],
-                  retryStatus: "not_waiting", ms: 76),
-        GateEvent(ts: now - 3 * 86400, action: "warn", mode: "block-critical",
-                  sessionID: "73082786", sessionName: nil,
-                  commandRaw: "cat vitest.config.ts", commandDisplay: "cat vitest.config.ts",
-                  classification: nil, legacy: true, level: "WATCH", score: 3,
-                  reasons: ["swap growing 382 MB/min", "load 23"],
-                  retryStatus: "not_waiting", ms: 72),
-        GateEvent(ts: now - 2 * 86400, action: "warn", mode: "block-critical",
-                  sessionID: "4dcb56b8", sessionName: "docs sweep",
-                  commandRaw: "pnpm --filter dashboard typecheck",
-                  commandDisplay: "pnpm --filter dashboard typecheck",
-                  classification: builtin, legacy: false, level: "WATCH", score: 2,
-                  reasons: ["load 24 on 8 cores"], retryStatus: "not_waiting", ms: 73),
-        GateEvent(ts: now - 3600, action: "warn", mode: "block-critical",
-                  sessionID: "a12e419f", sessionName: "search indexing",
-                  commandRaw: "npx vitest run", commandDisplay: "npx vitest run",
-                  classification: GateClassification(source: "builtin", rule: "vitest",
-                      shape: "npx vitest", samples: nil, observedPeak: nil,
-                      blockEligible: true), legacy: false, level: "DANGER", score: 4,
-                  reasons: ["paging 56 MB/s"], retryStatus: "not_waiting", ms: 70),
-    ]
-    s.gate = GateStats(installed: true, paused: PREVIEW_PAUSED,
-                       pausedUntil: PREVIEW_PAUSED ? now + 7200 : nil,
-                       mode: "block-critical", since: now - 3 * 86400,
-                       historyFrom: now - 3 * 86400, historyTo: now - 900,
-                       complete: false, truncated: true, evaluated: 525,
-                       // Must equal the number of block events below, or the
-                       // preview shows a header count contradicting its own list.
-                       warned: 54, stopped: 6, errors: 0, events: events,
-                       pending: [
-                        PendingRetry(ts: now - 3800, sessionID: "829922b2",
-                                     sessionName: nil,
-                                     commandRaw: events[0].commandRaw,
-                                     commandDisplay: events[0].commandDisplay,
-                                     pressureLevel: "CRITICAL", eventRetained: true),
-                        PendingRetry(ts: now - 7200, sessionID: "4dcb56b8",
-                                     sessionName: "docs sweep",
-                                     commandRaw: events[1].commandRaw,
-                                     commandDisplay: events[1].commandDisplay,
-                                     pressureLevel: "CRITICAL", eventRetained: true),
-                       ])
-    if PREVIEW_EMPTY {
-        s.gate.since = now - 600
-        s.gate.historyFrom = s.gate.since
-        s.gate.historyTo = nil
-        s.gate.evaluated = 0; s.gate.warned = 0; s.gate.stopped = 0
-        s.gate.events = []; s.gate.pending = []
-    }
-    if PREVIEW_NOT_INSTALLED {
-        s.gate.installed = false; s.gate.paused = false
-    }
-    m.snap = s; m.loaded = true; m.lastSync = Date()
+func fixtureRoot(_ model: Model, _ o: RenderOptions) -> some View {
+    ContentView(model: model, onQuit: {}, flattened: true, previewOpenGate: o.openGate,
+                previewOpenEvents: o.openEvents)
+        .environment(\.colorScheme, o.dark ? .dark : .light)
+}
 
-    let view = ContentView(model: m, onQuit: {}, onReap: {},
-                           flattened: true, previewExpandAll: false, previewOpenGate: true,
-                           frameHeight: 1000)
-    let renderer = ImageRenderer(content: view)
+@MainActor
+func prepareFixture() -> (Model, RenderOptions) {
+    guard let path = argValue("--fixture") else { fail("--fixture <owners json> is required") }
+    let (json, view) = loadFixture(path)
+    let o = renderOptions(view, fixtureDir: (path as NSString).deletingLastPathComponent)
+    // ImageRenderer ignores a forced NSApp.appearance when resolving dynamic
+    // NSColors; the colorScheme environment is what selects the token set.
+    NSApp.appearance = NSAppearance(named: o.dark ? .darkAqua : .aqua)
+    return (fixtureModel(json, o), o)
+}
+
+@MainActor
+func renderFixture(to path: String) {
+    let (model, o) = prepareFixture()
+    let renderer = ImageRenderer(content: fixtureRoot(model, o))
     renderer.scale = 2
     guard let img = renderer.nsImage,
           let tiff = img.tiffRepresentation,
           let rep = NSBitmapImageRep(data: tiff),
           let png = rep.representation(using: .png, properties: [:]) else {
-        FileHandle.standardError.write("render failed\n".data(using: .utf8)!)
-        exit(1)
+        fail("render failed")
     }
-    try? png.write(to: URL(fileURLWithPath: path))
-    print("rendered \(path)")
+    do { try png.write(to: URL(fileURLWithPath: path)) } catch { fail("cannot write \(path)") }
+    let darkOnly = darkTokenPixels(in: rep)
+    func hexAt(_ x: Int, _ y: Int) -> String {
+        rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB).map {
+            String(format: "#%02x%02x%02x", Int(round($0.redComponent * 255)),
+                   Int(round($0.greenComponent * 255)), Int(round($0.blueComponent * 255)))
+        } ?? "?"
+    }
+    // The page background is read below the header's gradient, at the
+    // bottom corner; the header itself is reported on its own.
+    print("rendered \(path) \(rep.pixelsWide)x\(rep.pixelsHigh) bg=\(hexAt(4, rep.pixelsHigh - 4)) "
+          + "head=\(hexAt(4, 4)) dark_tokens=\(darkOnly)")
 }
 
-if let i = CommandLine.arguments.firstIndex(of: "--render"),
-   i + 1 < CommandLine.arguments.count {
-    let out = CommandLine.arguments[i + 1]
-    _ = NSApplication.shared          // AppKit must exist for text rendering
-    MainActor.assumeIsolated { renderPreview(to: out) }
+/// Counts pixels of `rep` that carry one of the dark-only surface tokens (bg,
+/// panel, soft, the header gradient's two ends, the ring's track) exactly as the renderer draws them in dark mode. A light
+/// render must have none.
+@MainActor
+func darkTokenPixels(in rep: NSBitmapImageRep) -> Int {
+    let swatch = ImageRenderer(content: HStack(spacing: 0) {
+        P.bg; P.panel; P.soft; P.headerTop; P.headerBottom; P.track
+    }
+        .frame(width: 6, height: 1).environment(\.colorScheme, .dark))
+    swatch.scale = 1
+    guard let img = swatch.nsImage, let tiff = img.tiffRepresentation,
+          let sw = NSBitmapImageRep(data: tiff), let swData = sw.bitmapData,
+          let data = rep.bitmapData, sw.bitsPerPixel == rep.bitsPerPixel, rep.bitsPerPixel == 32 else {
+        return -1
+    }
+    let tokens = (0..<6).map { k in (0..<3).map { Int(swData[k * 4 + $0]) } }
+    var hits = 0
+    for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
+        let row = data + y * rep.bytesPerRow
+        for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
+            let p = row + x * 4
+            for t in tokens where abs(Int(p[0]) - t[0]) <= 1 && abs(Int(p[1]) - t[1]) <= 1
+                && abs(Int(p[2]) - t[2]) <= 1 {
+                hits += 1
+                break
+            }
+        }
+    }
+    return hits
+}
+
+/// Prints the accessibility tree SwiftUI builds for a fixture, one element per
+/// line: depth, role, label, value, value description and frame height,
+/// tab-separated.
+final class A11yDump: NSObject, NSApplicationDelegate {
+    var window: NSWindow?
+    func applicationDidFinishLaunching(_ note: Notification) {
+        MainActor.assumeIsolated {
+            let (model, o) = prepareFixture()
+            let host = NSHostingView(rootView: fixtureRoot(model, o))
+            let size = host.fittingSize
+            host.frame = NSRect(origin: .zero, size: size)
+            let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: size.width, height: size.height),
+                             styleMask: [.borderless], backing: .buffered, defer: false)
+            w.contentView = host
+            window = w
+            // SwiftUI builds its accessibility nodes only once an assistive
+            // client is present; this is how one announces itself.
+            NSApp.setValue(true, forKey: "accessibilityEnhancedUserInterface")
+            _ = NSApp.accessibilityFocusedUIElement
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.walk(host, 0)
+                exit(0)
+            }
+        }
+    }
+
+    func walk(_ element: Any, _ depth: Int) {
+        for row in axRows(element) {
+            print(([String(row.depth), row.role, row.label, row.value, row.described,
+                    String(format: "%.0f", row.height)]).joined(separator: "\t"))
+        }
+    }
+}
+
+struct AXRow {
+    var depth: Int, role: String, label: String, value: String, described: String
+    var height: Double = 0
+}
+
+/// Flattens the accessibility tree under `element`, depth first.
+func axRows(_ element: Any, _ depth: Int = 0) -> [AXRow] {
+    guard depth < 40, let e = element as? NSAccessibilityElementProtocol else { return [] }
+    let o = e as AnyObject
+    // KVC rather than the typed accessors: a progress element reports a
+    // number where the protocol promises a string.
+    func attribute(_ key: String) -> String {
+        guard let n = o as? NSObject, n.responds(to: Selector(key)),
+              let v = n.value(forKey: key) else { return "" }
+        return "\(v)".replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " ")
+    }
+    // SwiftUI files a textual accessibilityValue under ValueDescription,
+    // which is what VoiceOver reads.
+    let frame = ((o as? NSObject)?.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue ?? .zero
+    var rows = [AXRow(depth: depth, role: attribute("accessibilityRole"),
+                      label: attribute("accessibilityLabel"), value: attribute("accessibilityValue"),
+                      described: attribute("accessibilityValueDescription"),
+                      height: Double(frame.height))]
+    for c in (o.accessibilityChildren?() ?? nil) ?? [] { rows += axRows(c, depth + 1) }
+    return rows
+}
+
+final class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
+/// Hosts the real popover root (scrolling, adaptive height, live overlay) in an
+/// offscreen window and drives it: sizes, keyboard focus, Esc and Return, and
+/// the freshness ticker. The window is never ordered on screen and the app
+/// never activates, so nothing takes focus from the user.
+/// The end of a self-test window's responder chain. A key nothing handles
+/// (Return in a confirm, which has no default button) reaches here instead of
+/// NSWindow's noResponder(for:), which plays the alert sound on every run.
+/// Self-test windows only: the app itself keeps the standard beep.
+final class QuietKeys: NSResponder {
+    static let shared = QuietKeys()
+    override func keyDown(with event: NSEvent) {}
+    override func noResponder(for eventSelector: Selector) {}
+
+    /// Appends the sink to the end of `w`'s responder chain, once.
+    static func silence(_ w: NSWindow) {
+        var r: NSResponder = w
+        while let n = r.nextResponder {
+            if n === shared { return }
+            r = n
+        }
+        r.nextResponder = shared
+    }
+}
+
+final class HostSelftest: NSObject, NSApplicationDelegate {
+    let check: String
+    var window: NSWindow?
+    var popover: NSPopover?
+    init(check: String) { self.check = check }
+
+    func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+
+    func key(_ chars: String, _ code: UInt16, in w: NSWindow) {
+        QuietKeys.silence(w)
+        guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                                       windowNumber: w.windowNumber, context: nil, characters: chars,
+                                       charactersIgnoringModifiers: chars, isARepeat: false,
+                                       keyCode: code) else { return }
+        w.sendEvent(e)
+    }
+
+    /// A second offscreen window to anchor the popover to.
+    func probeAnchor() -> NSView {
+        let anchorWindow = KeyableWindow(contentRect: NSRect(x: -21000, y: -21000, width: 20, height: 20),
+                                         styleMask: [.borderless], backing: .buffered, defer: false)
+        anchors.append(anchorWindow)
+        // NSPopover only opens from a view in a visible window. This one is
+        // ordered in far off every display and the app never activates.
+        anchorWindow.orderFrontRegardless()
+        return anchorWindow.contentView!
+    }
+    var anchors: [NSWindow] = []
+
+    func phase(_ m: Model) -> String {
+        switch m.confirm?.phase {
+        case nil: return "closed"
+        case .ask?: return "ask"
+        case .working?: return "working"
+        case .partial?: return "partial"
+        case .appPartial?: return "app_partial"
+        }
+    }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        MainActor.assumeIsolated {
+            let (model, _) = prepareFixture()
+            let pop = NSPopover()
+            let host = configurePopover(pop, model: model, onQuit: {})
+            popover = pop
+            let w = KeyableWindow(contentRect: NSRect(x: -20000, y: -20000, width: 380, height: 900),
+                                  styleMask: [.borderless], backing: .buffered, defer: false)
+            w.contentView = host.view
+            window = w
+            NSApp.setValue(true, forKey: "accessibilityEnhancedUserInterface")
+            spin(0.6)
+            var report: [String: Any] = ["check": check]
+            switch check {
+            case "size":
+                let fit = host.view.fittingSize
+                report["fitting"] = [fit.width, fit.height]
+                report["preferred"] = [host.preferredContentSize.width, host.preferredContentSize.height]
+                report["popover_unshown"] = [pop.contentSize.width, pop.contentSize.height]
+                pop.show(relativeTo: .zero, of: probeAnchor(), preferredEdge: .minY)
+                spin(0.4)
+                report["popover_shown"] = pop.isShown
+                report["popover"] = [pop.contentSize.width, pop.contentSize.height]
+                let frame = host.view.window?.frame ?? .zero
+                report["popover_on_a_display"] = NSScreen.screens.contains { $0.frame.intersects(frame) }
+                pop.close()
+            case "keys":
+                report["phase_before"] = phase(model)
+                report["focus"] = model.overlayFocus ?? NSNull()
+                // Tab and shift-Tab must cycle inside the overlay; a nil focus
+                // would mean it went to the dimmed list behind it.
+                var trail: [Any] = []
+                QuietKeys.silence(w)
+                for shift in [false, false, false, true, true] {
+                    guard let e = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                                                   modifierFlags: shift ? [.shift] : [], timestamp: 0,
+                                                   windowNumber: w.windowNumber, context: nil,
+                                                   characters: "\t", charactersIgnoringModifiers: "\t",
+                                                   isARepeat: false, keyCode: 48) else { continue }
+                    w.sendEvent(e)
+                    spin(0.15)
+                    trail.append(model.overlayFocus ?? NSNull())
+                }
+                report["tab_trail"] = trail
+                key("\r", 36, in: w)
+                spin(0.3)
+                report["after_return_phase"] = phase(model)
+                report["after_return_actions"] = model.actionLog
+                key("\u{1b}", 53, in: w)
+                spin(0.4)
+                report["after_esc_phase"] = phase(model)
+                report["after_esc_banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+                report["actions"] = model.actionLog
+            case "force-ttl":
+                // Age the app partial result, then press Force. `--sleep`
+                // moves the injected clock instead, as a Mac asleep would.
+                let age = argValue("--age").flatMap(Double.init) ?? 0
+                if case .appPartial(let t, let r, let tok, _)? = model.confirm?.phase {
+                    model.confirm?.phase = .appPartial(t, r, token: tok, watchEnded: model.clock() - age)
+                }
+                if let slept = argValue("--sleep").flatMap(Double.init) {
+                    let base = model.clock
+                    model.clock = { base() + slept }
+                }
+                model.force()
+                spin(0.2)
+                report["phase"] = phase(model)
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+                report["actions"] = model.actionLog
+            case "rebind":
+                // A refresh lands while the confirm is still asking.
+                guard let next = argValue("--next") else { fail("rebind needs --next <fixture>") }
+                let (j, _) = loadFixture(next)
+                guard let s = OwnersSnap.decode(j) else { fail("--next is not an owners payload") }
+                model.snap = s
+                model.rebindConfirm(s)
+                report["phase"] = phase(model)
+                if case .job(let jb)? = model.confirm?.kind { report["job_token"] = jb.token ?? NSNull() }
+                report["owner_token"] = model.confirm?.owner.token ?? NSNull()
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+            case "refresh-rebind":
+                // The real refresh path: a stub memmon answers with the next
+                // payload while the confirm is still asking.
+                guard let next = argValue("--next"), let script = argValue("--script"),
+                      let out = argValue("--payload") else {
+                    fail("refresh-rebind needs --next <fixture> --script <stub> --payload <file>")
+                }
+                let (j, _) = loadFixture(next)
+                let data = try! JSONSerialization.data(withJSONObject: j)
+                FileManager.default.createFile(atPath: out, contents: data)
+                CLI.script = script
+                model.live = true
+                model.refresh()
+                let deadline = Date().addingTimeInterval(10)
+                spin(0.2)
+                while Date() < deadline && model.refreshing { spin(0.1) }
+                report["phase"] = phase(model)
+                if case .job(let jb)? = model.confirm?.kind { report["job_token"] = jb.token ?? NSNull() }
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+                report["load_error"] = model.loadError ?? NSNull()
+            case "closed-then-partial":
+                // The popover closes while a stop is working; its partial
+                // result lands afterwards.
+                guard let path = argValue("--outcome") else { fail("closed-then-partial needs --outcome") }
+                guard var c = model.confirm else { fail("closed-then-partial needs a confirm") }
+                c.phase = .working
+                model.confirm = c
+                model.popoverClosed()
+                model.apply(ActView.classify(outcomeResult(path), timeout: CLI.actTimeout), c)
+                spin(0.2)
+                report["phase"] = phase(model)
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+            case "close":
+                model.popoverClosed()
+                spin(0.2)
+                report["phase"] = phase(model)
+                report["banner"] = model.banner.map { $0.title + " " + $0.body } ?? NSNull()
+            case "popover-keys":
+                // The same keys inside a shown, transient NSPopover: Esc must
+                // close the overlay, not the popover.
+                pop.behavior = .transient
+                pop.show(relativeTo: .zero, of: probeAnchor(), preferredEdge: .minY)
+                spin(0.5)
+                guard let pw = host.view.window else { fail("popover has no window") }
+                report["popover_on_a_display"] = NSScreen.screens.contains { $0.frame.intersects(pw.frame) }
+                report["focus"] = model.overlayFocus ?? NSNull()
+                key("\r", 36, in: pw)
+                spin(0.3)
+                report["after_return_phase"] = phase(model)
+                key("\u{1b}", 53, in: pw)
+                spin(0.4)
+                report["after_esc_phase"] = phase(model)
+                report["popover_open_after_esc"] = pop.isShown
+                report["actions"] = model.actionLog
+                pop.close()
+            case "ticker":
+                func freshness() -> String {
+                    axRows(host.view).first { $0.label.hasPrefix("Sampled") || $0.label.hasPrefix("Sample time") }?.label ?? ""
+                }
+                report["before"] = freshness()
+                model.startTicking(every: 0.1)
+                clockOverride = (clockOverride ?? nowTs()) + 5
+                spin(0.5)
+                report["after_5s"] = freshness()
+                clockOverride = (clockOverride ?? nowTs()) + 90
+                spin(0.5)
+                report["after"] = freshness()
+                report["ticks"] = model.tick
+                model.stopTicking()
+            default:
+                fail("unknown check \(check)")
+            }
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
+    }
+}
+
+// Test seams. None of these touch a real process: --act-probe runs a stub
+// script, --selftest-quit-app drives a fake AppControl on a virtual clock.
+
+final class FakeApp: RunningAppHandle {
+    let bundleIdentifier: String?
+    let launchDate: Date?
+    var isTerminated = false
+    /// The process itself, which memmon's identity check sees.
+    var alive = true
+    /// memmon cannot read its start time: neither running nor exited.
+    var unreadable = false
+    /// Whether AppKit knows it as an app (false for helpers and widgets).
+    var listed = true
+    let ignoresTerminate: Bool
+    let pid: Int32
+    let log: (String) -> Void
+    init(pid: Int32, bundle: String, launched: Double, ignoresTerminate: Bool, log: @escaping (String) -> Void) {
+        self.pid = pid; bundleIdentifier = bundle
+        launchDate = Date(timeIntervalSince1970: launched)
+        self.ignoresTerminate = ignoresTerminate; self.log = log
+    }
+    func terminate() -> Bool {
+        log("terminate \(pid)")
+        if !ignoresTerminate { isTerminated = true; alive = false }
+        return true
+    }
+    func forceTerminate() -> Bool { log("force \(pid)"); isTerminated = true; alive = false; return true }
+}
+
+final class FakeApps: AppControl {
+    var apps: [Int32: FakeApp] = [:]
+    /// Models AppKit's lag: a lookup can still return a handle that has just
+    /// reported termination.
+    var lingering = false
+    var t = 0.0
+    func app(pid: Int32) -> RunningAppHandle? {
+        guard let a = apps[pid], a.listed else { return nil }
+        return a.isTerminated && !lingering ? nil : a
+    }
+    func now() -> Double { t }
+    func sleep(_ seconds: Double) { t += seconds }
+    /// What memmon's identity check would report.
+    func liveness() -> InstanceLiveness {
+        var out: InstanceLiveness = [:]
+        for (pid, a) in apps { out[pid] = a.unreadable ? .unverified : a.alive ? .running : .exited }
+        return out
+    }
+}
+
+func selftestQuitApp(_ scenario: String) {
+    var calls: [String] = []
+    let fake = FakeApps()
+    let bundle = "com.example.containers"
+    let log: (String) -> Void = { calls.append($0) }
+    fake.apps[101] = FakeApp(pid: 101, bundle: bundle, launched: 1000, ignoresTerminate: false, log: log)
+    fake.apps[102] = FakeApp(pid: 102, bundle: bundle, launched: 2000, ignoresTerminate: true, log: log)
+    var token = AppToken(bundleId: bundle, instances: [AppTokenInstance(pid: 101, launchDate: 1000),
+                                                       AppTokenInstance(pid: 102, launchDate: 2000)])
+    var verifyFails = false
+    switch scenario {
+    case "two-one-stubborn": break
+    case "pid-reused":
+        fake.apps[102] = FakeApp(pid: 102, bundle: "com.example.other", launched: 2000,
+                                 ignoresTerminate: true, log: log)
+    case "relaunched":
+        token.instances[1].launchDate = 1500
+    case "lingering-handle":
+        fake.lingering = true
+    case "gone":
+        fake.apps[101]?.alive = false
+        fake.apps[101]?.listed = false
+    case "not-an-app":
+        // A helper or widget: alive, but AppKit has no app for it.
+        fake.apps[102]?.listed = false
+    case "appkit-says-gone":
+        // AppKit drops the handle but the process keeps running.
+        fake.apps[102] = FakeApp(pid: 102, bundle: bundle, launched: 2000, ignoresTerminate: false, log: log)
+        fake.apps[102]?.listed = true
+        fake.lingering = false
+    case "verify-fails":
+        verifyFails = true
+    case "quit-before-force":
+        break
+    case "unreadable":
+        break
+    case "raced-exit":
+        // AppKit has no app for 102 at quit time because it is exiting.
+        fake.apps[102]?.listed = false
+    default:
+        fail("unknown scenario \(scenario)")
+    }
+    let engine = QuitApp(control: fake, verify: {
+        if scenario == "appkit-says-gone" { fake.apps[102]?.alive = true }
+        if scenario == "raced-exit" { fake.apps[102]?.alive = false }
+        if scenario == "unreadable" { fake.apps[102]?.unreadable = true }
+        return verifyFails ? nil : fake.liveness()
+    })
+    let first = engine.quit(token, alive: fake.liveness())
+    let firstCalls = calls
+    var report: [String: Any] = [
+        "after_quit": first.map { ["pid": Int($0.pid), "state": $0.state.rawValue] },
+        "complete_after_quit": first.allSatisfy { $0.state.done },
+        "quit_calls": firstCalls,
+        "virtual_seconds": fake.t,
+    ]
+    if first.contains(where: { $0.state == InstanceState.running }) {
+        if scenario == "quit-before-force" {
+            // The stubborn instance quits on its own before Force is pressed.
+            fake.apps[102]?.alive = false
+            fake.apps[102]?.listed = false
+        }
+        calls = []
+        let second = engine.force(token, after: first)
+        report["after_force"] = second.map { ["pid": Int($0.pid), "state": $0.state.rawValue] }
+        report["complete_after_force"] = second.allSatisfy { $0.state.done }
+        report["force_calls"] = calls
+    }
+    let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+/// Drives the real refresh path against a stub memmon whose first scan
+/// outlives the timeout: no second scanner may start while it runs, and the
+/// request made meanwhile runs once it ends.
+final class RefreshSelftest: NSObject, NSApplicationDelegate {
+    func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        guard let script = argValue("--script") else { fail("usage: --selftest-refresh --script <stub>") }
+        CLI.script = script
+        CLI.ownersTimeout = argValue("--timeout").flatMap(Double.init) ?? 0.3
+        let m = Model()
+        var report: [String: Any] = [:]
+        if let python = argValue("--python") {
+            // memmon cannot be started at all: every refresh must still run.
+            CLI.python = python
+            m.refresh()
+            spin(0.5)
+            report["first"] = ["error": m.loadError ?? NSNull(), "scans": m.scansStarted,
+                               "refreshing": m.refreshing] as [String: Any]
+            m.refresh()
+            spin(0.5)
+            report["second"] = ["error": m.loadError ?? NSNull(), "scans": m.scansStarted,
+                                "refreshing": m.refreshing] as [String: Any]
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
+        if ARGS.contains("--single") {
+            // One slow scan, nothing queued: once it ends, its "still
+            // sampling" error must not linger.
+            m.refresh()
+            spin(0.8)
+            report["during"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling] as [String: Any]
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline && m.stillSampling { spin(0.1) }
+            report["after"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling] as [String: Any]
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(data: data, encoding: .utf8)!)
+            exit(0)
+        }
+        m.refresh()
+        spin(0.8)
+        report["after_timeout"] = ["error": m.loadError ?? NSNull(), "still_sampling": m.stillSampling,
+                                   "scans": m.scansStarted] as [String: Any]
+        m.refresh()
+        spin(0.3)
+        report["while_busy_scans"] = m.scansStarted
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline && !(m.loaded && !m.refreshing) { spin(0.1) }
+        report["end"] = ["scans": m.scansStarted, "loaded": m.loaded,
+                         "still_sampling": m.stillSampling, "error": m.loadError ?? NSNull()] as [String: Any]
+        let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        print(String(data: data, encoding: .utf8)!)
+        exit(0)
+    }
+}
+
+func actProbe() {
+    guard let script = argValue("--script"), let sep = ARGS.firstIndex(of: "--") else {
+        fail("usage: --act-probe --script <stub> [--timeout s] -- <memmon args>")
+    }
+    CLI.script = script
+    let timeout = argValue("--timeout").flatMap(Double.init) ?? CLI.actTimeout
+    let r = CLI.run(Array(ARGS[(sep + 1)...]), timeout: timeout)
+    var report: [String: Any] = ["view": "", "exit": r.exit.map { Int($0) } ?? NSNull(), "timed_out": r.timedOut]
+    let view = ActView.classify(r, timeout: timeout)
+    report["view"] = view.name
+    switch view {
+    case .success(let o), .partial(let o), .refused(let o):
+        report["result"] = o.result
+        report["force_token"] = o.forceToken ?? NSNull()
+        report["reason"] = o.reason ?? NSNull()
+    case .error(let e):
+        report["message"] = e
+    }
+    let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+/// Runs the real quit-app path against a stub memmon and a fake AppControl:
+/// lock, verify-app with the descriptor inherited, then quit and watch.
+func quitProbe() {
+    guard let script = argValue("--script"), let lock = argValue("--lock-path"),
+          let token = argValue("--token") else {
+        fail("usage: --quit-probe --script <stub> --lock-path <file> --token <tok> [--timeout s] [--stubborn pid] [--force-after]")
+    }
+    CLI.script = script
+    ActionsLock.path = lock
+    if let t = argValue("--timeout").flatMap(Double.init) { CLI.actTimeout = t }
+    guard let parsed = AppToken.decode(token) else { fail("token does not decode") }
+    let fake = FakeApps()
+    var calls: [String] = []
+    // Each terminate() also reports whether actions.lock is still held, by
+    // trying it from a second open file description.
+    let lockHeld: () -> Bool = {
+        let fd = open(lock, O_RDWR)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
+        return true
+    }
+    let stubborn = argValue("--stubborn").flatMap(Int32.init)
+    for i in parsed.instances {
+        fake.apps[i.pid] = FakeApp(pid: i.pid, bundle: parsed.bundleId, launched: i.launchDate ?? 0,
+                                   ignoresTerminate: i.pid == stubborn,
+                                   log: { calls.append($0 + (lockHeld() ? " locked" : " unlocked")) })
+    }
+    var report: [String: Any] = [:]
+    let started = ProcessInfo.processInfo.systemUptime
+    func record(_ r: Model.AppResult, _ prefix: String) -> ([InstanceOutcome], String)? {
+        switch r {
+        case .refused(let o): report[prefix + "view"] = "refused"; report[prefix + "reason"] = o.reason ?? NSNull()
+        case .error(let e): report[prefix + "view"] = "error"; report[prefix + "message"] = e
+        case .done(let out, let tok):
+            report[prefix + "view"] = "done"
+            report[prefix + "states"] = out.map { $0.state.rawValue }
+            report[prefix + "token"] = tok
+            return (out, tok)
+        }
+        return nil
+    }
+    let quit = record(Model.quitApp(token: token, parsed: parsed, control: fake), "")
+    if ARGS.contains("--force-after"), let (out, tok) = quit {
+        let quitCalls = calls
+        calls = []
+        _ = record(Model.forceApp(token: tok, parsed, out, control: fake), "force_")
+        report["force_calls"] = calls
+        calls = quitCalls
+    }
+    report["seconds"] = ProcessInfo.processInfo.systemUptime - started
+    report["lock_free_after"] = !lockHeld()
+    report["calls"] = calls
+    let data = try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+if ARGS.contains("--selftest-quit-app") {
+    selftestQuitApp(argValue("--selftest-quit-app") ?? "two-one-stubborn")
     exit(0)
+}
+if ARGS.contains("--act-probe") { actProbe(); exit(0) }
+if ARGS.contains("--palette-probe") {
+    // The section and neutral colours as each theme resolves them.
+    _ = NSApplication.shared
+    func hex(_ c: Color, _ name: NSAppearance.Name) -> String {
+        var out = ""
+        NSAppearance(named: name)!.performAsCurrentDrawingAppearance {
+            let n = NSColor(c).usingColorSpace(.sRGB)!
+            out = String(format: "%02x%02x%02x", Int(round(n.redComponent * 255)),
+                         Int(round(n.greenComponent * 255)), Int(round(n.blueComponent * 255)))
+        }
+        return out
+    }
+    var tokens: [String: Color] = ["system": P.system, "track": P.track]
+    for s in OwnerSection.allCases { tokens["section." + s.rawValue] = P.section(s) }
+    var out: [String: [String: String]] = [:]
+    for (k, c) in tokens { out[k] = ["light": hex(c, .aqua), "dark": hex(c, .darkAqua)] }
+    // App icons: off by default (renders), found locally when the app enables them.
+    let finder = Owner.decode(["owner_id": "app:com.apple.finder", "kind": "app", "title": "Finder"])!
+    let iconOff = AppIcons.icon(for: finder) != nil
+    enableLiveOnlyFeatures()
+    let iconOn = AppIcons.icon(for: finder) != nil
+    let missing = Owner.decode(["owner_id": "app:com.example.not-installed", "kind": "app", "title": "X"])!
+    let iconMissing = AppIcons.icon(for: missing) != nil
+    AppIcons.enabled = false
+    let fm = Model()
+    fm.toggleFree(); let freeOnce = fm.freeOpen
+    fm.toggleFree(); let freeTwice = fm.freeOpen
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "icons": ["off": iconOff, "on": iconOn, "missing": iconMissing],
+        "free_toggle": [freeOnce, freeTwice],
+        "tokens": out, "mood_animates": moodAnimates(reduceMotion: false),
+        "mood_animates_reduced": moodAnimates(reduceMotion: true)], options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--sections-probe") {
+    // How a fixture's owners fall into sections, as the list would show them.
+    _ = NSApplication.shared
+    let (m, _) = MainActor.assumeIsolated { prepareFixture() }
+    // Probe-only interactions, driven through the same model methods the views call.
+    if ARGS.contains("--deselect") { m.expanded = nil }
+    if let name = argValue("--legend-click") {
+        guard let sec = OwnerSection(rawValue: name) else { fail("unknown section \(name)") }
+        m.openFromLegend(sec)
+    }
+    if let id = argValue("--dismiss") { m.dismissBlocked(id) }
+    let rows = m.snap?.rows ?? []
+    let out: [[String: Any]] = sectionedOwners(rows, by: m.sort).map { sec, owners in
+        let (shown, hidden) = m.visible(sec, owners)
+        return ["section": sec.rawValue, "title": sec.title, "owners": owners.map { $0.id },
+                "open": m.isOpen(sec, owners), "shown": shown.map { $0.id }, "hidden": hidden,
+                "total": sectionTotal(owners) ?? NSNull(), "count": sectionCount(sec, owners).shown]
+    }
+    let small = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, isSmallOwner($0)) })
+    let used = m.snap?.system.usedBytes
+    let ring: [[String: Any]] = ringSegments(rows, used: used).map {
+        ["id": $0.id, "bytes": $0.bytes, "arc": $0.arc]
+    }
+    let st = statusState(m.snap, refreshing: ARGS.contains("--refreshing"),
+                         stillSampling: ARGS.contains("--sampling"))
+    let reduce = ARGS.contains("--reduce-motion")
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "sections": out, "small": small, "ring": ring, "used": used ?? NSNull(),
+        "scroll_target": m.scrollTarget?.rawValue ?? NSNull(), "actions": m.actionLog,
+        "status": ["kind": st.kind.rawValue, "text": st.text, "spoken": st.spoken],
+        "motion": ["sweep": ringSweeps(reduceMotion: reduce, animate: true),
+                   "sweep_render": ringSweeps(reduceMotion: reduce, animate: false),
+                   "pulse": dotPulses(reduceMotion: reduce)],
+    ], options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--clock-probe") {
+    // The default clock the app-Force window reads, against the clocks it
+    // could be confused with.
+    print(String(format: "%.3f", Model().clock()))
+    exit(0)
+}
+if ARGS.contains("--constants") {
+    // What memmon.py's own constants and refusal vocabulary must agree with.
+    let reasons = (argValue("--reasons") ?? "").split(separator: ",").map(String.init)
+    var copy: [String: String] = [:]
+    for r in reasons { copy[r] = Copy.refusal(r, noun: "build", forcing: false).0 }
+    let out: [String: Any] = ["act_timeout": CLI.actTimeout, "owners_timeout": CLI.ownersTimeout,
+                              "force_ttl": Model.forceTTL, "refusals": copy]
+    let data = try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--title-probe") {
+    guard let path = argValue("--latest"), let now = argValue("--now").flatMap(Double.init),
+          let d = FileManager.default.contents(atPath: path),
+          let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
+        fail("usage: --title-probe --latest <latest.json> --now <epoch>")
+    }
+    print(statusTitle(j, now: now) ?? "")
+    exit(0)
+}
+if ARGS.contains("--selftest-refresh") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    let selftest = RefreshSelftest()
+    app.delegate = selftest
+    app.run()
+}
+if ARGS.contains("--quit-probe") { quitProbe(); exit(0) }
+if let out = argValue("--render") {
+    _ = NSApplication.shared          // AppKit must exist for text rendering
+    MainActor.assumeIsolated { renderFixture(to: out) }
+    exit(0)
+}
+if let check = argValue("--selftest-host") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    let selftest = HostSelftest(check: check)
+    app.delegate = selftest
+    app.run()
+}
+if ARGS.contains("--a11y-dump") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    let dump = A11yDump()
+    app.delegate = dump
+    app.run()
 }
 
 let app = NSApplication.shared
+enableLiveOnlyFeatures()
 let controller = Controller()
 app.delegate = controller
 app.run()

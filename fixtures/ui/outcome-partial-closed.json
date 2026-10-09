@@ -1,0 +1,9 @@
+{
+ "_base": "overview.json",
+ "_view": {
+  "select": "claude:fixture-a",
+  "confirm": "stop-job",
+  "outcome": "outcomes/partial.json",
+  "popover_closed": true
+ }
+}

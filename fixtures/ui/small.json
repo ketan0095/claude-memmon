@@ -1,0 +1,104 @@
+{
+ "_base": "overview.json",
+ "owners": [
+  {
+   "owner_id": "claude:fixture-c",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout copy fixes",
+   "project": "acme-web",
+   "worktree": "copy",
+   "activity": "Idle",
+   "confidence": "exact",
+   "footprint_bytes": 644245094,
+   "cpu_cores": 0.0,
+   "cpu_coverage": 0.6,
+   "growth_bytes_per_10min": 2097152,
+   "member_count": 2,
+   "root": {
+    "pid": 51002,
+    "start": [
+     1791447000,
+     9
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYyIsIm93bmVyX3Jvb3QiOnsicGlkIjo1MTAwMiwic3RhcnQiOlsxNzkxNDQ3MDAwLDldfSwidGFyZ2V0Ijp7InBpZCI6NTEwMDIsInN0YXJ0IjpbMTc5MTQ0NzAwMCw5XX0sInNuYXBzaG90X3RzIjoxNzkxNDQ5OTk4LjB9",
+   "jobs": [],
+   "actions": [
+    "end-session"
+   ],
+   "category": "claude"
+  }
+ ],
+ "protection": {
+  "summary": "on",
+  "gate": "on",
+  "route": "off",
+  "unmanaged_heavy": 0
+ },
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.6
+ },
+ "gate": {
+  "installed": true,
+  "paused": false,
+  "paused_until": null,
+  "policy": {
+   "mode": "block-critical"
+  },
+  "counts": {
+   "since": 1791190800.0,
+   "complete": false,
+   "evaluated": 212,
+   "warned": 1,
+   "stopped": 0,
+   "errors": 0
+  },
+  "history": {
+   "from": 1791190800.0,
+   "to": 1791449760.0,
+   "truncated": false,
+   "events": [
+    {
+     "ts": 1791444600.0,
+     "action": "warn",
+     "mode": "block-critical",
+     "session": {
+      "id": "fixture-b",
+      "name": "Billing API tests"
+     },
+     "command": {
+      "raw": "npx vitest run",
+      "display": "npx vitest run",
+      "short": "npx vitest run"
+     },
+     "classification": {
+      "source": "builtin",
+      "rule": "vitest",
+      "shape": "npx vitest",
+      "samples": null,
+      "observed_peak_bytes": null,
+      "block_eligible": true
+     },
+     "legacy": false,
+     "pressure": {
+      "level": "WATCH",
+      "score": 3,
+      "reasons": [
+       "paging 40 MB/s"
+      ]
+     },
+     "retry_status": "not_waiting",
+     "ms": 70
+    }
+   ]
+  },
+  "pending_retry": []
+ }
+}

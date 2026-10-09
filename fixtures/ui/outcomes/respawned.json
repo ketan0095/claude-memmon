@@ -1,0 +1,14 @@
+{
+ "exit": 3,
+ "stdout": {
+  "result": "respawned",
+  "reason": "daemon_restarted_worker",
+  "exited": 9,
+  "captured": 9,
+  "remaining": [],
+  "kept": [],
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 41768556953,
+  "measured_at": 1791450000.0
+ }
+}

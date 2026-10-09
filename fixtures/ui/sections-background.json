@@ -1,0 +1,13 @@
+{
+ "_base": "sections.json",
+ "_view": {
+  "sections": [
+   "-claude",
+   "-codex",
+   "background"
+  ],
+  "show_all": [
+   "background"
+  ]
+ }
+}

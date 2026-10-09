@@ -1,0 +1,32 @@
+{
+ "exit": 3,
+ "after_force": true,
+ "stdout": {
+  "reason": "outside_force",
+  "exited": 1,
+  "remaining": [
+   {
+    "pid": 48500,
+    "start": [
+     1791449958,
+     1
+    ],
+    "forceable": false,
+    "role": "runner",
+    "signalled": false,
+    "argv0": "python3"
+   }
+  ],
+  "kept": [],
+  "used_bytes_before": 42090679500,
+  "used_bytes_after": 40802189312,
+  "measured_at": 1791450000.0,
+  "result": "partial",
+  "killed": 1,
+  "exited_unsignalled": 0,
+  "named": 1,
+  "forceable": 0,
+  "observed": 0,
+  "observed_unlisted": 0
+ }
+}

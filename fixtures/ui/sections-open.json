@@ -1,0 +1,9 @@
+{
+ "_base": "sections.json",
+ "_view": {
+  "sections": [
+   "app",
+   "background"
+  ]
+ }
+}

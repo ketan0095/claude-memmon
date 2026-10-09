@@ -1,0 +1,15 @@
+{
+ "_base": "overview.json",
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "warning",
+  "score_level": "DANGER",
+  "ncpu": 18,
+  "cpu_cores": null,
+  "cpu_coverage": 0.817
+ },
+ "_view": {
+  "open_gate": true
+ }
+}

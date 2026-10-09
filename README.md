@@ -25,16 +25,28 @@ after one near-freeze where two full-repo typechecks demanded ~34 GB at once.
 
 ### Reading the popover
 
-**Memory now** — one line telling you whether it is safe to start work, and why.
-The track underneath shows where the score sits between the four tiers, so the
-boundaries are visible rather than implied. The sentence names the actual
-offender (`web-checkout is running tsc typecheck, 21.7G across 12 processes`)
-rather than giving generic advice, and `Memory signals now:` lists the signals
-that produced the verdict. `~6 min to low headroom` appears only when something
-is wrong — see the headroom caveat below.
+**Health card and protection line** — memory in use against RAM (the kernel's
+own accounting, not `top`'s), the kernel pressure level and the score verdict.
+Under it, one line says whether heavy commands are protected: `off`,
+`paused`, `partial` (the gate is on but some heavy work was not started through
+`memmon run`) or `on`. Neither line claims to prevent a freeze.
 
-**Command warnings & stops** — the part of the tool that acts on your sessions,
-so it sits directly under the verdict. It answers four questions in order:
+**Owners** — one row per owner (see *Owners and targeted stops* below): a
+Claude session, a Codex thread or daemon, an app, a VM, a managed job, or the
+unattributed rest. Sort by memory or CPU. A row shows its title, what
+it is doing, and where it runs (project · worktree · confidence). A value
+memmon could not measure shows `—` and the reason, and sorts last. Expand a
+session to see its builds, tests and servers, each with its own Stop button;
+the Conversation is listed too and marked kept. Every stop asks first, inside
+the popover, and the result banner reports what was measured.
+
+The old RAM/Swap tiles, the Reclaimable card with its Reap button, and the
+separate session, worktree and app lists are gone: their processes now appear
+under exactly one owner, and orphaned builds show up as Unattributed. Reaping
+stays on the command line (`memmon reap --apply`, then `--force` if needed).
+
+**Command warnings & stops** — the gate's own section, below the owners. It
+answers four questions in order:
 
 - *Is protection on?* `ACTIVE` or `PAUSED`, with the Pause control next to it.
   The section is always present, so pausing is always one click away.
@@ -58,28 +70,6 @@ Stops that have already been retried are history, so only the three most recent
 show, behind a "show all" toggle; warnings work the same way. Events recorded
 before rules were tracked say so plainly rather than being re-explained with
 today's rules.
-
-**RAM and Swap tiles** — RAM is what is in memory; Swap is what has been written
-to disk. Swap is measured against *RAM size* (`1.21x`), not against the swapfile,
-because macOS grows the swapfile to match demand so the usual percentage is
-meaningless. `OVER` means swap now exceeds physical RAM.
-
-**Reclaimable** — orphaned build processes whose parent died. Nothing else will
-ever clean these up; `Reap` kills them and never touches a live session.
-
-**Other apps** — non-Claude memory, because the question is whether the *machine*
-is safe to work on, not whether Claude is behaving. A browser routinely outweighs
-every session combined; when it does, it is called out and the advice says so
-rather than suggesting you scope a build that is not the problem.
-
-**Claude sessions** — every session by name, its total memory split into the part
-in RAM (blue) and the part swapped to disk (pink), its process count, and what it
-is doing right now. A pink outline means over half that session's memory is on
-disk. `✕` ends a session. Expand a row for the processes it spawned, the
-subagents running inside it, and the services it started.
-
-Completed sessions are called out separately: the work is done, so closing them
-is free memory at no cost.
 
 ## What it looks like in practice
 
@@ -319,11 +309,17 @@ memmon                 live dashboard (repaints in place, alternate screen)
 memmon --once          one snapshot
 memmon --pressure      crash-risk verdict only (fast, no top)
 memmon --report        per-app / per-worktree averages from history
-memmon --blocked       commands the gate refused that nobody has re-run
+memmon --blocked       commands the gate refused in the last 2 hours that nobody has re-run
+memmon --dismiss-blocked ID   stop listing one of them (the menu bar's Dismiss)
 memmon --gate-log      gate impact: what was evaluated, advised, blocked
-memmon --reap          orphaned build processes (add --apply to kill)
+memmon owners          every process, partitioned into exactly one owner
+memmon owners --json   the same as schema 2 JSON (what the menu bar reads)
+memmon act ACTION --target TOKEN   identity-checked stop (see below)
+memmon reap [--apply]  orphaned build processes; --apply stops at partial
+memmon reap --force TOKEN   SIGKILL exactly the survivors a partial reap named
+memmon --reap          same as `memmon reap` (add --apply to stop them)
 memmon --reap-spares   idle prewarms >4h (claimed sessions never touched)
-memmon --end-session PID   terminate a session by root pid (--apply to do it)
+memmon --end-session PID   end a session by root pid (--apply to do it)
 memmon --wait-safe     block until memory pressure clears
 memmon --json          machine-readable snapshot
 memmon --statusline    one compact line, for a shell/Claude statusline
@@ -442,6 +438,143 @@ Before this check the pool looked like "14 idle prewarms holding 2.7 GB" when it
 was really 2 idle prewarms holding 186 MB plus six working sessions, one of them
 22 hours old. `--reap-spares` excludes claimed sessions unconditionally.
 
+## Owners and targeted stops
+
+`memmon owners` answers "whose is this?" for every process you can see. Each
+process belongs to exactly one owner, so nothing is counted twice, and when one
+owner runs inside another (a session started from another session's shell) the
+nearest one wins.
+
+| Owner | Found by | Confidence |
+|---|---|---|
+| Claude session | `~/.claude/sessions/<pid>.json` or `/tmp/cc-socks/<pid>.sock`, each checked against the process start time (an idle prewarm is not a session) | exact |
+| Codex `exec` | a `codex exec` process; its thread from the rollout file it holds open | inferred |
+| Codex daemon / app-server | the shared server that hosts interactive threads | shared |
+| Codex terminal frontend | an interactive `codex` connected to the Codex daemon (or started with `--remote`) that holds no thread itself and has no children — a pointer to the daemon | shared |
+| Managed job | the child of a live `memmon run` lease | exact |
+| App | an executable in `Contents/MacOS` of an `Applications/<Name>.app` (the outermost bundle, helpers included, or the code-signing clone an app re-executes from); one row per bundle id. Only processes running the main executable are instances; an app with none (widgets only) has no quit action, and neither has one that hosts a Claude or Codex session | exact |
+| VM / container service | Docker Desktop or OrbStack (quit as an app), or the Virtualization VM process, Lima/Colima, qemu (a copyable stop command). A VM joins Docker Desktop or OrbStack only when macOS names that app responsible for it | shared |
+| Unattributed | any other top-level process tree | unknown |
+
+A language runtime that merely lives inside an app bundle — Python inside
+Xcode's `Python3.framework` — does not make its programs part of that app, and
+memmon's own process is never counted inside the app it runs in.
+
+Memory is each process's footprint (what Activity Monitor and `top` call MEM),
+summed over the owner. It is read with libproc, about 4 ms for every process on
+the machine, instead of `top`'s ~0.6 s. Other users' and root's processes cannot
+be read without privileges; they are listed as "not itemised", never as zero.
+A number memmon could not read is shown as `—` with the reason, never as 0.
+
+CPU needs two samples. The popover takes them a second apart; the sampler keeps
+a baseline so the next tick can measure against it. Growth per 10 minutes, shown on an
+owner's detail card when known, needs at least 5 samples over 10 minutes with no
+gap longer than 3 minutes. Until then, a freshly started owner, or one seen
+across a sleep, says "not enough history" in its Technical details.
+
+### Stopping something
+
+`memmon act` is the only part of memmon that signals a process memmon did not
+start (`memmon run` signals its own child's process group, escalating to
+SIGKILL after 5 s), and the menu bar goes through it too. It is the confirmed
+step: a script or agent shows the row to a person first and acts only on their
+say-so; nothing in memmon stops anything on its own. Each action takes a token
+from `memmon owners --json` that names the exact processes it was shown, and
+expires after 120 seconds:
+
+| Action | Stops | Keeps running |
+|---|---|---|
+| `stop-job` / `stop-server` | one build, test or dev server inside a session | the session's conversation and every other owner |
+| `stop-managed-job` | the child of a `memmon run`; its wrapper then exits 143 | the wrapper and everything else |
+| `end-session` | a Claude session or a `codex exec`, down to any nested session | nested sessions (reported as kept) |
+| `verify-app` | nothing — checks every instance of an app before the menu bar quits it, and answers with a fresh token for the check after the quit (where a reused PID reads `exited` and an unreadable one `unverified`) | — |
+
+Every signal goes to one process at a time, immediately after re-reading that
+process's identity (PID plus start time to the microsecond) and finding it
+unchanged. There is no process-group kill. A PID that was reused, or a process
+that moved to another owner, is refused rather than signalled. One residual
+race remains and is stated rather than hidden: a process that exits and has its
+PID reused in the instant between that re-read and the signal would be signalled.
+
+It is graceful first. Everything gets SIGTERM; memmon then watches for up to 10
+seconds, catching any child forked in the meantime, and reports exactly what is
+still alive. Nothing is force-killed automatically. If something survives, the
+result is `partial` with a force token naming only the survivors it signalled,
+and only `memmon act force --target <token>` sends SIGKILL to them — after
+re-reading each one again, and skipping any that has since become another
+owner's root. Processes the stop only observed (a reparented child found in the
+group, say) are listed as `forceable: false`; force never touches them and its
+result stays `partial` while they run. A token lists at most 64 of them; the
+rest are re-counted at force time from the process groups they were seen in
+(`observed_unlisted`). A force result splits the named survivors that are gone
+three ways: `killed` (sent SIGKILL, now gone), `exited_unsignalled` (left alone
+as protected, or the signal could not be delivered, and gone anyway) and the
+rest, which had already exited before force ran; `exited` is the total, kept
+under that name for compatibility. Each remaining row has a `role` (`survivor`,
+`observed` or `runner`), whether it was actually `signalled`, and for a
+survivor force left alone a `skip_reason` (`protected` or `signal_failed`).
+
+A stop never signals a `memmon run` wrapper while its child may still run,
+because the wrapper would pass the signal to the child's whole process group.
+That holds when the lease row has no child start time (older runners), when the
+start is only known to the second, while the wrapper is still starting its
+child, and for a wrapper started during the grace period. The child is stopped
+by PID and the wrapper then exits on its own; one still alive at the end is
+listed with role `runner`, and force waits for it once it has killed its child.
+A dry run lists such wrappers as stopping once their job ends.
+A reap's force token is accepted only by `memmon reap --force`, which re-checks
+each survivor against the orphan or prewarm rule; `memmon act` refuses it. If a job's process exited before the stop
+but what it started is still running in its group, the result is `partial`
+(`root_exited`) with those processes listed and nothing signalled. The outcome is JSON on stdout with exit code 0 (stopped), 3 (partial,
+or respawned), 4 (refused) or 1 (error), and it reports memory in use before and
+after as a measurement: other apps change it too, so it is never a promise of
+what was freed.
+
+Two cases end on purpose with exit 3:
+
+- **Respawned.** Claude's daemon restarts a worker that dies mid-turn, under the
+  same job, about ten seconds later. After ending a Claude session, memmon keeps
+  watching (reading only) for up to 20 seconds after the first signal and
+  reports `respawned` if that happens. It never signals the new worker; stop the
+  job from Claude itself (`claude stop <job>`) if you want it gone.
+- **Codex in a terminal.** A `codex` terminal session that is connected to the
+  Codex daemon is only a window onto a thread the daemon runs, so it has no stop
+  action. One running its thread itself is an owner you can end, but it usually
+  ignores SIGTERM, so expect `partial` and a force step. A force-killed Codex
+  terminal may need `reset`.
+
+`MEMMON_INVENTORY=top` forces the old `ps`/`top` inventory. memmon also falls
+back to it on its own if libproc ever fails its self-check; in that mode every
+action is refused, because one-second start times are not an identity.
+
+### Behaviour change: `reap --apply` stops at partial
+
+`memmon reap --apply` used to send SIGTERM, wait two seconds and SIGKILL whatever
+was left — including, if a PID had been reused in those two seconds, a process
+that was not the orphan at all. It now uses the same engine as `memmon act`:
+each orphan is re-checked against the orphan rule and must still be unattributed,
+gets SIGTERM, and anything that survives is listed with a command:
+
+```
+memmon reap --force <token>
+```
+
+That token names only the processes that survived, by identity, and expires
+after 120 seconds. Orphans that appeared after the first run are never touched
+by it. `--reap-spares --apply` goes through the same engine. Without `--apply`
+the same engine decides without signalling: the dry run lists every process
+`--apply` would signal, descendants included, and every one it would refuse.
+With `--apply`, `reap`, `--reap`, `--reap-spares` and `--end-session` exit with
+the outcome's code (0 done, 3 partial, 4 refused). The menu bar no longer has a
+Reap button; reaping is a command-line action.
+
+### Upgrading with the old menu bar still running
+
+Until `./install.sh --menubar` replaces it, an already-running menu bar from
+before this version still calls `--end-session` and `--reap`. Those now take the
+graceful path, which can keep the old app busy for up to about 25 seconds per
+click. Reinstall the menu bar to get the new popover.
+
 ## Crash prediction
 
 `HEALTHY → WATCH → DANGER → CRITICAL`, scored from:
@@ -467,7 +600,8 @@ consults when deciding whether to start killing processes. It is the only
 free-memory number worth scoring.
 
 The `~N min left` badge projects when that figure reaches **20%**, at the current
-rate of decline. Two samples, 60 seconds apart:
+rate of decline. It is a trend estimate of when free memory reaches that floor —
+not a time until the machine freezes, which nothing on macOS can predict. Two samples, 60 seconds apart:
 
 ```
 headroom_min = (current % − 20) ÷ (percentage points lost per minute)
@@ -519,8 +653,9 @@ With `--gate`, a session about to run something heavy is told what the rest of t
 machine is doing:
 
 > System memory pressure is CRITICAL (swap 1.3x RAM size · heavy thrashing 210 MB/s).
-> web-checkout is holding 23.0G of build processes. At the current rate memory runs out
-> in ~4 min. Do NOT start this command now… scope it down (`pnpm --filter <pkg>`).
+> web-checkout is holding 23.0G of build processes. At the current rate, about 4 min
+> until free memory reaches the 20 % floor (trend estimate). Do NOT start this command
+> now… scope it down (`pnpm --filter <pkg>`).
 
 ### What a session actually sees
 
@@ -547,6 +682,12 @@ Bash tool call
                                  Recorded in `memmon --blocked` to re-run later.
 ```
 
+A blocked command stays listed until the same session runs the same command
+again, until it is dismissed, or for 2 hours, whichever comes first. A pressure
+block is temporary: by then the session has retried in some form or moved on.
+The menu bar shows the operation itself (`pnpm test:affected`), not the whole
+shell line, which stays in the tooltip and the VoiceOver label.
+
 Exit code 2 is the only code that stops a tool. Every other path returns 0,
 including every error path — a monitoring tool must never be why work stops.
 
@@ -558,7 +699,8 @@ On a block, the session receives this on stderr, as the tool result:
 
 > System memory pressure is CRITICAL (swap 1.3x RAM size · heavy thrashing
 > 210 MB/s). web-checkout is holding 23.0G of build processes. At the
-> current rate memory runs out in ~4 min. Do NOT start this command now — it
+> current rate, about 4 min until free memory reaches the 20 % floor (trend
+> estimate). Do NOT start this command now — it
 > would likely freeze the machine and lose work in every session. Either wait and
 > retry, or scope it down (for example `pnpm --filter <package> typecheck`
 > instead of a full-repo run). Check with `memmon --once`.
@@ -644,8 +786,11 @@ Everything lives in `~/.claude/memmon/`. Nothing is written to `/tmp`.
 |---|---|
 | `history.jsonl` | trims to last 7 days once past 12 MB (~1 MB/day) |
 | `gate.jsonl` | last 500 entries past 256 KB |
-| `latest.json`, `blocked.json` | fixed / last 50 |
+| `latest.json`, `blocked.json` | fixed / last 50, entries listed for 2 hours |
 | `sampler.err` | last 200 lines past 1 MB |
+| `owners-history.json` | 60 samples × 200 owners, under ~600 KB |
+| `cpu-baseline.json` | one sample of up to 4,096 processes |
+| `runner/coord/actions.lock` | empty; the lock that serialises every stop |
 
 Worst case ~13 MB, self-limiting. Trimming is by row count, not age — an age
 cutoff further out than the size gate removes nothing, so the file gets rewritten

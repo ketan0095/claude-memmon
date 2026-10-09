@@ -12,7 +12,9 @@ Modes:
   memmon --statusline    single line, for the Claude Code statusline
   memmon --log           append a sample to history (for launchd/cron)
   memmon --report        per-owner averages from logged history
-  memmon --reap          list reclaimable orphans (add --apply to kill)
+  memmon --reap          list reclaimable orphans (add --apply to stop them)
+  memmon owners --json   every process partitioned into one owner (schema 2)
+  memmon act ACTION --target TOKEN   identity-checked stop of one owner or job
 """
 
 from __future__ import annotations
@@ -23,10 +25,12 @@ import re
 import subprocess
 import sys
 import time
-# argparse, shutil and signal are imported lazily where used. None is reachable
+# argparse and shutil are imported lazily where used. Neither is reachable
 # from gate(), which runs on every Bash tool call; importing them unconditionally
 # measured ~6ms of its ~85ms budget, and shutil alone pulls in bz2 and lzma.
 from collections import defaultdict
+
+from memmon_common import spare_is_idle
 
 HOME = os.path.expanduser("~")
 JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
@@ -36,6 +40,15 @@ SNAPSHOT = os.path.join(STATE_DIR, "latest.json")
 # The one state file written from three functions was the only one
 # without a constant.
 GATE_LOG = os.path.join(STATE_DIR, "gate.jsonl")
+# Owner view state. Only the sampler writes these two.
+OWNERS_HISTORY = os.path.join(STATE_DIR, "owners-history.json")
+CPU_BASELINE = os.path.join(STATE_DIR, "cpu-baseline.json")
+# Serialises every stop, including the menu bar's quit-app, across processes.
+ACTIONS_LOCK = os.path.join(STATE_DIR, "runner", "coord", "actions.lock")
+CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
+CC_SOCKS_DIR = "/tmp/cc-socks"
+CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
+CODEX_HOME = os.path.join(HOME, ".codex")
 
 # A process is a reap candidate only if it matches one of these shapes. Being an
 # orphan is not enough on its own — plenty of legitimate daemons have ppid 1.
@@ -168,7 +181,7 @@ def read_ps() -> dict[int, dict]:
     return procs
 
 
-def read_vm(fast: bool = False, header: str = "") -> dict:
+def read_vm(fast: bool = False, header: str = "", vm_stat_text: str | None = None) -> dict:
     """System-wide memory picture.
 
     free_pct is `kern.memorystatus_level` — NOT "unused RAM". macOS deliberately
@@ -223,7 +236,10 @@ def read_vm(fast: bool = False, header: str = "") -> dict:
     # Cumulative counters. Their *rate* is what predicts a freeze — a high
     # swapin rate means the working set no longer fits in RAM and the machine is
     # reading pages back as fast as it evicts them.
-    for line in _sh(["vm_stat"]).splitlines():
+    if vm_stat_text is None:
+        vm_stat_text = _sh(["vm_stat"])
+    page_size(vm_stat_text)
+    for line in vm_stat_text.splitlines():
         m = re.match(r'"?([^:"]+)"?:\s+(\d+)', line.strip())
         if not m:
             continue
@@ -264,15 +280,23 @@ STATE_LABEL = {"done": "completed", "stopped": "completed", "working": "working"
                "blocked": "idle", "terminal": "terminal"}
 
 
-def _page_size() -> int:
-    m = re.search(r"page size of (\d+) bytes", _sh(["vm_stat"]))
-    return int(m.group(1)) if m else os.sysconf("SC_PAGE_SIZE")
+_page: int | None = None
+
+
+def page_size(vm_stat_text: str | None = None) -> int:
+    """Read once per process, from whichever vm_stat output arrives first,
+    rather than spawning vm_stat at import just for its header."""
+    global _page
+    if _page is None:
+        text = vm_stat_text if vm_stat_text is not None else _sh(["vm_stat"])
+        m = re.search(r"page size of (\d+) bytes", text)
+        _page = int(m.group(1)) if m else os.sysconf("SC_PAGE_SIZE")
+    return _page
 
 
 # The free-% level the runway estimate projects toward. See pressure().
 HEADROOM_FLOOR = 20
 
-PAGE = _page_size()
 _prev_vm: dict = {}
 
 
@@ -304,9 +328,9 @@ def pressure(vm: dict) -> dict:
     dt = now - prev.get("_ts", 0) if prev else 0
     if prev and 2 <= dt <= 300:
         rates["swapin_mbs"] = max(0, vm.get("swapins", 0)
-                                  - prev.get("swapins", 0)) * PAGE / dt / 1e6
+                                  - prev.get("swapins", 0)) * page_size() / dt / 1e6
         rates["swapout_mbs"] = max(0, vm.get("swapouts", 0)
-                                   - prev.get("swapouts", 0)) * PAGE / dt / 1e6
+                                   - prev.get("swapouts", 0)) * page_size() / dt / 1e6
         rates["free_delta_min"] = (vm.get("free_pct", 0)
                                    - prev.get("free_pct", 0)) * 60.0 / dt
         rates["swap_growth_mbmin"] = (vm.get("swap_used", 0)
@@ -1007,7 +1031,6 @@ def read_subagents(transcript_path: str) -> list[dict]:
 
 
 RV_SOCK_RE = re.compile(r"/rv/([0-9a-f]{8})\.sock")
-CLAIM_SOCK_RE = re.compile(r"(\S+\.claim\.sock)")
 
 
 def map_pids_to_jobs() -> dict[int, str]:
@@ -1030,16 +1053,6 @@ def map_pids_to_jobs() -> dict[int, str]:
             if m:
                 mapping[pid] = m.group(1)
     return mapping
-
-
-def spare_is_idle(cmd: str) -> bool:
-    """A prewarm process advertises itself on a .claim.sock. Once a session
-    claims it the socket is removed, so a missing socket means this process is
-    doing real work and must never be treated as reclaimable."""
-    m = CLAIM_SOCK_RE.search(cmd)
-    if not m:
-        return False
-    return os.path.exists(m.group(1))
 
 
 def find_transcripts(max_age_h: int = 12) -> dict[str, str]:
@@ -1317,7 +1330,6 @@ def collect() -> dict:
     overhead = {"mem": 0, "n": 0, "oldest": 0, "spares": 0, "spare_mem": 0,
                 "stale": 0, "stale_mem": 0, "items": [],
                 "claimed": 0, "claimed_mem": 0}
-    STALE_SPARE = 4 * 3600
     apps: dict[str, dict] = defaultdict(lambda: {"mem": 0, "n": 0})
     other_heavy = []
     for pid, info in ps.items():
@@ -1512,7 +1524,8 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
                  + col(detail, "grey" if p["level"] == "HEALTHY" else p["color"], on)
                  + col(nxt, "grey", on))
         room = p.get("headroom_min")
-        room_s = (f" · ~{room:.0f} min before memory runs out"
+        room_s = (f" · about {room:.0f} min until free memory reaches the "
+                  f"{HEADROOM_FLOOR} % floor (trend estimate)"
                   if room is not None and room < 120 else "")
         L.append(col(f" {'':<10}{p.get('advice', '')}{room_s}", "grey", on))
     L.append("")
@@ -1611,8 +1624,8 @@ def _build(snap: dict, on: bool = True, child_cap: int = 4,
                      + col(human(o["mem"]).rjust(7), "red", on)
                      + f" {dur(o['age']):>7}  {o['pid']:>7}  "
                      + col(clip(why, max(10, w - 62)), "grey", on))
-        L.append(col("  → memmon --reap           preview the kill list", "grey", on))
-        L.append(col("  → memmon --reap --apply   free it now", "grey", on))
+        L.append(col("  → memmon --reap           preview what would be stopped", "grey", on))
+        L.append(col("  → memmon --reap --apply   SIGTERM them; anything left is reported", "grey", on))
         L.append("")
 
     # ---- build work rolled up by worktree
@@ -1832,11 +1845,126 @@ def report(days: int) -> str:
 
 # ------------------------------------------------------------------- reaping
 
-def reap_spares(snap: dict, apply: bool) -> str:
+STALE_SPARE = 4 * 3600
+
+
+def _orphan_still_selected(inv, pid: int) -> bool:
+    """The orphan selector, re-applied to fresh data at stop time."""
+    p = inv.procs.get(pid)
+    if p is None or not REAPABLE.search(inv.cmdline(pid)):
+        return False
+    return p.ppid == 1 or inv.ts - p.start[0] >= 3600
+
+
+def _spare_still_selected(inv, pid: int) -> bool:
+    """The stale-prewarm selector, re-applied: still an unclaimed spare, still
+    older than the cutoff. A spare claimed since the listing is never touched."""
+    p = inv.procs.get(pid)
+    cmd = inv.cmdline(pid)
+    return (p is not None and "bg-spare" in cmd and spare_is_idle(cmd)
+            and inv.ts - p.start[0] > STALE_SPARE)
+
+
+def _stop_report(out: dict, what: str) -> str:
+    """Plain-text account of an engine outcome for the legacy commands."""
+    r = out.get("result")
+    if r == "refused":
+        return "\n".join([f"refused: {out.get('reason')}"]
+                         + [f"left alone: pid {row['pid']} ({row['reason']})"
+                            for row in out.get("refused") or []])
+    if r == "error":
+        return f"error: {out.get('reason')}"
+    if r == "already_exited":
+        return f"{what}: already exited — nothing was signalled"
+    if r == "would_stop":
+        L = [f"{what}: would send SIGTERM to {len(out['would_signal'])} process(es):"]
+        L += [f"  {row['pid']:>7}  {row['argv0']}" for row in out["would_signal"]]
+        L += [f"  {row['pid']:>7}  {row['argv0']}  (memmon run wrapper: would stop once its "
+              "job ends)" for row in out.get("would_hold") or []]
+        L += [f"would keep running: {row}" for row in out.get("kept") or []]
+        out = {**out, "kept": []}
+    elif "named" in out:                     # a force result
+        gone, killed = out.get("exited", 0), out.get("killed", 0)
+        alone = out.get("exited_unsignalled", 0)
+        L = [f"{what}: {r} — {gone} of {out['named']} named survivor(s) gone: "
+             f"{killed} killed by SIGKILL, {gone - killed - alone} had already exited"]
+        if alone:
+            L.append(f"{alone} ended on {'its' if alone == 1 else 'their'} own while protected")
+    elif out.get("reason") == "root_exited":
+        L = [f"{what}: the job had already exited, but processes it started are "
+             "still running in its group (nothing was signalled)"]
+    else:
+        L = [f"{what}: {r} — {out.get('exited', 0)} of {out.get('captured', 0)} "
+             f"process(es) exited after SIGTERM"]
+    before, after = out.get("used_bytes_before"), out.get("used_bytes_after")
+    if before is not None and after is not None:
+        delta = before - after
+        L.append(f"used memory {human(abs(delta))} {'lower' if delta >= 0 else 'higher'}"
+                 " at the next sample (measured; other apps also change)")
+    for row in out.get("kept") or []:
+        L.append(f"kept running: {row}")
+    for row in out.get("refused") or []:
+        L.append(f"left alone: pid {row['pid']} ({row['reason']})")
+    if out.get("remaining"):
+        L.append(f"{len(out['remaining'])} still running:")
+        for row in out["remaining"]:
+            note = ""
+            if row.get("role") == "runner":
+                note = "  (memmon run wrapper, never signalled: it exits once its job ends)"
+            elif row.get("skip_reason") == "signal_failed":
+                note = "  (SIGKILL could not be delivered)"
+            elif row.get("skip_reason") == "protected":
+                note = "  (not force-killed: it is protected now)"
+            elif not row.get("signalled", row.get("forceable")):
+                note = ("  (signalled, but the signal was not delivered)" if row.get("forceable")
+                        else "  (observed, never signalled)")
+            L.append(f"  {row['pid']:>7}  {row['argv0']}{note}")
+    if out.get("observed_unlisted"):
+        L.append(f"{out['observed_unlisted']} more still running that memmon could not list "
+                 "(re-counted in the groups they were seen in)")
+    if out.get("watch_error"):
+        L.append(f"the respawn watch stopped early ({out['watch_error']}); a daemon "
+                 "restart after this point would not be reported")
+    if out.get("reason") == "outside_force":
+        L.append("Force only touches the survivors the stop signalled; the rest "
+                 "were observed in the group and are left alone.")
+    return "\n".join(L)
+
+
+def _force_hint(out: dict, command: str) -> str:
+    import memmon_act
+    return (f"\nNothing was force-killed. To force the {out.get('forceable', 0)} captured "
+            f"survivor(s) (the token expires in {memmon_act.TOKEN_TTL_S} s):\n"
+            f"  {command} {out['force_token']}")
+
+
+SELECTORS = {"orphan": lambda inv, pid: _orphan_still_selected(inv, pid),
+             "spare": lambda inv, pid: _spare_still_selected(inv, pid)}
+
+
+def _reap_run(pids: list, selector: str, what: str, apply: bool, engine=None) -> tuple:
+    """Run the reap selection through the engine: a dry run reports what
+    --apply would signal and refuse; --apply stops at partial. The listing
+    comes from ps and has no start time, so each target's identity is read
+    here, once, and the engine refuses a PID that holds another process by
+    the time it looks; a PID reused before this read is caught only by the
+    selector, which the engine re-applies too."""
+    eng = engine or _engine()
+    ids = []
+    for pid in pids:
+        p = eng.source.read(pid)
+        ids.append((pid, list(p.start)) if p is not None and p.start else (pid, None))
+    out = eng.reap(ids, SELECTORS[selector], selector, dry_run=not apply)
+    text = _stop_report(out, what)
+    if out.get("force_token"):
+        text += _force_hint(out, "memmon reap --force")
+    return text, out
+
+
+def reap_spares_report(snap: dict, apply: bool, engine=None) -> tuple:
     """Idle prewarm processes older than 4h. The daemon keeps a warm pool and is
-    meant to recycle it; when it doesn't, these just hold memory. Killing one is
+    meant to recycle it; when it doesn't, these just hold memory. Stopping one is
     safe — the pool respawns on demand — so only the stale ones are targeted."""
-    import signal
     ov = snap.get("overhead") or {}
     items = ov.get("items", [])
     stale = [i for i in items if i["stale"]]
@@ -1845,32 +1973,27 @@ def reap_spares(snap: dict, apply: bool) -> str:
         return (f"No stale prewarms. Idle pool: {ov.get('spares', 0)} spares, "
                 f"{human(ov.get('spare_mem', 0))}, oldest {dur(oldest)}.\n"
                 f"{ov.get('claimed', 0)} claimed session(s) holding "
-                f"{human(ov.get('claimed_mem', 0))} are working and excluded.")
+                f"{human(ov.get('claimed_mem', 0))} are working and excluded."), None
     L = [f"{'PID':>7}  {'MEM':>7} {'IDLE':>7}"]
     for i in sorted(stale, key=lambda x: -x["mem"]):
         L.append(f"{i['pid']:>7}  {human(i['mem']):>7} {dur(i['age']):>7}")
     total = sum(i["mem"] for i in stale)
     L.append("")
     L.append(f"{len(stale)} idle prewarm procs · {human(total)} reclaimable")
-    if not apply:
-        L.append("dry run — re-run with --apply to kill these.")
-        return "\n".join(L)
-    killed = 0
-    for i in stale:
-        try:
-            os.kill(i["pid"], signal.SIGTERM)
-            killed += 1
-        except Exception:
-            pass
-    L.append(f"killed {killed} prewarm process(es) — ~{human(total)} freed")
-    return "\n".join(L)
+    text, out = _reap_run([i["pid"] for i in stale], "spare", "prewarm reap", apply, engine)
+    L.append(text)
+    if not apply and out.get("result") == "would_stop":
+        L.append("dry run — re-run with --apply to stop these.")
+    return "\n".join(L), out
 
 
-def reap(snap: dict, apply: bool) -> str:
-    import signal  # reap() has no docstring, which is how my patch missed it
+def reap_report(snap: dict, apply: bool, engine=None) -> tuple:
+    """Orphaned or stale build processes. --apply sends SIGTERM, identity-checked
+    per PID, and stops at a partial result: anything still running is listed
+    with a `memmon reap --force` token that names exactly those processes."""
     targets = snap["orphans"]
     if not targets:
-        return "Nothing to reap — no orphaned or stale build processes."
+        return "Nothing to reap — no orphaned or stale build processes.", None
     L = [f"{'PID':>7}  {'MEM':>7} {'AGE':>7}  WHAT"]
     for o in targets:
         L.append(f"{o['pid']:>7}  {human(o['mem']):>7} {dur(o['age']):>7}  "
@@ -1878,30 +2001,24 @@ def reap(snap: dict, apply: bool) -> str:
                  + ("  [orphan]" if o["orphaned"] else "  [stale]"))
     L.append("")
     L.append(f"total reclaimable: {human(snap['orphan_total'])}")
-    if not apply:
-        L.append("dry run — re-run with --apply to kill these.")
-        return "\n".join(L)
+    text, out = _reap_run([o["pid"] for o in targets], "orphan", "reap", apply, engine)
+    L.append(text)
+    if not apply and out.get("result") == "would_stop":
+        L.append("dry run — re-run with --apply to stop these.")
+    return "\n".join(L), out
 
-    killed, failed = 0, 0
-    for o in targets:
-        try:
-            os.kill(o["pid"], signal.SIGTERM)
-            killed += 1
-        except ProcessLookupError:
-            pass
-        except Exception:
-            failed += 1
-    time.sleep(2)
-    for o in targets:
-        try:
-            os.kill(o["pid"], 0)
-            os.kill(o["pid"], signal.SIGKILL)
-        except Exception:
-            pass
-    L.append(f"killed {killed} process(es)"
-             + (f", {failed} failed" if failed else "")
-             + f" — ~{human(snap['orphan_total'])} freed")
-    return "\n".join(L)
+
+def reap(snap: dict, apply: bool, engine=None) -> str:
+    return reap_report(snap, apply, engine)[0]
+
+
+def reap_spares(snap: dict, apply: bool, engine=None) -> str:
+    return reap_spares_report(snap, apply, engine)[0]
+
+
+def _apply_exit(out, apply: bool) -> int:
+    import memmon_act
+    return memmon_act.exit_code(out) if apply and out is not None else 0
 
 
 # -------------------------------------------------------------------- the gate
@@ -2078,7 +2195,8 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
             bits.append(f"{name} is holding {human(mem)}.")
     room = pres.get("headroom_min")
     if room is not None and room < 30:
-        bits.append(f"At the current rate memory runs out in ~{room:.0f} min.")
+        bits.append(f"At the current rate, about {room:.0f} min until free memory "
+                    f"reaches the {HEADROOM_FLOOR} % floor (trend estimate).")
 
     # "warn" never blocks, whatever the level — that is the point of the mode.
     blocking = classification.get("block_eligible", False) and (
@@ -2100,6 +2218,14 @@ def gate_decision(tool: str, cmd: str, pres: dict, cached: dict,
 
 
 PENDING = os.path.join(STATE_DIR, "blocked.json")
+# A pressure block is temporary: after this long the session has retried in
+# some form or moved on, so the entry stops asking to be re-run.
+PENDING_TTL_S = 2 * 3600
+# Launch wrappers the short form strips, with the options of each that take a value.
+WRAPPERS = {"timeout": {"-s", "-k", "--signal", "--kill-after"},
+            "gtimeout": {"-s", "-k", "--signal", "--kill-after"},
+            "nice": {"-n"}, "time": set(), "caffeinate": {"-t", "-w"},
+            "env": {"-u", "-S", "-P", "--unset"}, "command": set()}
 
 
 def session_name_for(session_id: str) -> str:
@@ -2198,7 +2324,8 @@ def gate_stats(limit: int | None = None) -> dict:
             # unknown rather than being explained with mutable current state.
             "session": {"id": sid, "name": r.get("session_name")},
             "command": {"raw": cmd,
-                        "display": r.get("cmd_display") or display_command(cmd)},
+                        "display": r.get("cmd_display") or display_command(cmd),
+                        "short": short_command(cmd)},
             "classification": None if legacy else classification,
             "legacy": legacy,
             "pressure": {"level": r.get("level") or "?",
@@ -2213,8 +2340,10 @@ def gate_stats(limit: int | None = None) -> dict:
         "ts": p.get("ts", 0),
         "session": {"id": (p.get("session_id") or "")[:8],
                     "name": p.get("session")},
+        "id": pending_id(p),
         "command": {"raw": p.get("cmd", ""),
-                    "display": display_command(p.get("cmd", ""))},
+                    "display": display_command(p.get("cmd", "")),
+                    "short": short_command(p.get("cmd", ""))},
         "pressure_level": p.get("level") or "?",
         "event_retained": any(
             e["retry_status"] == "waiting"
@@ -2253,11 +2382,58 @@ def gate_stats(limit: int | None = None) -> dict:
 
 
 def load_pending() -> list[dict]:
+    """Outstanding blocked commands, without any older than PENDING_TTL_S."""
     try:
         with open(PENDING) as fh:
-            return json.load(fh)
+            items = json.load(fh)
     except Exception:
         return []
+    now = time.time()
+    return [i for i in items if now - (i.get("ts") or 0) < PENDING_TTL_S]
+
+
+def pending_id(item: dict) -> str:
+    return f"{int((item.get('ts') or 0) * 1000)}.{(item.get('session_id') or '')[:8]}"
+
+
+def dismiss_pending(item_id: str) -> bool:
+    """Drop one outstanding entry by its id. False when nothing matched."""
+    items = load_pending()
+    kept = [i for i in items if pending_id(i) != item_id]
+    if len(kept) == len(items):
+        return False
+    save_pending(kept)
+    return True
+
+
+def short_command(cmd: str, limit: int = 60) -> str:
+    """The operation itself, e.g. `pnpm test:affected`: the heavy segment of a
+    pipeline, without wrappers such as `timeout 1500` or its redirections."""
+    commands = shell_commands(cmd)
+    plain = [t for t in commands if t and t[0] != "cd"] or commands
+    tokens = next((t for t in commands if _builtin_for_tokens(t)),
+                  plain[0] if plain else [])
+    out: list[str] = []
+    for t in tokens:
+        if re.match(r"^\d*[<>&|]", t):
+            break
+        out.append(t)
+    while out and (out[0] in WRAPPERS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", out[0])):
+        head = out.pop(0)
+        takes = WRAPPERS.get(head, set())
+        while out and out[0].startswith("-"):
+            if out.pop(0) in takes and out:
+                out.pop(0)
+        if head in ("timeout", "gtimeout") and out and re.match(r"^[\d.]+[smhd]?$", out[0]):
+            out.pop(0)
+    # A path is shown by its last component: `../../node_modules/.bin/tsc`
+    # reads as `tsc`, and a test file as its file name.
+    out = [os.path.basename(t.rstrip("/")) or t if "/" in t and not t.startswith("-") else t
+           for t in out]
+    text = " ".join(out) or display_command(cmd)
+    if HOME:
+        text = text.replace(HOME + "/", "~/")
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
 def save_pending(items: list[dict]) -> None:
@@ -2397,46 +2573,44 @@ def gate() -> int:
         return 0
 
 
-def end_session(pid: int, apply: bool) -> str:
-    """Terminate a Claude session by hand, tree and all.
+def end_session(pid: int, apply: bool, engine=None) -> str:
+    return end_session_report(pid, apply, engine)[0]
 
-    Refuses any pid that is not currently a session ROOT in the live snapshot —
-    the caller passes a number, and a stale or mistyped one must never be able to
-    kill an arbitrary process. SIGTERM, never SIGKILL, so the session gets to
-    flush its transcript."""
-    import signal
-    snap = collect()
-    sess = next((s for s in snap["sessions"] if s.get("root") == pid), None)
-    if sess is None:
-        live = ", ".join(f"{s['name']}={s.get('root')}" for s in snap["sessions"])
-        return (f"refused: pid {pid} is not a live Claude session root.\n"
-                f"live sessions: {live or 'none'}")
 
-    ps = read_ps()
-    tree = [pid] + descendants(pid, build_tree(ps))
+def end_session_report(pid: int, apply: bool, engine=None) -> tuple:
+    """End a Claude session (or a codex exec) by hand, tree and all.
+
+    Refuses any pid that is not currently such an owner's ROOT — the caller
+    passes a number, and a stale or mistyped one must never reach a process.
+    SIGTERM only, identity-checked per PID; nested owners are kept."""
+    import memmon_act
+    import memmon_owners
+    import memmon_procs
+    eng = engine or _engine()
+    inv = memmon_procs.snapshot(eng.source, clock=eng.clock)
+    part = eng.partition_fn(inv)
+    oid = part.root_owner.get(pid)
+    owner = part.owners.get(oid) if oid else None
+    if owner is None or owner.kind not in memmon_owners.ENDABLE_KINDS:
+        live = ", ".join(f"{o.owner_id}={o.root}" for o in part.owners.values()
+                         if o.kind in memmon_owners.ENDABLE_KINDS)
+        return (f"refused: pid {pid} is not a live session root.\n"
+                f"live sessions: {live or 'none'}"), memmon_act.outcome("refused", "not_stoppable")
+    fp = sum(inv.procs[p].footprint or 0 for p in owner.members)
     if not apply:
-        return (f"would end \"{sess['name']}\" — {human(sess['mem'])} across "
-                f"{len(tree)} process(es), root pid {pid}\n"
-                f"re-run with --apply to do it.")
-
-    # Children first, so the root does not respawn or re-adopt them mid-teardown.
-    for p in sorted(tree, reverse=True):
-        try:
-            os.kill(p, signal.SIGTERM)
-        except Exception:
-            pass
-    time.sleep(2)
-    still = [p for p in tree if _alive(p)]
-    return (f"ended \"{sess['name']}\" — SIGTERM to {len(tree)} process(es); "
-            f"{len(still)} still winding down")
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
+        return (f"would end {owner.owner_id} — {human(fp)} across "
+                f"{len(owner.members)} process(es), root pid {pid}\n"
+                f"re-run with --apply to do it."), None
+    root = inv.procs[pid]
+    token = memmon_owners.mint_token({
+        "v": 1, "action": "end-session", "owner_id": oid,
+        "owner_root": memmon_owners.ident(root), "target": memmon_owners.ident(root),
+        "snapshot_ts": round(inv.ts, 3)})
+    out = eng.run("end-session", token)
+    text = _stop_report(out, f"end {oid}")
+    if out.get("force_token"):
+        text += _force_hint(out, "memmon act force --target")
+    return text, out
 
 
 def wait_safe(timeout: int) -> int:
@@ -2456,6 +2630,330 @@ def wait_safe(timeout: int) -> int:
     return 1
 
 
+# ------------------------------------------------------------------- owners
+
+def job_tokens(cmd: str) -> list:
+    """The executables of a command line as token lists, a package
+    launcher's own options skipped the way the gate skips them
+    (`pnpm --filter web dev` runs `dev`)."""
+    import memmon_owners
+    out = []
+    for t in shell_commands(cmd):
+        toks = _command_tokens(t)
+        if toks and os.path.basename(toks[0]) in memmon_owners.LAUNCHERS:
+            toks = toks[:1] + toks[_skip_options(toks, 1):]
+        out.append(toks)
+    return out
+
+
+def _owners_ctx(titles: bool = True):
+    import memmon_owners
+    from memmon_runner import jobs
+    ctx = memmon_owners.Context(
+        sessions_dir=CLAUDE_SESSIONS_DIR, socks_dir=CC_SOCKS_DIR,
+        codex_home=CODEX_HOME, jobs_dir=JOBS_DIR, roster_path=CLAUDE_ROSTER,
+        leases=jobs(STATE_DIR), rv_map=map_pids_to_jobs,
+        lsof=lambda args: _sh(["lsof", *args], timeout=5))
+    if titles:
+        prof = load_profile()
+        ctx.classify = lambda cmd: classify_command(cmd, prof)
+        ctx.commands = job_tokens
+        for sess in read_sessions():
+            ctx.titles_by_job[sess["short"]] = sess["name"]
+            if sess["session_id"]:
+                ctx.titles_by_sid[sess["session_id"]] = sess["name"]
+    return ctx
+
+
+def _engine(**kw):
+    import memmon_act
+    import memmon_owners
+    import memmon_procs
+    from memmon_runner import jobs
+    kw.setdefault("source", memmon_procs.default_source())
+    kw.setdefault("partition_fn", lambda inv: memmon_owners.partition(
+        inv, _owners_ctx(titles=False)))
+    ctx = _owners_ctx(titles=False)
+    kw.setdefault("respawn", memmon_owners.RespawnWatch(ctx))
+    kw.setdefault("root_rule_fn", lambda inv, pids: memmon_owners.fresh_roots(inv, pids, ctx))
+    kw.setdefault("lock_path", ACTIONS_LOCK)
+    kw.setdefault("system_reader", memmon_procs.read_system_strict)
+    kw.setdefault("leases_fn", lambda: jobs(STATE_DIR))
+    return memmon_act.Engine(**kw)
+
+
+def system_block(reader=None) -> dict:
+    """The health card's numbers: the strict reader's "used" and the kernel
+    level, plus the existing score verdict. A failed strict read is null with
+    its reason, never a healthy-looking default."""
+    import memmon_procs
+    out = {"ram_bytes": None, "used_bytes": None, "pressure_level": None,
+           "score_level": None, "reason": None}
+    shared = []
+
+    def vm_stat_once(cmd, **kw):
+        # One vm_stat serves both readers; the strict one still sees its
+        # failures as failures.
+        if not shared:
+            shared.append(subprocess.run(cmd, **kw))
+        return shared[0]
+    try:
+        out.update((reader or (lambda: memmon_procs.read_system_strict(run=vm_stat_once)))())
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+    text = shared[0].stdout if shared and shared[0].returncode == 0 else None
+    try:
+        out["score_level"] = pressure(read_vm(fast=True, vm_stat_text=text))["level"]
+    except Exception:
+        pass
+    return out
+
+
+def protection_block(unmanaged: int) -> dict:
+    mode = os.environ.get("MEMMON_GATE", "block-critical")
+    if not gate_installed() or mode == "off":
+        gate_state = "off"
+    elif pause_until():
+        gate_state = "paused"
+    else:
+        gate_state = "on"
+    summary = (gate_state if gate_state != "on"
+               else "partial" if unmanaged else "on")
+    return {"summary": summary, "gate": gate_state, "route": "off",
+            "unmanaged_heavy": unmanaged}
+
+
+def owners_sample(cpu_window: float, source=None, ctx=None, sleep=time.sleep):
+    """One owners sample. CPU comes from two snapshots `cpu_window` seconds
+    apart, or with a window of 0 from the sampler's persisted baseline when
+    that is still valid. Returns (sample, actual window or None)."""
+    import memmon_owners
+    import memmon_procs
+    src = source or memmon_procs.default_source()
+    first = memmon_procs.snapshot(src)
+    ctx = ctx or _owners_ctx()
+    cpu, window, reason = {}, None, "warming up"
+    if first.kind == "degraded":
+        inv, reason = first, "not measured"
+    elif cpu_window > 0:
+        sleep(cpu_window)
+        inv = memmon_procs.snapshot(src)
+        cpu = memmon_procs.cpu_cores(memmon_procs.tick_table(first, 1 << 30),
+                                     inv, first.mono_ns)
+        window = round((inv.mono_ns - first.mono_ns) / 1e9, 3)
+    else:
+        inv = first
+        base = memmon_owners.read_json(CPU_BASELINE, {})
+        if not memmon_owners.baseline_problem(base, inv, memmon_owners.boot_id(),
+                                              memmon_owners.awake_ns()):
+            cpu = memmon_procs.cpu_cores(base["procs"], inv, int(base["mono_ns"]))
+            window = round((inv.mono_ns - int(base["mono_ns"])) / 1e9, 3)
+    part = memmon_owners.partition(inv, ctx)
+    return memmon_owners.Sample(inv, part, cpu, reason), window
+
+
+def owners_json(cpu_window: float = 1.0, expand: list | None = None,
+                source=None, ctx=None, system_reader=None) -> dict:
+    import memmon_owners
+    ctx = ctx or _owners_ctx()
+    sample, window = owners_sample(cpu_window, source, ctx)
+    used_by = None
+    if expand:
+        owners = sample.part.owners
+        # Only agent jobs have a server kind to settle.
+        wanted = [p for oid in expand if oid in owners
+                  and owners[oid].kind in memmon_owners.ENDABLE_KINDS
+                  for p in owners[oid].members]
+        ctx.listening = _listening(wanted)
+        used_by = {oid: _service_users(sample, oid) for oid in expand
+                   if oid in owners and owners[oid].kind == "service"}
+    hist = memmon_owners.read_json(OWNERS_HISTORY, {})
+    payload = memmon_owners.owners_payload(
+        sample, ctx, history=hist, cpu_window_s=window,
+        system=system_block(system_reader),
+        protection=protection_block(memmon_owners.unmanaged_heavy(sample, ctx)),
+        gate=gate_stats(), used_by=used_by)
+    # A machine-wide CPU figure is only a sum when every member was measured;
+    # counted in whole members, never from the rounded per-owner fractions.
+    members = [p for o in payload["owners"] if o["owner_id"] in sample.part.owners
+               for p in sample.part.owners[o["owner_id"]].members]
+    seen = [sample.cpu[p] for p in members if p in sample.cpu]
+    system = payload["system"]
+    system["ncpu"] = os.cpu_count()
+    complete = bool(seen) and len(seen) == len(members)
+    system["cpu_coverage"] = memmon_owners.coverage(len(seen), len(members)) if seen else None
+    system["cpu_cores"] = round(sum(seen), 3) if complete else None
+    if not seen:
+        system["cpu_reason"] = sample.cpu_reason or "not measured"
+    payload["runner_jobs"] = ctx.leases       # the legacy --json "jobs" list, verbatim
+    return payload
+
+
+def _service_users(sample, oid: str):
+    """Sessions that appear to use a VM: agent processes with a TCP connection
+    to a port the VM side listens on (Lima's forwards, Docker Desktop's
+    backend). Inferred, computed only on demand; None when it cannot be."""
+    import memmon_owners
+    part = sample.part
+    host = list(part.owners[oid].members)
+    agents = {p: o.owner_id for o in part.owners.values()
+              if o.kind in memmon_owners.ENDABLE_KINDS for p in o.members}
+    if not host or not agents:
+        return [] if host else None
+    listen = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fn",
+                  "-p", ",".join(map(str, sorted(set(host))))], timeout=5)
+    ports = {line.rsplit(":", 1)[-1] for line in listen.splitlines()
+             if line.startswith("n") and ":" in line}
+    if not ports:
+        return []
+    est = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:ESTABLISHED", "-Fpn",
+               "-p", ",".join(map(str, sorted(agents)))], timeout=5)
+    users, pid = set(), None
+    for line in est.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and "->" in line and pid in agents:
+            if line.rsplit(":", 1)[-1] in ports:
+                users.add(agents[pid])
+    return sorted(users)
+
+
+def _listening(pids: list) -> set:
+    """PIDs among `pids` holding a TCP LISTEN socket (one lsof, on demand)."""
+    if not pids:
+        return set()
+    out = _sh(["lsof", "-O", "-b", "-w", "-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fp",
+               "-p", ",".join(str(p) for p in sorted(set(pids)))], timeout=5)
+    return {int(line[1:]) for line in out.splitlines()
+            if line.startswith("p") and line[1:].isdigit()}
+
+
+def owners_sampler_tick(source=None, ctx=None, clock=None, mono=None) -> dict | None:
+    """The sampler's share of the owner view: append one footprint per owner to
+    owners-history.json and persist the CPU baseline the next tick (another
+    process, a minute later) measures against."""
+    import memmon_owners as mo
+    import memmon_procs
+    src = source or memmon_procs.default_source()
+    inv = memmon_procs.snapshot(src, clock=clock, mono=mono)
+    if inv.kind == "degraded":
+        return None
+    part = mo.partition(inv, ctx or _owners_ctx(titles=False))
+    boot, awake = mo.boot_id(), mo.awake_ns()
+    base = mo.read_json(CPU_BASELINE, {})
+    problem = mo.baseline_problem(base, inv, boot, awake)
+    cpu = {} if problem else memmon_procs.cpu_cores(base["procs"], inv,
+                                                    int(base["mono_ns"]))
+    hist = mo.update_history(mo.read_json(OWNERS_HISTORY, {}),
+                             mo.history_footprints(part, inv), inv.ts)
+    for oid, owner in part.owners.items():
+        if oid in hist["owners"]:
+            cores, cov = mo._cpu(owner.members, cpu)
+            hist["owners"][oid]["cpu"] = [round(inv.ts, 1),
+                                          None if cores is None else round(cores, 3),
+                                          cov]
+    mo.write_json_atomic(OWNERS_HISTORY, hist)
+    mo.write_json_atomic(CPU_BASELINE, mo.make_baseline(inv, boot, awake))
+    return {"cpu": cpu, "baseline_problem": problem, "owners": len(part.owners)}
+
+
+def owners_text(payload: dict) -> str:
+    L = [f"{'OWNER':<34}{'KIND':<10}{'MEMORY':>9}{'CPU':>7}  CONFIDENCE"]
+    for o in payload["owners"]:
+        mem = human(o["footprint_bytes"]) if o["footprint_bytes"] is not None else "—"
+        cpu = f"{o['cpu_cores']:.1f}" if o["cpu_cores"] is not None else "—"
+        L.append(f"{clip(o['title'], 32):<34}{o['kind']:<10}{mem:>9}{cpu:>7}  "
+                 f"{o['confidence']}")
+        for j in o["jobs"]:
+            jm = human(j["footprint_bytes"]) if j["footprint_bytes"] is not None else "—"
+            L.append(f"  └ {clip(j['kind'] + ' · ' + j['label'], 30):<40}{jm:>9}")
+    if payload["inventory"] == "degraded":
+        L.append(f"inventory degraded ({payload.get('inventory_reason')}): "
+                 "memory from top, actions refused")
+    L.append(f"system and other users: not itemised "
+             f"({payload['hidden_process_count']} processes)")
+    return "\n".join(L)
+
+
+def owners_cli(argv: list) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="memmon owners")
+    ap.add_argument("--json", action="store_true", help="schema 2 payload")
+    ap.add_argument("--cpu-window", type=float, default=1.0,
+                    help="seconds between the two CPU samples; 0 reuses the "
+                         "sampler's baseline (default 1.0)")
+    ap.add_argument("--expand", action="append", metavar="OWNER_ID",
+                    help="also look up listening sockets for this owner's jobs")
+    args = ap.parse_args(argv)
+    payload = owners_json(max(0.0, args.cpu_window), args.expand)
+    print(json.dumps(payload) if args.json else owners_text(payload))
+    return 0
+
+
+def act_cli(argv: list, engine=None) -> int:
+    """memmon act ACTION --target TOKEN. The outcome JSON always goes to stdout;
+    the exit code is 0 done, 3 partial, 4 refused, 1 error."""
+    import argparse
+    import memmon_act
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):
+            raise ValueError(message)
+    ap = Parser(prog="memmon act")
+    ap.add_argument("action", nargs="?", choices=(
+        *memmon_act.PROCESS_ACTIONS, *memmon_act.TOKEN_ACTION))
+    ap.add_argument("--target", help="token from `memmon owners --json`")
+    ap.add_argument("--force", metavar="FORCE_TOKEN",
+                    help="SIGKILL the survivors a partial result named")
+    ap.add_argument("--lock-fd", type=int, help="inherited actions.lock descriptor")
+    try:
+        args = ap.parse_args(argv)
+        action, token = (("force", args.force) if args.force
+                         else (args.action, args.target))
+        if not action or not token:
+            raise ValueError("give an action and --target TOKEN, or --force FORCE_TOKEN")
+    except (ValueError, SystemExit) as exc:
+        if isinstance(exc, SystemExit) and not exc.code:
+            raise                                   # --help
+        out = memmon_act.outcome("refused", "bad_args")
+        out["detail"] = str(exc)
+        print(json.dumps(out))
+        return memmon_act.exit_code(out)
+    try:
+        out = (engine or _engine()).run(action, token, lock_fd=args.lock_fd)
+    except Exception as exc:
+        out = memmon_act.outcome("error", f"{type(exc).__name__}: {exc}")
+    print(json.dumps(out))
+    return memmon_act.exit_code(out)
+
+
+def reap_cli(argv: list, engine=None) -> int:
+    import argparse
+    import memmon_act
+    ap = argparse.ArgumentParser(prog="memmon reap")
+    ap.add_argument("--apply", action="store_true",
+                    help="SIGTERM the listed processes; stops at partial")
+    ap.add_argument("--force", metavar="FORCE_TOKEN",
+                    help="SIGKILL exactly the survivors a partial reap named")
+    ap.add_argument("--spares", action="store_true",
+                    help="idle claude prewarms older than 4h instead of orphans")
+    args = ap.parse_args(argv)
+    if args.force:
+        import memmon_owners
+        try:
+            selector = memmon_owners.decode_token(args.force).get("selector")
+        except ValueError:
+            selector = None
+        out = (engine or _engine()).force(args.force, origin="reap",
+                                          still_selected=SELECTORS.get(selector))
+        print(_stop_report(out, "force"))
+        return memmon_act.exit_code(out)
+    snap = collect()
+    text, out = (reap_spares_report if args.spares else reap_report)(snap, args.apply, engine)
+    print(text)
+    return _apply_exit(out, args.apply)
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -2463,6 +2961,9 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] in ("run", "jobs"):
         from memmon_runner import cli
         return cli(sys.argv[1:], STATE_DIR, lambda: pressure(read_vm(fast=True)))
+    if len(sys.argv) > 1 and sys.argv[1] in ("owners", "act", "reap"):
+        return {"owners": owners_cli, "act": act_cli,
+                "reap": reap_cli}[sys.argv[1]](sys.argv[2:])
     # Short-circuit before the parser exists: gate() runs on every Bash tool call
     # and has no use for 24 argument definitions.
     if "--gate" in sys.argv:
@@ -2479,11 +2980,14 @@ def main() -> int:
     ap.add_argument("--reap", action="store_true", help="list reclaimable orphans")
     ap.add_argument("--reap-spares", action="store_true",
                     help="list idle claude prewarm procs older than 4h")
-    ap.add_argument("--apply", action="store_true", help="with --reap, actually kill")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --reap, SIGTERM them (stops at partial; see `memmon reap`)")
     ap.add_argument("--gate", action="store_true",
                     help="PreToolUse hook: gate heavy commands on memory pressure")
     ap.add_argument("--blocked", action="store_true",
                     help="commands the gate refused that nobody has re-run")
+    ap.add_argument("--dismiss-blocked", metavar="ID",
+                    help="stop listing one blocked command (its id from --blocked)")
     ap.add_argument("--off", nargs="?", const="forever", metavar="DURATION",
                     help="pause the gate entirely, e.g. --off 8h (default: until --on)")
     ap.add_argument("--on", action="store_true", help="resume the gate")
@@ -2510,8 +3014,9 @@ def main() -> int:
     if args.gate:
         return gate()
     if args.end_session:
-        print(end_session(args.end_session, args.apply))
-        return 0
+        text, out = end_session_report(args.end_session, args.apply)
+        print(text)
+        return _apply_exit(out, args.apply)
     if args.off is not None:
         until = "forever"
         if args.off != "forever":
@@ -2552,17 +3057,25 @@ def main() -> int:
         save_pending([])
         print("outstanding-blocked list cleared")
         return 0
+    if args.dismiss_blocked:
+        if dismiss_pending(args.dismiss_blocked):
+            print("Dismissed.")
+            return 0
+        print("No outstanding blocked command has that id.", file=sys.stderr)
+        return 1
     if args.blocked:
         pend = load_pending()
         if not pend:
-            print("Nothing outstanding — no command has been blocked.")
+            print("Nothing outstanding in the last "
+                  f"{PENDING_TTL_S // 3600} hours — no command is waiting to be re-run.")
             return 0
         lvl = pressure(read_vm(fast=True))["level"]
         print(f"{len(pend)} command(s) blocked and not yet re-run:\n")
         for b in pend:
             print(f"  {time.strftime('%H:%M', time.localtime(b['ts']))}  "
-                  f"{b.get('session', '?')}")
+                  f"{b.get('session', '?')}  ·  {short_command(b.get('cmd', ''))}")
             print(f"        {b.get('cmd', '')[:100]}")
+            print(f"        dismiss: memmon --dismiss-blocked {pending_id(b)}")
             if b.get("cwd"):
                 print(f"        in {b['cwd']}")
         print()
@@ -2678,17 +3191,20 @@ def main() -> int:
     snap = collect()
 
     if args.json:
-        print(json.dumps(snap, indent=1))
+        print(json.dumps({**snap, "schema_version": 2}, indent=1))
         return 0
     if args.log:
         log_sample(snap)
+        try:
+            owners_sampler_tick()
+        except Exception as exc:
+            print(f"owners sample failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
         return 0
-    if args.reap:
-        print(reap(snap, args.apply))
-        return 0
-    if args.reap_spares:
-        print(reap_spares(snap, args.apply))
-        return 0
+    if args.reap or args.reap_spares:
+        text, out = (reap_report if args.reap else reap_spares_report)(snap, args.apply)
+        print(text)
+        return _apply_exit(out, args.apply)
     if args.once:
         print(render(snap, color))
         return 0

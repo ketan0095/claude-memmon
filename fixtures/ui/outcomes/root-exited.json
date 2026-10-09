@@ -1,0 +1,34 @@
+{
+ "exit": 3,
+ "stdout": {
+  "result": "partial",
+  "reason": "root_exited",
+  "exited": 0,
+  "remaining": [
+   {
+    "pid": 48303,
+    "start": [
+     1791449101,
+     1
+    ],
+    "forceable": false,
+    "argv0": "tsc"
+   },
+   {
+    "pid": 48311,
+    "start": [
+     1791449101,
+     5
+    ],
+    "forceable": false,
+    "argv0": "node"
+   }
+  ],
+  "kept": [],
+  "used_bytes_before": null,
+  "used_bytes_after": null,
+  "measured_at": 1791450000.0,
+  "forceable": 0,
+  "observed": 2
+ }
+}

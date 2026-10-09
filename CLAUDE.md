@@ -81,8 +81,9 @@ monitor sounds like it should need them.
 
 - No `sudo`, at any point.
 - No Screen Recording, Accessibility, or Full Disk Access. Every reading comes
-  from `top`, `ps`, `sysctl`, `vm_stat` and `lsof`, all of which run unprivileged
-  for the current user's own processes.
+  from libproc (`proc_pidinfo`, footprint, start time), `top`, `ps`, `sysctl`,
+  `vm_stat` and `lsof`, all of which run unprivileged for the current user's own
+  processes.
 - The menu-bar app is compiled locally by `swiftc` and is ad-hoc signed with no
   quarantine attribute, so Gatekeeper does not prompt.
 - **Notifications**: the sampler posts one via `osascript` when pressure clears
@@ -135,7 +136,13 @@ memmon --once          # single snapshot, good for piping
 memmon --gate-log      # what the gate has done, and whether it ever blocked
 memmon --blocked       # commands refused that nobody has re-run
 memmon --report        # per-app / per-worktree averages (needs --sampler)
+memmon owners          # who owns each process; --json carries action tokens
 ```
+
+`memmon act <action> --target <token>` stops one owner's job, server or session,
+identity-checked per PID. `act` is the confirmed step: an agent must show the
+row to a human first and act only on their say-so. Never loop it, and never
+pass a `force` token without that confirmation.
 
 For an always-visible readout, add `memmon --statusline` to a Claude Code
 statusline command or shell prompt. It reads the cached sample and never blocks.

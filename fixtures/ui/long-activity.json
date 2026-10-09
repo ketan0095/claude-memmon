@@ -1,0 +1,138 @@
+{
+ "_base": "overview.json",
+ "owners": [
+  {
+   "owner_id": "claude:fixture-a",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Checkout refactor",
+   "project": "acme-web",
+   "worktree": "checkout",
+   "activity": "Building · typecheck",
+   "confidence": "exact",
+   "footprint_bytes": 9556302233,
+   "cpu_cores": 3.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
+   "member_count": 9,
+   "root": {
+    "pid": 48211,
+    "start": [
+     1791449000,
+     318442
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [
+    {
+     "job_id": "48211.1791449000.318442",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 1288490188,
+     "member_count": 3,
+     "token": null
+    },
+    {
+     "job_id": "48302.1791449100.120044",
+     "kind": "build",
+     "label": "typecheck",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 7301444403,
+     "member_count": 5,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODMwMiwic3RhcnQiOlsxNzkxNDQ5MTAwLDEyMDA0NF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    },
+    {
+     "job_id": "48260.1791449050.500100",
+     "kind": "server",
+     "label": "dev server · port 3000",
+     "action": "stop-server",
+     "managed": false,
+     "footprint_bytes": 966367641,
+     "member_count": 1,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLXNlcnZlciIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODI2MCwic3RhcnQiOlsxNzkxNDQ5MDUwLDUwMDEwMF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "instances": null,
+   "shared_with": null,
+   "category": "claude"
+  },
+  {
+   "owner_id": "claude:fixture-long",
+   "kind": "claude",
+   "agent": "claude",
+   "title": "Long activity",
+   "project": "acme-web",
+   "worktree": "checkout",
+   "activity": "Building · very long label very long label very long label very long label very long label very long label very long label very long label very long label very long label very long label very long label ",
+   "confidence": "exact",
+   "footprint_bytes": 9556302233,
+   "cpu_cores": 3.1,
+   "cpu_coverage": 1.0,
+   "growth_bytes_per_10min": 325058560,
+   "growth_reason": null,
+   "member_count": 9,
+   "root": {
+    "pid": 48211,
+    "start": [
+     1791449000,
+     318442
+    ]
+   },
+   "token": "eyJ2IjoxLCJhY3Rpb24iOiJlbmQtc2Vzc2lvbiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ==",
+   "jobs": [
+    {
+     "job_id": "48211.1791449000.318442",
+     "kind": "conversation",
+     "label": "Conversation",
+     "action": null,
+     "managed": false,
+     "footprint_bytes": 1288490188,
+     "member_count": 3,
+     "token": null
+    },
+    {
+     "job_id": "48302.1791449100.120044",
+     "kind": "build",
+     "label": "typecheck",
+     "action": "stop-job",
+     "managed": false,
+     "footprint_bytes": 7301444403,
+     "member_count": 5,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLWpvYiIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODMwMiwic3RhcnQiOlsxNzkxNDQ5MTAwLDEyMDA0NF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    },
+    {
+     "job_id": "48260.1791449050.500100",
+     "kind": "server",
+     "label": "dev server · port 3000",
+     "action": "stop-server",
+     "managed": false,
+     "footprint_bytes": 966367641,
+     "member_count": 1,
+     "token": "eyJ2IjoxLCJhY3Rpb24iOiJzdG9wLXNlcnZlciIsIm93bmVyX2lkIjoiY2xhdWRlOmZpeHR1cmUtYSIsIm93bmVyX3Jvb3QiOnsicGlkIjo0ODIxMSwic3RhcnQiOlsxNzkxNDQ5MDAwLDMxODQ0Ml19LCJ0YXJnZXQiOnsicGlkIjo0ODI2MCwic3RhcnQiOlsxNzkxNDQ5MDUwLDUwMDEwMF19LCJzbmFwc2hvdF90cyI6MTc5MTQ0OTk5OC4wfQ=="
+    }
+   ],
+   "actions": [
+    "end-session"
+   ],
+   "instances": null,
+   "shared_with": null,
+   "category": "claude"
+  }
+ ],
+ "system": {
+  "ram_bytes": 51539607552,
+  "used_bytes": 42090679500,
+  "pressure_level": "normal",
+  "score_level": "HEALTHY",
+  "ncpu": 18,
+  "cpu_cores": 6.2,
+  "cpu_coverage": 1.0
+ }
+}
