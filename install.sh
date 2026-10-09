@@ -131,8 +131,10 @@ done
 cp "$SRC_DIR/memmon.py" "$DEST_DIR/.memmon.py.$$"
 mv -f "$DEST_DIR/.memmon.py.$$" "$DEST"
 chmod +x "$DEST"
-cp "$SRC_DIR/memmon-gate.sh" "$GATE"
-chmod +x "$GATE"
+# The gate runs before every Bash command, so it is swapped in whole too.
+cp "$SRC_DIR/memmon-gate.sh" "$GATE.$$"
+chmod +x "$GATE.$$"
+mv -f "$GATE.$$" "$GATE"
 # The route launcher is installed but not enabled; `memmon route on` points
 # Claude Code's shell prefix at it.
 cp "$SRC_DIR/memmon_route.sh" "$DEST_DIR/.memmon_route.sh.$$"

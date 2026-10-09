@@ -280,6 +280,10 @@ class ModeTests(unittest.TestCase):
         w = week(peak_frac=0.8, warned=3, owner_days={"VM · colima": 6, "/Users/x": 7},
                  rules={"tsc": 3, "pnpm … test": 1})
         s = ex.build_patterns_summary(p, w)
+        # The browser owner's title carries "(pid 999)"; its name is sent, its PID never.
+        full = ex.build_patterns_summary(payload(), w)
+        self.assertIn('"Browser', full)
+        self.assertNotIn("999", full)
         for want in ("peak 38.4 GB (measured)", "top Claude sessions", "warned 3, stopped 0",
                      "most-warned rule tsc (3)", '"VM · colima" 6 of 7 days',
                      "Idle now and heavy most days", "Triggered by:"):
@@ -327,6 +331,20 @@ class ReplyTests(StubBase):
                  "- `kill 4300` to stop vitest")
         _, out = self.run_cli(payload(), None, reply)
         self.assertEqual(out["text"], "Stop vitest in Checkout refactor; frees about 8.8 GB.")
+
+    def test_headings_quotes_and_single_emphasis_are_stripped(self):
+        reply = ("## Stop *vitest* in _Checkout refactor_; frees about 8.8 GB.|"
+                 "> Leave acme_web_dev running.")
+        labels = ["vitest", "acme_web_dev"]
+        self.assertEqual(ex.filter_reply(reply.replace("|", "\n"), labels),
+                         ["Stop vitest in Checkout refactor; frees about 8.8 GB.",
+                          "Leave acme_web_dev running."])
+
+    def test_the_call_is_bounded_to_sixty_seconds_by_default(self):
+        import inspect
+        self.assertEqual(ex.TIMEOUT_S, 60)
+        for fn in (ex.run_claude, ex.cli):
+            self.assertEqual(inspect.signature(fn).parameters["timeout"].default, 60)
 
     def test_unknown_with_normal_kernel_asks_nothing(self):
         p = quiet_payload()

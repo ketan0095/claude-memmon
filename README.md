@@ -30,8 +30,8 @@ from a real machine.
 | **Command protection**: blocked commands waiting to retry, the policy, and recent events in plain words. | **Managed jobs** started with `memmon run`: running, and waiting with the reason. |
 | <img src="docs/screenshots/usage-memory-dark.png" width="300" alt="Last 7 days, memory"> | <img src="docs/screenshots/usage-protection-light.png" width="300" alt="Last 7 days, protection"> |
 | **Last 7 days**: daily peak and average memory. | The same card's **Protection** view: warnings and stops per day. |
-| <img src="docs/screenshots/explain-busy-dark.png" width="300" alt="Asking Claude"> | <img src="docs/screenshots/explain-reply-light.png" width="300" alt="Claude's suggestions"> |
-| **Ask Claude what to do** asks once, on a click, with Cancel and a 60 s limit. | **The reply is shown as text.** memmon never acts on it. |
+| <img src="docs/screenshots/explain-busy-dark.png" width="300" alt="Asking Claude"> | <img src="docs/screenshots/explain-patterns-light.png" width="300" alt="Patterns this week"> |
+| **Ask Claude what to do** asks once, on a click, with Cancel and a 60 s limit. | **The answer fits the moment**: what to stop now, patterns this week, or nothing to do. memmon never acts on it. |
 | <img src="docs/screenshots/settings-panel-dark.png" width="300" alt="Settings panel"> | |
 | **Settings**: gate mode, pause, runner mode, auto-cancel, suggestions, notifications and theme. | |
 

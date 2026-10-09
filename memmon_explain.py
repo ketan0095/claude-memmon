@@ -335,8 +335,12 @@ def filter_reply(text: str, labels: list) -> list:
     anything that looks like a command."""
     keep = []
     for line in (text or "").splitlines():
-        # The menu bar shows this verbatim: no Markdown emphasis or list markers.
+        # The menu bar shows this verbatim: no Markdown headings, quotes,
+        # emphasis or list markers. Word-bounded single * or _ only, so a
+        # snake_case owner name keeps its underscores.
         line = re.sub(r"\*\*|__|`", "", line)
+        line = re.sub(r"(?<![\w*])[*_]([^*_\n]+?)[*_](?![\w*])", r"\1", line)
+        line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*)+", "", line)
         line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
         if not line or line.startswith(("$", "sudo ", "kill ")):
             continue
