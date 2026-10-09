@@ -24,7 +24,8 @@ def at(day_offset, hour=12):
 
 
 def full_row(ts, ram=30 * GB, **kw):
-    row = {"ts": int(ts), "ram_used": ram, "swap_used": GB, "pressure": "HEALTHY",
+    row = {"ts": int(ts), "used_bytes": ram, "ram_used": 47 * GB, "swap_used": GB,
+           "pressure": "HEALTHY",
            "sessions": {"Checkout refactor": 1 * GB}, "overhead": GB // 2,
            "apps": {"Brave": 2 * GB, "Docker VM": 3 * GB, "Slack": GB,
                     "WindowServer": GB // 4, "SomeNewApp": GB // 4},
@@ -70,7 +71,7 @@ class UsageTests(unittest.TestCase):
             self.assertIsNone(e["mem_avg_bytes"])
             self.assertIsNone(e["by_section"])
         self.assertEqual(set(first), {"date", "samples", "mem_peak_bytes", "mem_avg_bytes",
-                                      "by_section", "gate", "runner"})
+                                      "mem_basis", "by_section", "gate", "runner"})
         cov = out["coverage"]
         self.assertEqual((cov["from_ts"], cov["to_ts"]), (int(at(-6)), int(at(0))))
         self.assertFalse(cov["complete"])
@@ -139,9 +140,33 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(day["mem_avg_bytes"], 30 * GB)
         self.assertEqual(day["by_section"]["browser"], 2 * GB)
 
-    def test_strict_used_bytes_preferred(self):
+    def test_strict_used_bytes_is_measured(self):
         self.write(memmon.HISTORY, [full_row(at(0), used_bytes=20 * GB)])
-        self.assertEqual(memmon.usage(7, now=NOW)["series"][-1]["mem_peak_bytes"], 20 * GB)
+        day = memmon.usage(7, now=NOW)["series"][-1]
+        self.assertEqual((day["mem_peak_bytes"], day["mem_basis"]), (20 * GB, "measured"))
+
+    def test_legacy_rows_estimate_from_free_pct_never_ram_used(self):
+        # A v1 sampler row: top's ram_used sits near RAM; the kernel's free %
+        # is the honest basis.
+        ram = 48 * GB
+        legacy = {"ts": int(at(0)), "ram_used": int(47.9 * GB), "free_pct": 40,
+                  "sessions": {}, "apps": {}, "worktrees": {}}
+        self.write(memmon.HISTORY, [legacy, full_row(at(0, 13), used_bytes=20 * GB)])
+        with mock.patch.object(memmon.os, "sysconf",
+                               lambda name: {"SC_PHYS_PAGES": ram // 16384,
+                                             "SC_PAGE_SIZE": 16384}[name]):
+            day = memmon.usage(7, now=NOW)["series"][-1]
+        self.assertEqual(day["mem_peak_bytes"], int(ram * 0.6))      # 28.8 GB
+        self.assertEqual(day["mem_basis"], "estimated")
+        self.assertEqual(day["mem_avg_bytes"], (int(ram * 0.6) + 20 * GB) // 2)
+
+    def test_no_memory_figure_is_null_not_zero(self):
+        self.write(memmon.HISTORY, [{"ts": int(at(0)), "ram_used": 47 * GB,
+                                     "sessions": {}, "apps": {}, "worktrees": {}}])
+        day = memmon.usage(7, now=NOW)["series"][-1]
+        self.assertEqual(day["samples"], 1)
+        self.assertEqual((day["mem_peak_bytes"], day["mem_avg_bytes"], day["mem_basis"]),
+                         (None, None, None))
 
     def test_gate_counts_per_day(self):
         self.write(memmon.HISTORY, [full_row(at(0))])

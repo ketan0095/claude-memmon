@@ -3615,14 +3615,16 @@ def usage(days: int = 7, now: float | None = None) -> dict:
         time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1) + i,
                      12, 0, 0, 0, 0, -1)))) for i in range(days)]
     # v changes whenever the mapping does, so an old cache is never served.
-    key = {"v": 2, "days": days, "dates": dates, "inputs": _usage_inputs()}
+    key = {"v": 3, "days": days, "dates": dates, "inputs": _usage_inputs()}
+    ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     cached = _read_row(USAGE_CACHE)
     if cached and cached.get("key") == key:
         return cached["value"]
 
     def day_of(ts):
         return time.strftime("%Y-%m-%d", time.localtime(ts))
-    acc = {d: {"samples": 0, "mem_n": 0, "mem_sum": 0, "mem_peak": None, "sec_n": 0,
+    acc = {d: {"samples": 0, "mem_n": 0, "mem_sum": 0, "mem_peak": None,
+               "mem_estimated": False, "sec_n": 0,
                "sec": dict.fromkeys(USAGE_SECTIONS, 0), "warned": 0, "stopped": 0,
                "held": set()} for d in dates}
     first = last = None
@@ -3638,9 +3640,16 @@ def usage(days: int = 7, now: float | None = None) -> dict:
         first = ts if first is None else min(first, ts)
         last = ts if last is None else max(last, ts)
         a["samples"] += 1
-        # The strict "used" where the sampler recorded it (S2 rows); v1 rows
-        # only have top's figure, which counts cache and sits near RAM.
-        mem = row.get("used_bytes", row.get("ram_used"))
+        # The strict "used" where the sampler recorded it (S2 rows). A v1 row
+        # has only top's ram_used, which counts file cache and sits near RAM,
+        # so it is never used: its kernel free_pct gives an estimate instead.
+        mem = row.get("used_bytes")
+        if not (isinstance(mem, (int, float)) and mem > 0):
+            free = row.get("free_pct")
+            mem = (int(ram * (1 - free / 100.0))
+                   if isinstance(free, (int, float)) and 0 <= free <= 100 else None)
+            if mem is not None:
+                a["mem_estimated"] = True
         if isinstance(mem, (int, float)) and mem > 0:
             a["mem_n"] += 1
             a["mem_sum"] += mem
@@ -3680,13 +3689,15 @@ def usage(days: int = 7, now: float | None = None) -> dict:
             "date": d, "samples": a["samples"],
             "mem_peak_bytes": a["mem_peak"],
             "mem_avg_bytes": a["mem_sum"] // a["mem_n"] if a["mem_n"] else None,
+            "mem_basis": (None if not a["mem_n"] else
+                          "estimated" if a["mem_estimated"] else "measured"),
             "by_section": ({k: (None if k == "codex" else v // a["sec_n"])
                             for k, v in a["sec"].items()} if a["sec_n"] else None),
             "gate": {"warned": a["warned"], "stopped": a["stopped"]},
             "runner": {"held": len(a["held"]) if log_from is not None and d >= log_from
                        else None, "cancelled": None}})
     value = {"schema_version": 1, "days": days,
-             "ram_bytes": os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+             "ram_bytes": ram,
              "series": series,
              "coverage": {"from_ts": first, "to_ts": last,
                           "complete": first is not None and first < start_day + 3600
