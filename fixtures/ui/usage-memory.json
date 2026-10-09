@@ -25,7 +25,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "estimated"
    },
    {
     "date": "2026-10-03",
@@ -47,7 +48,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "estimated"
    },
    {
     "date": "2026-10-04",
@@ -69,7 +71,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "estimated"
    },
    {
     "date": "2026-10-05",
@@ -91,7 +94,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "measured"
    },
    {
     "date": "2026-10-06",
@@ -113,7 +117,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "measured"
    },
    {
     "date": "2026-10-07",
@@ -135,7 +140,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "measured"
    },
    {
     "date": "2026-10-08",
@@ -157,7 +163,8 @@
     "runner": {
      "held": null,
      "cancelled": null
-    }
+    },
+    "mem_basis": "measured"
    }
   ],
   "coverage": {

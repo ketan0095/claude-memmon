@@ -1568,6 +1568,9 @@ struct UsageDay: Identifiable {
     var bySection: [String: Double] = [:]
     var warned: Int?, stopped: Int?
     var held: Int?, cancelled: Int?
+    /// "estimated" (from free memory, older history rows) or "measured".
+    var basis: String?
+    var estimated: Bool { basis == "estimated" }
     var id: String { date }
     var empty: Bool { samples == 0 }
 
@@ -1612,7 +1615,7 @@ struct UsageData {
         let days = rows.compactMap { d -> UsageDay? in
             guard let date = str(d["date"]) else { return nil }
             var u = UsageDay(date: date, samples: int(d["samples"]) ?? 0)
-            u.peak = num(d["mem_peak_bytes"]); u.avg = num(d["mem_avg_bytes"])
+            u.peak = num(d["mem_peak_bytes"]); u.avg = num(d["mem_avg_bytes"]); u.basis = str(d["mem_basis"])
             for (k, v) in d["by_section"] as? [String: Any] ?? [:] { if let b = num(v) { u.bySection[k] = b } }
             if let g = d["gate"] as? [String: Any] { u.warned = int(g["warned"]); u.stopped = int(g["stopped"]) }
             if let r = d["runner"] as? [String: Any] { u.held = int(r["held"]); u.cancelled = int(r["cancelled"]) }
@@ -1656,6 +1659,59 @@ enum UsageView: String, CaseIterable {
 }
 
 /// One bar as the chart draws and speaks it.
+/// The card's headline: a bold value with a small caption under it. The
+/// sentence `usageBars` builds stays as the spoken summary.
+struct UsageHeadline: Equatable {
+    var value: String
+    var caption: String
+}
+
+/// "≈ 28.8 GB" for a value memory estimated from free memory.
+func usageGB(_ b: Double, estimated: Bool) -> String { (estimated ? "≈ " : "") + gb(b) }
+
+func usageHeadline(_ u: UsageData, _ view: UsageView) -> UsageHeadline {
+    switch view {
+    case .memory:
+        let high = u.days.filter { $0.peak != nil }.max { ($0.peak ?? 0) < ($1.peak ?? 0) }
+        let week = high.map { " · week high " + usageGB($0.peak!, estimated: $0.estimated) } ?? ""
+        guard let t = u.today, let p = t.peak else {
+            return UsageHeadline(value: "—", caption: "no samples today" + week)
+        }
+        return UsageHeadline(value: usageGB(p, estimated: t.estimated), caption: "today’s peak" + week)
+    case .consumers:
+        guard let t = u.today, let top = UsageData.sections
+            .compactMap({ s in t.bySection[s.key].map { (s.name, $0) } }).max(by: { $0.1 < $1.1 }), top.1 > 0 else {
+            return UsageHeadline(value: "—", caption: "no samples today")
+        }
+        return UsageHeadline(value: gb(top.1), caption: "today’s top · \(top.0)")
+    case .protection:
+        let w = u.days.reduce(0) { $0 + ($1.warned ?? 0) }, st = u.days.reduce(0) { $0 + ($1.stopped ?? 0) }
+        return UsageHeadline(value: "\(st + w)", caption: "\(st) stopped · \(w) warned this week")
+    }
+}
+
+/// The y-axis top: GB rounded up to a multiple of 4 (2 below 8 GB), so the
+/// half line is a whole number too; counts rounded up to an even number.
+func usageAxisTop(_ u: UsageData, _ view: UsageView) -> Double {
+    func niceGB(_ b: Double) -> Double {
+        let g = max(b / GB, 1)
+        let step = g > 8 ? 4.0 : 2.0
+        return (g / step).rounded(.up) * step * GB
+    }
+    switch view {
+    case .memory: return niceGB(max(u.days.compactMap { $0.peak }.max() ?? 0, u.ram ?? 0))
+    case .consumers: return niceGB(u.days.map { $0.bySection.values.reduce(0, +) }.max() ?? 0)
+    case .protection:
+        let m = u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0
+        return Double(max(2, m + m % 2))
+    }
+}
+
+func usageAxisLabel(_ v: Double, _ view: UsageView) -> String {
+    if v == 0 { return "0" }
+    return view == .protection ? String(Int(v)) : String(format: "%.0f GB", v / GB)
+}
+
 struct UsageBar {
     var day: UsageDay
     var label: String
@@ -1670,7 +1726,8 @@ func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary:
         let top = max(u.ram ?? 0, u.days.compactMap { $0.peak }.max() ?? 0, 1)
         let bars = u.days.map { d -> UsageBar in
             guard !d.empty, let p = d.peak else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
-            var s = "\(d.weekday), peak \(gb(p))" + (d.avg.map { ", average \(gb($0))" } ?? "")
+            var s = "\(d.weekday), peak \(d.estimated ? "about " : "")\(gb(p))" + (d.avg.map { ", average \(gb($0))" } ?? "")
+            if d.estimated { s += ", estimated" }
             if d.few { s += ", only \(plural(d.samples, "sample"))" }
             return UsageBar(day: d, label: d.weekday, fraction: p / top, spoken: s)
         }
@@ -4557,19 +4614,32 @@ struct UsageCard: View {
     }
 
     private var expanded: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Button { withAnimation(motion) { model.toggleUsage() } } label: {
-                HStack(spacing: 8) {
-                    Chevron(open: true)
-                    Text("Last 7 days").font(ft(13, .medium)).foregroundColor(P.text)
-                    Spacer()
-                    if model.usageLoading { ProgressView().controlSize(.small) }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Button { withAnimation(motion) { model.toggleUsage() } } label: {
+                    HStack(spacing: 8) {
+                        Chevron(open: true)
+                        Text("Last 7 days").font(ft(13, .medium)).foregroundColor(P.text)
+                        if model.usageLoading { ProgressView().controlSize(.small) }
+                    }
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityLabel("Last 7 days")
+                .accessibilityValue("expanded")
+                Spacer(minLength: 8)
+                if let u = model.usage {
+                    let h = usageHeadline(u, model.usageView)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(h.value).font(.system(size: 22, weight: .bold)).foregroundColor(P.text)
+                            .monospacedDigit().lineLimit(1)
+                        Text(h.caption).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(usageBars(u, model.usageView).summary)
+                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Last 7 days")
-            .accessibilityValue("expanded")
             ChoiceSegmented(choices: UsageView.allCases.map { ($0.rawValue, $0.label, $0.label, $0.label) },
                             selected: model.usageView.rawValue, enabled: true) { v in
                 withAnimation(motion) { model.usageView = UsageView(rawValue: v) ?? .memory }
@@ -4598,81 +4668,126 @@ struct UsageCard: View {
         .accessibilityLabel("Last 7 days")
     }
 
+    /// The right-hand axis gutter.
+    static let gutter: CGFloat = 38
+
     @ViewBuilder private func chart(_ u: UsageData) -> some View {
         let view = model.usageView
-        let (bars, summary) = usageBars(u, view)
-        Text(summary).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
-            .accessibilityLabel(summary)
+        let bars = usageBars(u, view).bars
+        let top = usageAxisTop(u, view)
+        let today = u.today?.date
+        let h = UsageCard.chartHeight
         ZStack(alignment: .bottomLeading) {
-            HStack(alignment: .bottom, spacing: 10) {
+            // Faint gridlines at 0, half and full, labelled on the right.
+            ForEach([0.0, 0.5, 1.0], id: \.self) { f in
+                HStack(spacing: 6) {
+                    Rectangle().fill(P.border.opacity(f == 0 ? 1 : 0.7)).frame(height: 1)
+                    Text(usageAxisLabel(top * f, view)).font(ft(9)).foregroundColor(P.muted)
+                        .monospacedDigit().frame(width: UsageCard.gutter - 6, alignment: .trailing)
+                }
+                .offset(y: -h * CGFloat(f) + 0.5)
+            }
+            if view == .memory, let ram = u.ram, abs(ram - top) > GB / 2 {
+                HStack(spacing: 6) {
+                    Rectangle().stroke(P.muted.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [3, 3])).frame(height: 1)
+                    Text("RAM").font(ft(9)).foregroundColor(P.muted).frame(width: UsageCard.gutter - 6, alignment: .trailing)
+                }
+                .offset(y: -h * CGFloat(ram / top) + 0.5)
+            }
+            HStack(alignment: .bottom, spacing: 0) {
                 ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
-                    column(bar, u, view)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                        .help(bar.spoken)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(bar.spoken)
+                    GeometryReader { g in
+                        let w = g.size.width * 0.55
+                        column(bar, u, view, top: top, width: w, isToday: bar.day.date == today)
+                            .frame(width: g.size.width, height: h, alignment: .bottom)
+                    }
+                    .frame(height: h)
+                    .help(bar.spoken)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(bar.spoken)
                 }
             }
-            if view == .memory, let ram = u.ram {
-                let top = max(ram, u.days.compactMap { $0.peak }.max() ?? 0, 1)
-                Rectangle().stroke(P.muted.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                    .frame(height: 1)
-                    .offset(y: -UsageCard.chartHeight * CGFloat(ram / top))
-                    .accessibilityHidden(true)
-            }
+            .padding(.trailing, UsageCard.gutter)
         }
-        .frame(height: UsageCard.chartHeight)
+        .frame(height: h)
+        .padding(.top, 6)
         .animation(reduceMotion || !animate ? nil : .easeOut(duration: 0.3), value: view)
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 0) {
             ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
-                Text(bar.label).font(ft(10)).foregroundColor(bar.day.empty ? P.muted.opacity(0.6) : P.muted)
-                    .frame(maxWidth: .infinity)
+                VStack(spacing: 0) {
+                    Text(bar.label).font(ft(10, bar.day.date == today ? .semibold : .regular))
+                        .foregroundColor(bar.day.date == today ? P.text : P.muted)
+                    if bar.day.empty && view != .protection {
+                        Text("—").font(ft(10)).foregroundColor(P.muted)
+                    }
+                }
+                .frame(maxWidth: .infinity)
             }
         }
+        .padding(.trailing, UsageCard.gutter)
         .accessibilityHidden(true)
         legend(u, view)
         notes(u)
     }
 
-    @ViewBuilder private func column(_ bar: UsageBar, _ u: UsageData, _ view: UsageView) -> some View {
+    /// A bar's opacity: today in full, other days at 70 %, days with few
+    /// samples at 40 % so they read as uncertain.
+    private func emphasis(_ d: UsageDay, isToday: Bool) -> Double {
+        d.few ? 0.4 : isToday ? 1 : 0.7
+    }
+
+    private func soft(_ c: Color) -> LinearGradient {
+        LinearGradient(colors: [c, c.opacity(0.8)], startPoint: .top, endPoint: .bottom)
+    }
+
+    @ViewBuilder private func column(_ bar: UsageBar, _ u: UsageData, _ view: UsageView,
+                                     top: Double, width: CGFloat, isToday: Bool) -> some View {
         let h = UsageCard.chartHeight
         if bar.day.empty && view != .protection {
-            // No samples: a faint stub, never a guessed value.
-            RoundedRectangle(cornerRadius: 1.5).fill(P.border).frame(width: 14, height: 3)
+            // No samples: an outline stub, never a guessed value.
+            RoundedRectangle(cornerRadius: 2)
+                .stroke(P.muted.opacity(0.55), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                .frame(width: width, height: 6)
         } else {
+            let op = emphasis(bar.day, isToday: isToday)
             switch view {
             case .memory:
-                let top = max(u.ram ?? 0, u.days.compactMap { $0.peak }.max() ?? 0, 1)
+                let height = max(2, h * CGFloat((bar.day.peak ?? 0) / top) * growth)
                 ZStack(alignment: .bottom) {
-                    RoundedRectangle(cornerRadius: 3).fill(P.accent.opacity(bar.day.few ? 0.45 : 0.85))
-                        .frame(width: 14, height: max(2, h * CGFloat(bar.fraction ?? 0) * growth))
+                    TopRounded(radius: 4).fill(soft(P.sectionClaude)).frame(width: width, height: height)
                     if let avg = bar.day.avg {
-                        Circle().fill(P.text).frame(width: 5, height: 5)
-                            .offset(y: -h * CGFloat(avg / top) * growth + 2.5)
+                        // The day's average: a thin tick across the bar.
+                        Rectangle().fill(P.text.opacity(0.7)).frame(width: width + 4, height: 2)
+                            .offset(y: -h * CGFloat(avg / top) * growth + 1)
                     }
                 }
+                .opacity(op)
             case .consumers:
-                let total = bar.day.bySection.values.reduce(0, +)
-                let k = total > 0 ? CGFloat(bar.fraction ?? 0) / CGFloat(total) : 0
+                let k = h / CGFloat(top) * growth
                 VStack(spacing: 1) {
                     ForEach(UsageData.sections.reversed(), id: \.key) { s in
                         if let v = bar.day.bySection[s.key], v > 0 {
-                            Rectangle().fill(UsageData.color(s.key)).frame(height: max(1, h * k * CGFloat(v) * growth))
+                            Rectangle().fill(soft(UsageData.color(s.key))).frame(height: max(1, k * CGFloat(v)))
                         }
                     }
                 }
-                .frame(width: 14)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-                .opacity(bar.day.few ? 0.55 : 1)
+                .frame(width: width)
+                .clipShape(TopRounded(radius: 4))
+                .opacity(op)
             case .protection:
-                let top = CGFloat(max(u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0, 1))
-                HStack(alignment: .bottom, spacing: 2) {
-                    RoundedRectangle(cornerRadius: 2).fill(P.amber)
-                        .frame(width: 6, height: max(2, h * CGFloat(bar.day.warned ?? 0) / top * growth))
-                    RoundedRectangle(cornerRadius: 2).fill(P.red)
-                        .frame(width: 6, height: max(2, h * CGFloat(bar.day.stopped ?? 0) / top * growth))
+                let w = bar.day.warned ?? 0, st = bar.day.stopped ?? 0
+                let k = h / CGFloat(top) * growth
+                if w + st == 0 {
+                    Rectangle().fill(P.border).frame(width: width, height: 1)
+                } else {
+                    VStack(spacing: 1) {
+                        if w > 0 { Rectangle().fill(soft(P.sectionService)).frame(height: k * CGFloat(w)) }
+                        if st > 0 { Rectangle().fill(soft(P.red)).frame(height: k * CGFloat(st)) }
+                    }
+                    .frame(width: width)
+                    .clipShape(TopRounded(radius: 4))
+                    .opacity(op)
                 }
-                .opacity((bar.day.warned ?? 0) + (bar.day.stopped ?? 0) == 0 ? 0.35 : 1)
             }
         }
     }
@@ -4681,9 +4796,9 @@ struct UsageCard: View {
         HStack(spacing: 12) {
             switch view {
             case .memory:
-                legendItem(P.accent.opacity(0.85), "Daily peak")
-                legendItem(P.text, "Average", dot: true)
-                if u.ram != nil { legendItem(P.muted, "RAM", dashed: true) }
+                legendItem(P.sectionClaude, "Daily peak")
+                legendItem(P.text.opacity(0.7), "Average", tick: true)
+                if let ram = u.ram, abs(ram - usageAxisTop(u, view)) > GB / 2 { legendItem(P.muted, "RAM", dashed: true) }
             case .consumers:
                 ForEach(u.topSections, id: \.key) { s in
                     // Three to a line: the legend uses the short name; the
@@ -4691,7 +4806,7 @@ struct UsageCard: View {
                     legendItem(UsageData.color(s.key), s.key == "dev" ? "Terminals" : s.name)
                 }
             case .protection:
-                legendItem(P.amber, "Warned")
+                legendItem(P.sectionService, "Warned")
                 legendItem(P.red, "Stopped")
             }
             Spacer(minLength: 0)
@@ -4705,32 +4820,52 @@ struct UsageCard: View {
         }
     }
 
-    private func legendItem(_ c: Color, _ name: String, dot: Bool = false, dashed: Bool = false) -> some View {
+    private func legendItem(_ c: Color, _ name: String, tick: Bool = false, dashed: Bool = false) -> some View {
         HStack(spacing: 5) {
             if dashed {
                 Rectangle().stroke(c, style: StrokeStyle(lineWidth: 1, dash: [3, 2])).frame(width: 12, height: 1)
-            } else if dot {
-                Circle().fill(c).frame(width: 5, height: 5)
+            } else if tick {
+                Rectangle().fill(c).frame(width: 10, height: 2)
             } else {
-                RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 8, height: 8)
+                TopRounded(radius: 2).fill(c).frame(width: 8, height: 9)
             }
             Text(name).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
         }
     }
 
-    /// Days with no samples, or too few to stand for the day, are named.
+    /// Days with no samples, or too few to stand for the day, are named, and
+    /// so is memory estimated from free memory on older history rows.
     @ViewBuilder private func notes(_ u: UsageData) -> some View {
         let empty = u.days.filter { $0.empty }.map { $0.weekday }
         let few = u.days.filter { $0.few }.map { "\($0.weekday) (\($0.samples))" }
-        if !empty.isEmpty || !few.isEmpty || u.complete == false {
+        let estimated = model.usageView == .memory && u.days.contains { $0.estimated && $0.peak != nil }
+        if !empty.isEmpty || !few.isEmpty || u.complete == false || estimated {
             VStack(alignment: .leading, spacing: 2) {
                 if !empty.isEmpty { Text("No samples: " + empty.joined(separator: ", ")) }
                 if !few.isEmpty { Text("Few samples: " + few.joined(separator: ", ")) }
+                if estimated { Text("≈ estimated from free memory on older days") }
                 if u.complete == false { Text("History before \(u.days.first?.weekday ?? "this week") is incomplete.") }
             }
             .font(ft(11)).foregroundColor(P.muted)
             .accessibilityElement(children: .combine)
         }
+    }
+}
+
+/// A bar with rounded top corners and a square base.
+struct TopRounded: Shape {
+    var radius: CGFloat
+    func path(in r: CGRect) -> Path {
+        let c = min(radius, r.width / 2, r.height)
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.minX, y: r.minY + c))
+        p.addQuadCurve(to: CGPoint(x: r.minX + c, y: r.minY), control: CGPoint(x: r.minX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX - c, y: r.minY))
+        p.addQuadCurve(to: CGPoint(x: r.maxX, y: r.minY + c), control: CGPoint(x: r.maxX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+        p.closeSubpath()
+        return p
     }
 }
 
@@ -7241,7 +7376,9 @@ if ARGS.contains("--sections-probe") {
         var views: [String: Any] = [:]
         for v in UsageView.allCases {
             let (bars, summary) = usageBars(u, v)
-            views[v.rawValue] = ["summary": summary,
+            let hl = usageHeadline(u, v)
+            views[v.rawValue] = ["summary": summary, "value": hl.value, "caption": hl.caption,
+                                 "axis": [0.0, 0.5, 1.0].map { usageAxisLabel(usageAxisTop(u, v) * $0, v) },
                                  "bars": bars.map { ["label": $0.label, "fraction": $0.fraction.map { $0 as Any } ?? NSNull(),
                                                      "spoken": $0.spoken, "empty": $0.day.empty, "few": $0.day.few] }]
         }

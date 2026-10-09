@@ -2222,6 +2222,37 @@ class UsageCardTests(StubCase):
         self.assertIn("Terminals & editors 15.9 GB", u["views"]["consumers"]["bars"][6]["spoken"])
         self.assertIn("Terminals & editors", " ".join(said("usage-consumers-dev.json")))
 
+    def test_headline_value_and_caption_per_view(self):
+        u = self.probe("usage-protection.json")["views"]
+        self.assertEqual((u["memory"]["value"], u["memory"]["caption"]), ("41.2 GB", "today’s peak · week high 44.1 GB"))
+        self.assertEqual((u["consumers"]["value"], u["consumers"]["caption"]), ("11.6 GB", "today’s top · Claude sessions"))
+        self.assertEqual((u["protection"]["value"], u["protection"]["caption"]), ("23", "7 stopped · 16 warned this week"))
+        self.assertEqual(u["memory"]["axis"], ["0", "24 GB", "48 GB"])
+        self.assertEqual(u["consumers"]["axis"], ["0", "18 GB", "36 GB"])
+        self.assertEqual(u["protection"]["axis"], ["0", "4", "8"])
+        dev = self.probe("usage-consumers-dev.json")["views"]["consumers"]
+        self.assertEqual((dev["value"], dev["caption"]), ("15.9 GB", "today’s top · Terminals & editors"))
+        # The sentence stays as the spoken summary of the headline.
+        self.assertIn(u["protection"]["summary"], said("usage-protection.json"))
+
+    def test_estimated_memory_is_marked(self):
+        p = payload("usage-memory.json")
+        u = self.probe("usage-memory.json")["views"]["memory"]
+        self.assertEqual(u["value"], "41.2 GB")                      # today is measured
+        self.assertTrue(u["bars"][0]["spoken"].endswith(", estimated"))
+        self.assertIn("≈ estimated from free memory on older days", " ".join(said("usage-memory.json")))
+        for d in p["_usage"]["series"]:
+            d["mem_basis"] = "estimated"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            est = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]["views"]["memory"]
+        self.assertEqual((est["value"], est["caption"]), ("≈ 41.2 GB", "today’s peak · week high ≈ 44.1 GB"))
+        # Without the field nothing is marked.
+        plain = self.probe("usage-protection.json")["views"]["memory"]
+        self.assertFalse(any("estimated" in b["spoken"] for b in plain["bars"]))
+        self.assertNotIn("≈", plain["value"] + plain["caption"])
+
     def test_today_is_found_by_date_not_position(self):
         # The fixtures' _now is 09:00 UTC on their last date, the same local
         # date from UTC-9 to UTC+14.
@@ -2297,5 +2328,5 @@ class UsageCardTests(StubCase):
         self.assertIn("Last 7 days, Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", cached)
         expanded = said("usage-memory.json")
         self.assertIn("Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", expanded)
-        self.assertIn("Fri, peak 34.2 GB, average 26.1 GB", expanded)
+        self.assertIn("Fri, peak about 34.2 GB, average 26.1 GB, estimated", expanded)
         self.assertIn("Choose Top consumers", expanded)
