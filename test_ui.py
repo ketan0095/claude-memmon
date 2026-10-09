@@ -2205,11 +2205,21 @@ class UsageCardTests(StubCase):
             self.assertEqual(sun["fraction"], None, view)
         tue = u["memory"]["bars"][4]
         self.assertTrue(tue["few"])
-        self.assertTrue(tue["spoken"].endswith("only 42 samples"))
+        self.assertTrue(tue["spoken"].endswith(", few samples (42), may be low"))
+        # History starts mid-week: the first measured bar says so.
+        self.assertTrue(u["memory"]["bars"][0]["spoken"].endswith(", earlier history incomplete"))
+        self.assertTrue(u["consumers"]["bars"][4]["spoken"].endswith(", few samples (42), may be low"))
         found = said("usage-empty-days.json")
         self.assertIn("Sat, no samples", found)
-        self.assertTrue(any("No samples: Sat, Sun" in l for l in found), found)
-        self.assertTrue(any("Few samples: Tue (42)" in l for l in found), found)
+        self.assertTrue(any(l.startswith("Tue, peak") and l.endswith("few samples (42), may be low") for l in found))
+
+    def test_the_chart_has_no_footnotes(self):
+        for f in ("usage-empty-days.json", "usage-memory.json", "usage-protection.json"):
+            joined = " ".join(said(f))
+            for gone in ("No samples:", "Few samples:", "≈ estimated from free memory on older days", "is incomplete."):
+                self.assertNotIn(gone, joined, (f, gone))
+            if f != "usage-protection.json":
+                self.assertIn("Daily peak", joined)          # the legend row stays
 
     def test_dev_and_missing_sections_decode_as_optional(self):
         p = payload("usage-consumers.json")
@@ -2251,8 +2261,7 @@ class UsageCardTests(StubCase):
         p = payload("usage-memory.json")
         u = self.probe("usage-memory.json")["views"]["memory"]
         self.assertEqual(u["value"], "41.2 GB")                      # today is measured
-        self.assertTrue(u["bars"][0]["spoken"].endswith(", estimated"))
-        self.assertIn("≈ estimated from free memory on older days", " ".join(said("usage-memory.json")))
+        self.assertTrue(u["bars"][0]["spoken"].endswith(", estimated from free memory"))
         for d in p["_usage"]["series"]:
             d["mem_basis"] = "estimated"
         with tempfile.TemporaryDirectory() as tmp:
@@ -2340,7 +2349,7 @@ class UsageCardTests(StubCase):
         self.assertIn("Last 7 days, Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", cached)
         expanded = said("usage-memory.json")
         self.assertIn("Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", expanded)
-        self.assertIn("Fri, peak about 34.2 GB, average 26.1 GB, estimated", expanded)
+        self.assertIn("Fri, peak about 34.2 GB, average 26.1 GB, estimated from free memory", expanded)
         self.assertIn("Choose Top consumers", expanded)
 
 

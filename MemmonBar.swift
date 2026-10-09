@@ -1771,6 +1771,19 @@ struct UsageBar {
     var spoken: String
 }
 
+/// What a bar's shape already shows, said in words for its tooltip and
+/// label: few samples (a faded bar), an estimate (≈), and history that
+/// starts mid-week (the first measured bar when coverage is incomplete).
+func usageDayNotes(_ d: UsageDay, _ u: UsageData, memory: Bool) -> [String] {
+    var out: [String] = []
+    if d.few { out.append("few samples (\(d.samples)), may be low") }
+    if memory && d.estimated { out.append("estimated from free memory") }
+    if u.complete == false, d.date == u.days.first(where: { !$0.empty })?.date {
+        out.append("earlier history incomplete")
+    }
+    return out
+}
+
 /// The bars and the summary sentence for one view. Empty days stay empty.
 func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary: String) {
     switch view {
@@ -1779,8 +1792,7 @@ func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary:
         let bars = u.days.map { d -> UsageBar in
             guard !d.empty, let p = d.peak else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
             var s = "\(d.weekday), peak \(d.estimated ? "about " : "")\(gb(p))" + (d.avg.map { ", average \(gb($0))" } ?? "")
-            if d.estimated { s += ", estimated" }
-            if d.few { s += ", only \(plural(d.samples, "sample"))" }
+            for n in usageDayNotes(d, u, memory: true) { s += ", " + n }
             return UsageBar(day: d, label: d.weekday, fraction: p / top, spoken: s)
         }
         let head = u.today.flatMap { $0.peak }.map { "Today’s peak \(gb($0))" + (u.ram.map { " of \(gb($0))" } ?? "") }
@@ -1794,7 +1806,7 @@ func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary:
             guard !d.empty, totals[k] > 0 else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
             let parts = UsageData.sections.compactMap { s in d.bySection[s.key].flatMap { $0 > 0 ? "\(s.name) \(gb($0))" : nil } }
             return UsageBar(day: d, label: d.weekday, fraction: totals[k] / top,
-                            spoken: "\(d.weekday), " + parts.joined(separator: ", "))
+                            spoken: "\(d.weekday), " + (parts + usageDayNotes(d, u, memory: false)).joined(separator: ", "))
         }
         let names = u.topSections.map { "\($0.name) \(gb($0.avg))" }
         return (bars, names.isEmpty ? "No samples this week." : "Top consumers on average: " + names.joined(separator: ", ") + ".")
@@ -4863,7 +4875,6 @@ struct UsageCard: View {
         .padding(.trailing, UsageCard.gutter)
         .accessibilityHidden(true)
         legend(u, view)
-        notes(u)
     }
 
     /// A bar's opacity: today in full, other days at 70 %, days with few
@@ -4966,24 +4977,6 @@ struct UsageCard: View {
                 TopRounded(radius: 2).fill(c).frame(width: 8, height: 9)
             }
             Text(name).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
-        }
-    }
-
-    /// Days with no samples, or too few to stand for the day, are named, and
-    /// so is memory estimated from free memory on older history rows.
-    @ViewBuilder private func notes(_ u: UsageData) -> some View {
-        let empty = u.days.filter { $0.empty }.map { $0.weekday }
-        let few = u.days.filter { $0.few }.map { "\($0.weekday) (\($0.samples))" }
-        let estimated = model.usageView == .memory && u.days.contains { $0.estimated && $0.peak != nil }
-        if !empty.isEmpty || !few.isEmpty || u.complete == false || estimated {
-            VStack(alignment: .leading, spacing: 2) {
-                if !empty.isEmpty { Text("No samples: " + empty.joined(separator: ", ")) }
-                if !few.isEmpty { Text("Few samples: " + few.joined(separator: ", ")) }
-                if estimated { Text("≈ estimated from free memory on older days") }
-                if u.complete == false { Text("History before \(u.days.first?.weekday ?? "this week") is incomplete.") }
-            }
-            .font(ft(11)).foregroundColor(P.muted)
-            .accessibilityElement(children: .combine)
         }
     }
 }
