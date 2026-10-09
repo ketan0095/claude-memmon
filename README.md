@@ -467,10 +467,10 @@ be read without privileges; they are listed as "not itemised", never as zero.
 A number memmon could not read is shown as `—` with the reason, never as 0.
 
 CPU needs two samples. The popover takes them a second apart; the sampler keeps
-a baseline so the next tick can measure against it. Growth per 10 minutes, shown in an
-owner's technical details, needs at least 5 samples over 10 minutes with no gap
-longer than 3 minutes, so a freshly started owner, or one seen across a sleep,
-says "not enough history".
+a baseline so the next tick can measure against it. Growth per 10 minutes, shown on an
+owner's detail card when known, needs at least 5 samples over 10 minutes with no
+gap longer than 3 minutes. Until then, a freshly started owner, or one seen
+across a sleep, says "not enough history" in its Technical details.
 
 ### Stopping something
 
