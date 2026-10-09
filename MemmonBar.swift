@@ -1524,6 +1524,8 @@ struct SettingsInfo {
     var suggestions = true
     var notifications = true
     var stateDir: String?
+    /// The install record (install.json) when memmon reports it.
+    var installCommit: String?, installedAt: Double?
 
     /// MEMMON_GATE in the hook's environment wins over config.json, so the
     /// panel must not offer a choice that would not take effect.
@@ -1544,6 +1546,9 @@ struct SettingsInfo {
         s.suggestions = j["pressure_suggestions"] as? Bool ?? true
         s.notifications = j["notifications"] as? Bool ?? true
         s.stateDir = str(j["state_dir"])
+        if let i = j["install"] as? [String: Any] {
+            s.installCommit = str(i["commit"]).map { String($0.prefix(7)) }; s.installedAt = num(i["installed_at"])
+        }
         return s
     }
 
@@ -1905,6 +1910,60 @@ func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary:
             s += "; managed-job holds and cancels not recorded"
         }
         return (bars, s + ".")
+    }
+}
+
+// MARK: - updates (D49)
+
+struct UpdateCommit: Equatable { var sha: String, subject: String }
+
+/// `memmon update --check --json`. Every field is optional, so an older or
+/// newer memmon still decodes.
+struct UpdateInfo: Equatable {
+    var state: String               // up_to_date | available | unavailable
+    var installed: String?, latest: String?
+    var installedAt: Double?
+    var behind: Int?
+    var commits: [UpdateCommit] = []
+    var reason: String?
+
+    static let installHint = "Run ./install.sh once from your clone to enable updates"
+
+    static func decode(_ j: [String: Any]) -> UpdateInfo? {
+        guard let state = str(j["state"]) else { return nil }
+        var u = UpdateInfo(state: state, installed: str(j["installed"]), latest: str(j["latest"]),
+                           installedAt: num(j["installed_at"]), behind: int(j["behind"]), reason: str(j["reason"]))
+        u.commits = (j["commits"] as? [[String: Any]] ?? []).compactMap { c in
+            str(c["subject"]).map { UpdateCommit(sha: str(c["sha"]) ?? "", subject: $0) }
+        }
+        return u
+    }
+
+    var count: Int { behind ?? commits.count }
+    /// Without an install record there is nothing to check; it only says how.
+    var needsInstall: Bool { state == "unavailable" && (reason ?? "").hasPrefix("Run ./install.sh") }
+}
+
+enum UpdateOutcome {
+    case checked(UpdateInfo)
+    case started(from: String?, to: String?)
+    case failed(String)
+
+    /// Exit 0 with JSON is memmon's answer; exit 2 carries its error. Nothing
+    /// is shown as done unless memmon said so.
+    static func of(_ r: CLIResult, applying: Bool) -> UpdateOutcome {
+        let what = applying ? "Could not update" : "Could not check for updates"
+        if r.timedOut { return .failed("\(what): memmon did not answer in time.") }
+        if let e = r.launchError { return .failed("\(what): \(e).") }
+        let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
+        if r.exit == 0, let j {
+            if applying, str(j["state"]) == "started" { return .started(from: str(j["from"]), to: str(j["to"])) }
+            if !applying, let u = UpdateInfo.decode(j) { return .checked(u) }
+        }
+        if let e = j.flatMap({ str($0["error"]) ?? str($0["reason"]) }) {
+            return .failed("\(what): \(e.hasSuffix(".") ? String(e.dropLast()) : e).")
+        }
+        return .failed("\(what): memmon's answer could not be read.")
     }
 }
 
@@ -2884,6 +2943,59 @@ final class Model: ObservableObject {
                     self.usageError = r.timedOut ? "memmon did not answer in time" : "memmon could not read the history"
                 }
             }
+        }
+    }
+
+    /// Updates (D49): checked only on a click, applied only after the
+    /// in-view confirm.
+    @Published var update: UpdateInfo?
+    @Published var updateBusy: String?
+    @Published var updateError: String?
+    @Published var updateConfirm = false
+    @Published var updateStarted = false
+    /// A fetch can take its full 30 s.
+    static let updateTimeout = 45.0
+
+    func checkUpdates() {
+        guard updateBusy == nil, !updateStarted else { return }
+        updateError = nil
+        updateConfirm = false
+        updateCall(["update", "--check", "--json"], applying: false)
+    }
+
+    /// "Update now…": only asks.
+    func askUpdate() {
+        guard update?.state == "available", updateBusy == nil, !updateStarted else { return }
+        updateConfirm = true
+    }
+
+    func cancelUpdate() { updateConfirm = false }
+
+    /// The confirm's Update button: the only path to --apply.
+    func confirmUpdate() {
+        guard updateConfirm, update?.state == "available", updateBusy == nil else { return }
+        updateConfirm = false
+        updateError = nil
+        updateCall(["update", "--apply", "--json"], applying: true)
+    }
+
+    private func updateCall(_ args: [String], applying: Bool) {
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        updateBusy = applying ? "apply" : "check"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let o = UpdateOutcome.of(CLI.run(args, timeout: Model.updateTimeout), applying: applying)
+            DispatchQueue.main.async {
+                self.updateBusy = nil
+                self.applyUpdate(o)
+            }
+        }
+    }
+
+    func applyUpdate(_ o: UpdateOutcome) {
+        switch o {
+        case .checked(let u): update = u; updateError = nil
+        case .started: updateStarted = true; updateError = nil
+        case .failed(let e): updateError = e
         }
     }
 
@@ -5621,6 +5733,98 @@ struct ContentView: View {
         }
     }
 
+    // MARK: updates (D49)
+
+    @ViewBuilder private func updatesBody(_ st: SettingsInfo) -> some View {
+        let u = model.update
+        let commit = u?.installed ?? st.installCommit
+        let at = u?.installedAt ?? st.installedAt
+        if let commit {
+            Text("Installed \(commit)" + (at.map { " · " + retainedDate($0) } ?? ""))
+                .font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
+        }
+        if model.updateStarted {
+            HStack(spacing: 8) {
+                Spinner()
+                Text("Updating… the menu bar will restart.").font(ft(12)).foregroundColor(P.text)
+            }
+        } else if model.updateBusy == "apply" {
+            HStack(spacing: 8) { Spinner(); Text("Starting the update…").font(ft(12)).foregroundColor(P.muted) }
+        } else if let u, u.needsInstall {
+            let hint = u.reason ?? UpdateInfo.installHint
+            Text(verbatim: hint.hasSuffix(".") ? hint : hint + ".")
+                .font(ft(12)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+        } else {
+            if let u {
+                switch u.state {
+                case "up_to_date":
+                    Label("Up to date", systemImage: "checkmark.circle").font(ft(12, .medium)).foregroundColor(P.green)
+                case "available":
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(plural(u.count, "update")).font(ft(12, .semibold)).foregroundColor(P.text)
+                        ForEach(Array(u.commits.prefix(5).enumerated()), id: \.offset) { _, c in
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                ExplainBullet(color: P.muted)
+                                Text(verbatim: c.subject).font(ft(12)).foregroundColor(P.text)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .accessibilityElement(children: .combine)
+                        }
+                        if u.commits.count > 5 {
+                            Text("and \(u.commits.count - 5) more").font(ft(11)).foregroundColor(P.muted).padding(.leading, 12)
+                        }
+                    }
+                default:
+                    if let r = u.reason {
+                        Text(verbatim: r.hasSuffix(".") ? r : r + ".").font(ft(12)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if let e = model.updateError {
+                Text(verbatim: e).font(ft(12)).foregroundColor(P.red).fixedSize(horizontal: false, vertical: true)
+            }
+            if model.updateConfirm, let u {
+                updateConfirmBox(u)
+            } else {
+                HStack(spacing: 8) {
+                    ActionButton(title: model.updateBusy == "check" ? "Checking…" : "Check for updates",
+                                 icon: "arrow.clockwise") { model.checkUpdates() }
+                        .disabled(model.updateBusy != nil)
+                        .accessibilityLabel("Check for updates")
+                    if u?.state == "available" {
+                        ActionButton(title: "Update now…", variant: .primary) { model.askUpdate() }
+                            .accessibilityLabel("Update memmon (asks to confirm)")
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            Text("Checking contacts GitHub, only when you click.").font(ft(11)).foregroundColor(P.muted)
+        }
+    }
+
+    /// The in-view confirm, like the stop confirm: the safe choice first.
+    private func updateConfirmBox(_ u: UpdateInfo) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Update memmon?").font(ft(13, .semibold)).foregroundColor(P.text).accessibilityAddTraits(.isHeader)
+            Text("It pulls \(plural(u.count, "commit")) and re-runs the installer with your flags. The menu bar restarts.")
+                .font(ft(12)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                ActionButton(title: "Cancel") { model.cancelUpdate() }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityLabel("Cancel, don't update")
+                ActionButton(title: "Update", variant: .primary) { model.confirmUpdate() }
+                    .accessibilityLabel("Update memmon now")
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(P.soft))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.amber.opacity(0.62), lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Update memmon?")
+    }
+
     // MARK: settings (D43)
 
     private func settingsCard<C: View>(_ title: String, _ icon: String, @ViewBuilder _ body: () -> C) -> some View {
@@ -5741,6 +5945,7 @@ struct ContentView: View {
                          line: "Sampling gaps, stop suggestions and managed jobs that need you",
                          on: st.notifications, enabled: !busy) { model.setFlag("notifications", $0) }
         }
+        settingsCard("Updates", "arrow.down.circle") { updatesBody(st) }
         settingsCard("Appearance", "circle.lefthalf.filled") {
             HStack(spacing: 8) {
                 Text("Theme").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
@@ -6812,6 +7017,19 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
             }
             m.applySettings(SettingsOutcome.of(r, key: str(set["key"]) ?? "load"), key: "load")
         }
+        if let u = fixtureView["update"] as? [String: Any] {
+            // {check: {exit, stdout}, confirm: bool, apply: {exit, stdout}}, through the real decoders.
+            func result(_ d: [String: Any]) -> CLIResult {
+                var r = CLIResult(exit: int(d["exit"]).map { Int32($0) }, stdout: Data())
+                if let obj = d["stdout"], JSONSerialization.isValidJSONObject(obj) {
+                    r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+                }
+                return r
+            }
+            if let c = u["check"] as? [String: Any] { m.applyUpdate(UpdateOutcome.of(result(c), applying: false)) }
+            if u["confirm"] as? Bool == true { m.askUpdate() }
+            if let a = u["apply"] as? [String: Any] { m.applyUpdate(UpdateOutcome.of(result(a), applying: true)) }
+        }
     }
     if let id = o.confirmSuggestion {
         guard let sg = snap.suggestions.first(where: { $0.id == id }) else { fail("no suggestion \(id) in the fixture") }
@@ -7419,6 +7637,10 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     case "pause": model.pauseProtection(v)
                     case "resume": model.pauseProtection(nil)
                     case "folder": model.openDataFolder()
+                    case "check-updates": model.checkUpdates()
+                    case "ask-update": model.askUpdate()
+                    case "confirm-update": model.confirmUpdate()
+                    case "cancel-update": model.cancelUpdate()
                     case "intervene":
                         // A new job needing intervention reaches the alerts.
                         jobSeq += 1
@@ -7429,7 +7651,7 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     }
                     let deadline = Date().addingTimeInterval(8)
                     spin(0.05)
-                    while Date() < deadline && model.settingsBusy != nil { spin(0.05) }
+                    while Date() < deadline && (model.settingsBusy != nil || model.updateBusy != nil) { spin(0.05) }
                 }
                 report["actions"] = model.actionLog
                 report["open"] = model.settingsOpen
@@ -7439,6 +7661,10 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                 report["notifications"] = model.settings?.notifications ?? NSNull()
                 report["alerts_enabled"] = model.alerts?.enabled ?? NSNull()
                 report["posted"] = posts.n
+                report["update_state"] = model.update?.state ?? NSNull()
+                report["update_confirm"] = model.updateConfirm
+                report["update_started"] = model.updateStarted
+                report["update_error"] = model.updateError ?? NSNull()
             case "run-mode":
                 guard let mode = argValue("--mode") else { fail("run-mode needs --mode") }
                 if let script = argValue("--script") { CLI.script = script; model.live = true }

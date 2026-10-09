@@ -1,0 +1,42 @@
+{
+ "_base": "overview.json",
+ "_settings": {
+  "schema_version": 1,
+  "gate_mode": {
+   "value": "block-critical",
+   "source": "config",
+   "choices": [
+    "block-critical",
+    "block",
+    "warn",
+    "off"
+   ]
+  },
+  "paused_until": null,
+  "runner_mode": "protect",
+  "auto_cancel_interruptible": false,
+  "pressure_suggestions": true,
+  "notifications": true,
+  "state_dir": "/opt/example/memmon",
+  "install": {
+   "commit": "abc1234",
+   "installed_at": 1791277200
+  }
+ },
+ "_view": {
+  "settings": true,
+  "update": {
+   "check": {
+    "exit": 0,
+    "stdout": {
+     "state": "up_to_date",
+     "installed": "abc1234",
+     "latest": "abc1234",
+     "behind": 0,
+     "commits": [],
+     "reason": null
+    }
+   }
+  }
+ }
+}

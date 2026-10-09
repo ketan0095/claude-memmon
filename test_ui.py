@@ -2545,3 +2545,77 @@ class ExplainTests(StubCase):
         for gone in ("Send this summary to Claude", "Not now", "What is sent to Claude"):
             self.assertNotIn(gone, busy)
         self.assertTrue(any(l.startswith("Claude Code isn’t installed") for l in said("explain-error.json")))
+
+
+class UpdatesCardTests(StubCase):
+    """D49: Settings → Updates. Checked only on a click; applied only after
+    the in-view confirm."""
+
+    AVAIL = {"state": "available", "installed": "abc1234", "latest": "d4e5f60", "behind": 3,
+             "commits": [{"sha": "d4e5f60", "subject": "Show resource owners"},
+                         {"sha": "1a2b3c4", "subject": "Bullet each suggestion"},
+                         {"sha": "9f8e7d6", "subject": "Say which look System follows"}], "reason": None}
+
+    def steps(self, steps, check=None, apply=None, apply_code=0):
+        calls = self.dir / "calls.jsonl"
+        calls.unlink(missing_ok=True)
+        script = self.dir / "memmon_update_stub.py"
+        script.write_text(
+            "import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "a = sys.argv[1:]\n"
+            "if a[:2] == ['update', '--check']:\n"
+            f"    print(json.dumps({check or self.AVAIL!r}))\n"
+            "elif a[:2] == ['update', '--apply']:\n"
+            f"    print(json.dumps({apply or {'state': 'started', 'from': 'abc1234', 'to': 'd4e5f60'}!r})); sys.exit({apply_code})\n"
+            f"else:\n    print(json.dumps({SETTINGS!r}))\n")
+        r = host("settings", FIXTURES / "settings-panel.json", "--script", str(script), "--do", ",".join(steps))
+        made = [json.loads(l) for l in calls.read_text().splitlines()] if calls.exists() else []
+        return r, [c for c in made if c[:1] == ["update"]]
+
+    def test_nothing_runs_on_open(self):
+        r, made = self.steps(["open", "close", "open"])
+        self.assertEqual(made, [])
+
+    def test_check_then_confirm_runs_the_exact_argv(self):
+        r, made = self.steps(["open", "check-updates", "ask-update", "confirm-update"])
+        self.assertEqual(made, [["update", "--check", "--json"], ["update", "--apply", "--json"]])
+        self.assertTrue(r["update_started"])
+        self.assertEqual(host("settings", FIXTURES / "update-available.json",
+                              "--do", "check-updates,ask-update,confirm-update")["actions"],
+                         ["memmon update --check --json", "memmon update --apply --json"])
+
+    def test_update_needs_the_confirm(self):
+        r, made = self.steps(["check-updates", "confirm-update"])
+        self.assertEqual(made, [["update", "--check", "--json"]])
+        r, made = self.steps(["check-updates", "ask-update", "cancel-update", "confirm-update"])
+        self.assertEqual(made, [["update", "--check", "--json"]])
+        self.assertFalse(r["update_started"])
+
+    def test_nothing_to_update_offers_no_update(self):
+        up = {"state": "up_to_date", "installed": "abc1234", "latest": "abc1234", "behind": 0, "commits": []}
+        r, made = self.steps(["check-updates", "ask-update", "confirm-update"], check=up)
+        self.assertEqual((r["update_state"], made), ("up_to_date", [["update", "--check", "--json"]]))
+
+    def test_a_refused_update_is_a_plain_sentence(self):
+        r, _ = self.steps(["check-updates", "ask-update", "confirm-update"],
+                          apply={"error": "your clone has uncommitted changes"}, apply_code=2)
+        self.assertEqual((r["update_started"], r["update_error"]),
+                         (False, "Could not update: your clone has uncommitted changes."))
+
+    def test_each_state_reads_as_it_should(self):
+        cases = {
+            "update-up-to-date.json": ["Installed abc1234", "Up to date", "Check for updates"],
+            "update-available.json": ["7 updates", "Show resource owners", "and 2 more", "Update memmon (asks to confirm)"],
+            "update-confirm.json": ["Update memmon?", "Cancel, don't update", "Update memmon now"],
+            "update-error.json": ["Could not update: your clone has uncommitted changes; commit or stash them first."],
+            "update-started.json": ["Updating… the menu bar will restart."],
+            "update-unavailable.json": ["Run ./install.sh once from your clone to enable updates."],
+        }
+        for f, want in cases.items():
+            joined = " ".join(said(f))
+            for w in want:
+                self.assertIn(w, joined, (f, w))
+        self.assertNotIn("Check for updates", " ".join(said("update-unavailable.json")))
+        self.assertNotIn("Title the Claude card", " ".join(said("update-available.json")))   # 6th of 7 hidden
+        self.assertNotIn("Update memmon now", " ".join(said("update-available.json")))
