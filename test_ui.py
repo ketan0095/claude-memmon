@@ -2342,3 +2342,40 @@ class UsageCardTests(StubCase):
         self.assertIn("Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", expanded)
         self.assertIn("Fri, peak about 34.2 GB, average 26.1 GB, estimated", expanded)
         self.assertIn("Choose Top consumers", expanded)
+
+
+class ThemeTests(unittest.TestCase):
+    """D48: MemmonBar's own theme, stored in UserDefaults (a file here) and
+    applied to the popover. Renders stay on --light/--dark."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = str(Path(self.tmp.name) / "prefs.json")
+
+    def probe(self, *extra):
+        return run_json("--theme-probe", "--store", self.store, *extra)
+
+    def test_default_is_system_with_no_forced_appearance(self):
+        r = self.probe()
+        self.assertEqual((r["theme"], r["stored"], r["appearance"]), ("system", None, None))
+
+    def test_a_choice_is_stored_applied_and_kept_across_launches(self):
+        r = self.probe("--set", "dark")
+        self.assertEqual((r["stored"], r["appearance"]), ("dark", "NSAppearanceNameDarkAqua"))
+        again = self.probe()                       # a relaunch reads it back
+        self.assertEqual((again["before"], again["before_appearance"]), ("dark", "NSAppearanceNameDarkAqua"))
+        r = self.probe("--set", "light")
+        self.assertEqual((r["stored"], r["appearance"]), ("light", "NSAppearanceNameAqua"))
+        r = self.probe("--set", "system")
+        self.assertEqual((r["stored"], r["appearance"]), ("system", None))
+
+    def test_an_unknown_stored_value_is_system(self):
+        Path(self.store).write_text(json.dumps({"memmon.theme": "sepia"}))
+        self.assertEqual((self.probe()["theme"], self.probe()["appearance"]), ("system", None))
+
+    def test_settings_offers_the_theme(self):
+        found = said("settings-panel.json")
+        self.assertIn("Theme, System", found)
+        self.assertIn("System, current choice", found)
+        self.assertIn("Choose Dark", found)

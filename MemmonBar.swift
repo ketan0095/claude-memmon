@@ -1209,6 +1209,7 @@ enum ActionsLock {
 /// probes and tests use memory or a file, so they never touch the user's.
 protocol PrefStore: AnyObject {
     func double(_ key: String) -> Double?
+    func string(_ key: String) -> String?
     func strings(_ key: String) -> [String]
     func set(_ value: Any, _ key: String)
 }
@@ -1216,6 +1217,7 @@ protocol PrefStore: AnyObject {
 final class DefaultsStore: PrefStore {
     let d = UserDefaults.standard
     func double(_ key: String) -> Double? { d.object(forKey: key) == nil ? nil : d.double(forKey: key) }
+    func string(_ key: String) -> String? { d.string(forKey: key) }
     func strings(_ key: String) -> [String] { d.stringArray(forKey: key) ?? [] }
     func set(_ value: Any, _ key: String) { d.set(value, forKey: key) }
 }
@@ -1223,6 +1225,7 @@ final class DefaultsStore: PrefStore {
 class MemoryStore: PrefStore {
     var values: [String: Any] = [:]
     func double(_ key: String) -> Double? { num(values[key]) }
+    func string(_ key: String) -> String? { str(values[key]) }
     func strings(_ key: String) -> [String] { strs(values[key]) ?? [] }
     func set(_ value: Any, _ key: String) { values[key] = value }
 }
@@ -1244,9 +1247,29 @@ final class FileStore: MemoryStore {
     }
 }
 
+/// The popover's appearance (D48). System follows macOS; it is MemmonBar's
+/// own preference, kept in UserDefaults, and never memmon's.
+enum ThemeChoice: String, CaseIterable {
+    case system, light, dark
+    var label: String { rawValue.capitalized }
+    var appearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+/// Sets the popover's appearance; nil hands it back to the system.
+func applyTheme(_ popover: NSPopover, _ t: ThemeChoice) {
+    popover.appearance = t.appearance
+}
+
 enum PrefKey {
     static let dismissedGap = "memmon.dismissedGapTs"
     static let notifiedJobs = "memmon.notifiedJobStates"
+    static let theme = "memmon.theme"
 }
 
 /// `done` reports whether the notification was handed over; only then is it
@@ -2627,6 +2650,17 @@ final class Model: ObservableObject {
             _ = CLI.run(args, timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
         }
+    }
+
+    /// The stored theme; an unknown or missing value is System.
+    var theme: ThemeChoice { ThemeChoice(rawValue: prefs.string(PrefKey.theme) ?? "") ?? .system }
+    /// Applies a theme to the live popover; unset in renders and probes.
+    var onTheme: ((ThemeChoice) -> Void)?
+
+    func setTheme(_ t: ThemeChoice) {
+        prefs.set(t.rawValue, PrefKey.theme)
+        objectWillChange.send()
+        onTheme?(t)
     }
 
     func toggleUsage() {
@@ -5394,6 +5428,17 @@ struct ContentView: View {
                          line: "Sampling gaps, stop suggestions and managed jobs that need you",
                          on: st.notifications, enabled: !busy) { model.setFlag("notifications", $0) }
         }
+        settingsCard("Appearance", "circle.lefthalf.filled") {
+            HStack(spacing: 8) {
+                Text("Theme").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                ChoiceSegmented(choices: ThemeChoice.allCases.map { ($0.rawValue, $0.label, $0.label, $0.label) },
+                                selected: model.theme.rawValue, enabled: true) { v in
+                    model.setTheme(ThemeChoice(rawValue: v) ?? .system)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Theme, \(model.theme.label)")
+            }
+        }
         if let dir = st.stateDir {
             HStack(spacing: 8) {
                 ActionButton(title: "Open data folder", icon: "folder") { model.openDataFolder() }
@@ -6217,6 +6262,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.alerts = InterventionAlerts(notifier: notifier, store: model.prefs)
 
         configurePopover(popover, model: model, onQuit: { NSApp.terminate(nil) })
+        applyTheme(popover, model.theme)
+        model.onTheme = { [weak self] t in self.map { applyTheme($0.popover, t) } }
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
@@ -7444,6 +7491,24 @@ if ARGS.contains("--notify-probe") {
                                                             "remembered": store.strings(PrefKey.notifiedJobs)],
                                            options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+if ARGS.contains("--theme-probe") {
+    // Stores a theme through the Settings path into a file-backed store (as
+    // UserDefaults would hold it) and applies it to a real popover.
+    _ = NSApplication.shared
+    guard let path = argValue("--store") else { fail("usage: --theme-probe --store <file> [--set <theme>]") }
+    let m = Model()
+    m.prefs = FileStore(path: path)
+    let pop = NSPopover()
+    applyTheme(pop, m.theme)
+    m.onTheme = { applyTheme(pop, $0) }
+    var out: [String: Any] = ["before": m.theme.rawValue, "before_appearance": pop.appearance?.name.rawValue ?? NSNull()]
+    if let v = argValue("--set") { m.setTheme(ThemeChoice(rawValue: v) ?? .system) }
+    out["theme"] = m.theme.rawValue
+    out["stored"] = m.prefs.string(PrefKey.theme) ?? NSNull()
+    out["appearance"] = pop.appearance?.name.rawValue ?? NSNull()
+    print(String(data: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), encoding: .utf8)!)
     exit(0)
 }
 if ARGS.contains("--clock-probe") {
