@@ -24,12 +24,14 @@ json.dump({{"argv": sys.argv[1:], "stdin": sys.stdin.read(),
            "memmon_env": sorted(k for k in os.environ if k.startswith("MEMMON_"))}},
           open(os.path.join(d, "call.json"), "w"))
 mode = os.environ.get("STUB_MODE", "")
+reply = os.environ.get("STUB_REPLY")
 if mode == "sleep":
     time.sleep(5)
 if mode == "fail":
     sys.stderr.write("x" * 500 + "auth failed")
     sys.exit(3)
-print("1. Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
+print(reply.replace("|", "\\n") if reply else
+      "1. Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
 """
 
 
@@ -73,24 +75,23 @@ def payload():
 
 
 class SummaryTests(unittest.TestCase):
+    def summary(self, p=None):
+        return ex.build_now_summary(p or payload())
+
     def test_summary_content(self):
-        s = ex.build_summary(payload())
-        self.assertEqual(s, ex.build_summary(payload()), "deterministic")
+        s = self.summary()
+        self.assertEqual(s, self.summary(), "deterministic")
         self.assertLessEqual(len(s), ex.SUMMARY_MAX)
         for want in ("DANGER", "kernel warning", "swap 1.1x RAM size", "paging 80 MB per s",
-                     "44.2 GB used of 48.0 GB",
-                     "swap 5.5 GB", "Checkout refactor", "9.5 GB", "test 8.8 GB", "VM · colima",
-                     "idle", "2 queued", "holding for recovery", "vitest (test) in",
+                     "44.2 GB used of 48.0 GB", "swap 5.5 GB", "Checkout refactor", "8.8 GB",
+                     "VM · colima", "idle service", "queued: 2", "holding for recovery",
                      "idle 31 min"):
             self.assertIn(want, s)
-        owners = [l for l in s.splitlines() if re.match(r"\d+\. ", l)]
-        self.assertEqual(len(owners), ex.TOP_OWNERS)
-        for line in owners:
-            title = re.search(r'"([^"]*)"', line).group(1)
+        for title in re.findall(r'"([^"]*)"', s):
             self.assertLessEqual(len(title), ex.TITLE_MAX)
 
     def test_summary_hygiene(self):
-        s = ex.build_summary(payload())
+        s = self.summary()
         self.assertNotIn("/", s)
         self.assertNotRegex(s.lower(), r"\bpid\b")
         self.assertNotIn("@", s)
@@ -105,11 +106,11 @@ class SummaryTests(unittest.TestCase):
         p = payload()
         for o in p["owners"]:
             o["title"] = "Checkout refactor " * 10
-            o["jobs"] = [{"kind": "test", "footprint_bytes": GB}] * 5
-        self.assertLessEqual(len(ex.build_summary(p)), ex.SUMMARY_MAX)
+            o["jobs"] = [{"kind": "test", "label": "vitest " * 9, "footprint_bytes": GB}] * 5
+        self.assertLessEqual(len(self.summary(p)), ex.SUMMARY_MAX)
 
 
-class CallTests(unittest.TestCase):
+class StubBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.bin = Path(self.tmp.name)
@@ -135,6 +136,8 @@ class CallTests(unittest.TestCase):
     def call(self):
         return json.loads((self.bin / "call.json").read_text())
 
+
+class CallTests(StubBase):
     def test_exact_argv_tools_disabled_and_prompt_on_stdin(self):
         code, out = self.cli("--json")
         self.assertEqual(code, 0)
@@ -144,8 +147,8 @@ class CallTests(unittest.TestCase):
         call = self.call()
         self.assertEqual(call["argv"], ["-p", "--model", "claude-haiku-5-5", "--output-format",
                                         "text", "--tools", "", "--no-session-persistence"])
-        self.assertTrue(call["stdin"].startswith(ex.PROMPT))
-        self.assertIn("no action needed", call["stdin"])
+        self.assertTrue(call["stdin"].startswith(ex.PROMPT_NOW))
+        self.assertEqual((res["mode"], res["title"]), ("now", "Free memory now"))
         self.assertEqual(res["chars_sent"], len(call["stdin"]))
         self.assertEqual(call["memmon_env"], [], "memmon's own variables never reach claude")
         self.assertNotIn(TOKEN, call["stdin"])
@@ -174,15 +177,143 @@ class CallTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("called")):
             code, out = self.cli("--preview")
         self.assertEqual(code, 0)
-        self.assertEqual(out, ex.PROMPT + ex.build_summary(payload()) + "\n")
+        self.assertEqual(out, ex.plan(payload(), None)["prompt"] + "\n")
         self.assertFalse((self.bin / "call.json").exists())
 
     def test_reply_is_printed_never_acted_on(self):
         with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
             code, out = self.cli()
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "1. Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
+        self.assertEqual(out.strip(), "Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
         self.assertEqual(popen.call_count, 1, "one process: claude itself")
+
+
+def healthy(p=None):
+    p = p or payload()
+    p["system"] = dict(p["system"], score_level="HEALTHY", pressure_level="normal",
+                       used_bytes=int(20 * GB), reasons=[])
+    p["pressure_suggestions"] = []
+    return p
+
+
+def quiet_payload():
+    p = healthy()
+    for o in p["owners"]:
+        o["activity"], o["cpu_cores"], o["jobs"] = "Working", 1.0, []
+    return p
+
+
+def week(peak_frac=0.5, warned=0, owner_days=None, rules=None):
+    ram = 48 * GB
+    series = [{"date": f"2026-10-0{i + 1}", "samples": 1400, "mem_peak_bytes": int(peak_frac * ram),
+               "mem_basis": "measured",
+               "by_section": {"claude": 9 * GB, "browser": 4 * GB, "service": 6 * GB},
+               "gate": {"warned": warned if i == 6 else 0, "stopped": 0}} for i in range(7)]
+    return {"usage": {"ram_bytes": ram, "series": series}, "owner_days": owner_days or {},
+            "rules": rules or {}}
+
+
+class ModeTests(unittest.TestCase):
+    def test_pressure_selects_now(self):
+        for level in ("WATCH", "DANGER", "CRITICAL", "UNKNOWN", None):
+            p = payload()
+            p["system"]["score_level"] = level
+            with self.subTest(level=level):
+                self.assertEqual(ex.select_mode(p, week()), "now")
+
+    def test_healthy_triggers_select_patterns(self):
+        dup = quiet_payload()
+        dup["owners"][0]["jobs"] = [{"kind": "server", "label": "vite", "footprint_bytes": GB}]
+        dup["owners"][2]["jobs"] = [{"kind": "server", "label": "vite", "footprint_bytes": GB}]
+        idle = quiet_payload()
+        idle["owners"][1].update(activity="Idle", footprint_bytes=6 * GB)
+        cases = {"peak": (quiet_payload(), week(peak_frac=0.8)),
+                 "gate": (quiet_payload(), week(warned=1)),
+                 "duplicate": (dup, week()),
+                 "idle owner": (idle, week(owner_days={"VM · colima": 5}))}
+        for name, (p, w) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(ex.select_mode(p, w), "patterns")
+                self.assertTrue(ex.pattern_triggers(p, w))
+
+    def test_healthy_without_triggers_is_quiet(self):
+        idle = quiet_payload()
+        idle["owners"][1].update(activity="Idle", footprint_bytes=6 * GB)
+        self.assertEqual(ex.select_mode(quiet_payload(), week()), "quiet")
+        self.assertEqual(ex.select_mode(idle, week(owner_days={"VM · colima": 3})), "quiet")
+        self.assertEqual(ex.select_mode(quiet_payload(), week(peak_frac=0.74)), "quiet")
+
+    def test_now_summary_lists_evidence(self):
+        s = ex.plan(payload(), None)["prompt"]
+        self.assertIn('"vitest" (test job) in "Checkout refactor', s)
+        for want in ("idle 31 min", "growing 12 MB per min", "memmon can stop it", "8.8 GB"):
+            self.assertIn(want, s)
+        cands = [l for l in s.splitlines() if re.match(r"\d+\. ", l)]
+        self.assertLessEqual(len(cands), ex.STOP_CANDIDATES)
+
+    def test_patterns_summary_content_and_hygiene(self):
+        p = quiet_payload()
+        p["owners"][1].update(activity="Idle", footprint_bytes=6 * GB)
+        w = week(peak_frac=0.8, warned=3, owner_days={"VM · colima": 6, "/Users/x": 7},
+                 rules={"tsc": 3, "pnpm … test": 1})
+        s = ex.build_patterns_summary(p, w)
+        for want in ("peak 38.4 GB (measured)", "top Claude sessions", "warned 3, stopped 0",
+                     "most-warned rule tsc (3)", '"VM · colima" 6 of 7 days',
+                     "Idle now and heavy most days", "Triggered by:"):
+            self.assertIn(want, s)
+        self.assertLessEqual(len(s), ex.SUMMARY_MAX)
+        self.assertNotIn("/", s)
+        self.assertNotRegex(s.lower(), r"\bpid\b")
+        self.assertNotIn(TOKEN, s)
+        self.assertNotIn("@", s)
+        self.assertNotIn("someone", s)
+
+
+class ReplyTests(StubBase):
+    def run_cli(self, p, w=None, reply=None, *argv):
+        if reply is not None:
+            os.environ["STUB_REPLY"] = reply
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = ex.cli(["--json", *argv], lambda: p, week_fn=lambda: w)
+        os.environ.pop("STUB_REPLY", None)
+        return code, json.loads(buf.getvalue())
+
+    def test_quiet_never_calls_claude(self):
+        code, out = self.run_cli(quiet_payload(), week())
+        self.assertEqual(code, 0)
+        self.assertEqual(out, {"mode": "quiet", "title": "Nothing to do",
+                               "text": "Nothing to do. Memory is healthy."})
+        self.assertFalse((self.bin / "call.json").exists())
+        code, out = self.run_cli(quiet_payload(), week(), None, "--preview")
+        self.assertEqual((out["would_send"], out["mode"]), (False, "quiet"))
+        self.assertIn("Nothing would be sent", out["preview"])
+        self.assertFalse((self.bin / "call.json").exists())
+
+    def test_generic_lines_are_dropped(self):
+        reply = ("1. Close some browser tabs to free memory.|"
+                 "2. Stop vitest in Checkout refactor; it is idle and frees about 8.8 GB.|"
+                 "3. Restart your Mac.|`kill 4300` to stop vitest")
+        code, out = self.run_cli(payload(), None, reply)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["text"],
+                         "Stop vitest in Checkout refactor; it is idle and frees about 8.8 GB.")
+
+    def test_reply_capped_at_three_lines(self):
+        reply = "|".join(f"{i}. Stop vitest, step {i}." for i in range(1, 6))
+        _, out = self.run_cli(payload(), None, reply)
+        self.assertEqual(len(out["text"].splitlines()), ex.REPLY_LINES)
+
+    def test_nothing_specific_left_is_quiet(self):
+        _, out = self.run_cli(payload(), None, "Close tabs.|Quit unused apps.")
+        self.assertEqual((out["mode"], out["text"], out["asked"]),
+                         ("quiet", "Nothing to do. Memory is healthy.", "now"))
+
+    def test_patterns_mode_end_to_end(self):
+        reply = "Run one \"VM · colima\" instead of leaving it idle all week."
+        _, out = self.run_cli(quiet_payload(), week(warned=2), reply)
+        self.assertEqual((out["mode"], out["title"]), ("patterns", "Patterns this week"))
+        self.assertTrue(self.call()["stdin"].startswith(ex.PROMPT_PATTERNS))
 
 
 if __name__ == "__main__":
