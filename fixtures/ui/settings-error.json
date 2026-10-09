@@ -1,0 +1,33 @@
+{
+ "_base": "overview.json",
+ "_settings": {
+  "schema_version": 1,
+  "gate_mode": {
+   "value": "block-critical",
+   "source": "config",
+   "choices": [
+    "block-critical",
+    "block",
+    "warn",
+    "off"
+   ]
+  },
+  "paused_until": null,
+  "runner_mode": "protect",
+  "auto_cancel_interruptible": false,
+  "pressure_suggestions": true,
+  "notifications": true,
+  "state_dir": "/opt/example/memmon"
+ },
+ "_view": {
+  "settings": true,
+  "settings_set": {
+   "key": "runner_mode",
+   "exit": 2,
+   "stdout": {
+    "error": "runner_mode must be one of protect, observe, paused",
+    "key": "runner_mode"
+   }
+  }
+ }
+}

@@ -1947,6 +1947,16 @@ class InterventionNotificationTests(unittest.TestCase):
         r = self.probe([[job(state="cancelled_by_policy", changed=300.0)]])
         self.assertEqual(r["posted"][0]["title"], "memmon cancelled Search index rebuild")
 
+    def test_notifications_off_in_config_posts_nothing_and_never_replays(self):
+        cfg = self.dir / "config.json"
+        cfg.write_text(json.dumps({"notifications": False, "headroom_frac": 0.2}))
+        r = self.probe([[job()]], True, "--config", str(cfg))
+        self.assertEqual((r["posted"], len(r["remembered"])), ([], 1))
+        self.assertEqual(self.probe([[job()]])["posted"], [])        # turned back on: no replay
+        cfg.write_text(json.dumps({"headroom_frac": 0.2}))
+        self.assertEqual(len(self.probe([[job(changed=900.0)]], True, "--config", str(cfg))["posted"]), 1)
+        self.assertEqual(len(self.probe([[job(changed=901.0)]], True, "--config", str(self.dir / "absent"))["posted"]), 1)
+
     def test_a_failed_hand_over_is_retried_and_not_remembered(self):
         r = self.probe([[job()], [job()], [job()]], True, "--fail-adds", "1")
         self.assertEqual([len(x) for x in r["rounds"]], [1, 1, 0])
@@ -1997,3 +2007,94 @@ class InterventionNotificationTests(unittest.TestCase):
         r = self.probe([], True, "--runner-dir", str(runner))
         self.assertLessEqual(len(r["posted"]), 64)
         self.assertGreater(len(r["posted"]), 0)
+
+
+SETTINGS = {"schema_version": 1,
+            "gate_mode": {"value": "block-critical", "source": "config",
+                          "choices": ["block-critical", "block", "warn", "off"]},
+            "paused_until": None, "runner_mode": "protect", "auto_cancel_interruptible": False,
+            "pressure_suggestions": True, "notifications": True, "state_dir": "/opt/example/memmon"}
+
+
+class SettingsPanelTests(StubCase):
+    """D43: the Settings panel. Every change goes through memmon and shows
+    only memmon's answer."""
+
+    def settings(self, fixture, steps, script=None):
+        extra = ["--do", ",".join(steps)] + (["--script", script] if script else [])
+        return host("settings", FIXTURES / fixture, *extra)
+
+    def memmon_stub(self, set_reply, code=0):
+        """Records every argv; `settings set` answers `set_reply`, the rest the fixture state."""
+        calls = self.dir / "calls.jsonl"
+        script = self.dir / "memmon_settings.py"
+        script.write_text(
+            "import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "a = sys.argv[1:]\n"
+            "if a[:2] == ['settings', 'set']:\n"
+            f"    print(json.dumps({set_reply!r})); sys.exit({code})\n"
+            f"print(json.dumps({SETTINGS!r}))\n")
+        return str(script), calls
+
+    def test_each_control_logs_its_exact_argv(self):
+        r = self.settings("settings-panel.json", [
+            "gate:block", "runner:observe", "auto:on", "suggest:off", "notify:off",
+            "pause:1h", "pause:8h", "pause:forever", "resume", "folder", "open"])
+        self.assertEqual(r["actions"], [
+            "memmon settings set gate_mode block",
+            "memmon settings set runner_mode observe",
+            "memmon settings set auto_cancel_interruptible true",
+            "memmon settings set pressure_suggestions false",
+            "memmon settings set notifications false",
+            "memmon --off 1h", "memmon --off 8h", "memmon --off", "memmon --on",
+            "open /opt/example/memmon",
+            "memmon settings --json"])
+
+    def test_env_locked_gate_mode_is_never_written(self):
+        r = self.settings("settings-env-locked.json", ["gate:block", "runner:paused"])
+        self.assertTrue(r["locked"])
+        self.assertEqual(r["actions"], ["memmon settings set runner_mode paused"])
+        found = said("settings-env-locked.json")
+        self.assertIn("Gate mode, Warn only, locked: MEMMON_GATE in the hook environment overrides this setting",
+                      found)
+        self.assertIn("MEMMON_GATE in the hook environment overrides this setting", " ".join(found))
+
+    def test_a_change_shows_memmon_answer(self):
+        reply = dict(SETTINGS, gate_mode=dict(SETTINGS["gate_mode"], value="block"), notifications=False)
+        script, calls = self.memmon_stub(reply)
+        r = self.settings("settings-panel.json", ["gate:block", "intervene"], script)
+        self.assertEqual(json.loads(calls.read_text().splitlines()[0]), ["settings", "set", "gate_mode", "block"])
+        self.assertEqual((r["gate_mode"], r["error"]), ("block", None))
+        # memmon said notifications are off: MemmonBar's own notices follow.
+        self.assertEqual((r["notifications"], r["alerts_enabled"], r["posted"]), (False, False, 0))
+
+    def test_a_refused_change_is_shown_and_never_applied(self):
+        script, _ = self.memmon_stub({"error": "gate_mode must be one of block-critical, block, warn, off",
+                                      "key": "gate_mode"}, code=2)
+        r = self.settings("settings-panel.json", ["gate:block"], script)
+        self.assertEqual(r["gate_mode"], "block-critical")
+        self.assertEqual(r["error"], "Could not change command protection: "
+                                     "gate_mode must be one of block-critical, block, warn, off.")
+        script, _ = self.memmon_stub("not json")
+        r = self.settings("settings-panel.json", ["notify:off"], script)
+        self.assertEqual(r["notifications"], True)
+        self.assertEqual(r["error"], "Could not change notifications: memmon's answer could not be read.")
+
+    def test_notifications_on_still_posts(self):
+        self.assertEqual(self.settings("settings-panel.json", ["intervene"])["posted"], 1)
+
+    def test_labels(self):
+        found = said("settings-panel.json")
+        for label in ["Close settings", "Gate mode, Stop at Critical", "Choose Stop at Danger",
+                      "Pause command protection for 1 h", "Pause command protection until resumed",
+                      "Auto-cancel interruptible jobs under CRITICAL. memmon stops jobs started with "
+                      "--interruptible after 10 s at CRITICAL",
+                      "Suggest stops under pressure. Lists heavy jobs memmon can’t hold. memmon never stops "
+                      "them on its own.", "Open data folder", "Set protection mode to Observe"]:
+            self.assertIn(label, found)
+        self.assertNotIn("Resume command protection", found)          # not paused
+        self.assertIn("Resume command protection", said("settings-env-locked.json"))
+        self.assertIn("Settings", said("overview.json"))                # the header's gear
+        self.assertIn("Settings error: Could not change protection mode: runner_mode must be one of "
+                      "protect, observe, paused.", said("settings-error.json"))

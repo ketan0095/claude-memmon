@@ -1283,6 +1283,11 @@ final class InterventionAlerts {
     static let states: Set<String> = ["intervention_needed", "cancelled_by_policy"]
     static let keep = 200
 
+    /// memmon's notifications setting. While it is off, a new state is
+    /// remembered without a notification, so turning it back on never
+    /// replays old ones.
+    var enabled = true
+
     init(notifier: Notifier, store: PrefStore) {
         self.notifier = notifier
         self.store = store
@@ -1322,6 +1327,7 @@ final class InterventionAlerts {
         for j in jobs where InterventionAlerts.states.contains(j.state) {
             let k = InterventionAlerts.key(j)
             guard !seen.contains(k), !inFlight.contains(k) else { continue }
+            guard enabled else { remember(k); continue }
             inFlight.insert(k)
             posted.append(k)
             let (title, body) = InterventionAlerts.copy(j)
@@ -1408,6 +1414,97 @@ final class PressureWatch {
 
     /// What the source's handler does, for the self-test.
     func fire() { handler?() }
+}
+
+// MARK: - settings (D43)
+
+/// `memmon settings --json` (schema 1): the switches memmon itself honours.
+struct SettingsInfo {
+    var gateMode: String
+    var gateSource: String
+    var gateChoices: [String]
+    var warning: String?
+    var pausedForever = false
+    var pausedUntil: Double?
+    var runnerMode: String?
+    var autoCancel = false
+    var suggestions = true
+    var notifications = true
+    var stateDir: String?
+
+    /// MEMMON_GATE in the hook's environment wins over config.json, so the
+    /// panel must not offer a choice that would not take effect.
+    var gateLocked: Bool { gateSource == "env" }
+    var paused: Bool { pausedForever || (pausedUntil.map { $0 > nowTs() } ?? false) }
+
+    static let envWarning = "MEMMON_GATE in the hook environment overrides this setting"
+
+    static func decode(_ j: [String: Any]) -> SettingsInfo? {
+        guard num(j["schema_version"]) != nil, let g = j["gate_mode"] as? [String: Any],
+              let mode = str(g["value"]) else { return nil }
+        var s = SettingsInfo(gateMode: mode, gateSource: str(g["source"]) ?? "default",
+                             gateChoices: strs(g["choices"]) ?? ["block-critical", "block", "warn", "off"])
+        s.warning = str(j["warning"])
+        if str(j["paused_until"]) == "forever" { s.pausedForever = true } else { s.pausedUntil = num(j["paused_until"]) }
+        s.runnerMode = str(j["runner_mode"])
+        s.autoCancel = j["auto_cancel_interruptible"] as? Bool ?? false
+        s.suggestions = j["pressure_suggestions"] as? Bool ?? true
+        s.notifications = j["notifications"] as? Bool ?? true
+        s.stateDir = str(j["state_dir"])
+        return s
+    }
+
+    /// The gate's choices as the panel names them, with one line each.
+    /// The full name (spoken and in the tooltip), the segment's short label,
+    /// and the one line that explains it.
+    static func gateChoice(_ m: String) -> (label: String, short: String, line: String) {
+        switch m {
+        case "block-critical": return ("Stop at Critical", "Critical", "WATCH or DANGER warns; CRITICAL stops a heavy command before it runs.")
+        case "block": return ("Stop at Danger", "Danger", "WATCH warns; DANGER or CRITICAL stops a heavy command before it runs.")
+        case "warn": return ("Warn only", "Warn", "Every level warns; heavy commands are never stopped.")
+        case "off": return ("Off", "Off", "Heavy commands run with no memory check.")
+        default: return (m, m, "")
+        }
+    }
+
+    static func keyName(_ key: String) -> String {
+        switch key {
+        case "gate_mode": return "command protection"
+        case "runner_mode": return "protection mode"
+        case "auto_cancel_interruptible": return "auto-cancel"
+        case "pressure_suggestions": return "stop suggestions"
+        case "notifications": return "notifications"
+        case "pause": return "the pause"
+        default: return key
+        }
+    }
+}
+
+enum SettingsOutcome {
+    case ok(SettingsInfo)
+    case failed(String)
+
+    /// Exit 0 with the settings JSON is the re-read state. Exit 2 carries
+    /// memmon's own error; anything else is an error too. Nothing is applied
+    /// unless memmon answered with the new state.
+    static func of(_ r: CLIResult, key: String) -> SettingsOutcome {
+        let what = key == "load" ? "Could not read settings" : "Could not change \(SettingsInfo.keyName(key))"
+        if r.timedOut { return .failed("\(what): memmon did not answer within \(String(format: "%g", CLI.ownersTimeout)) s.") }
+        if let e = r.launchError { return .failed("\(what): \(e).") }
+        let j = (try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any]
+        if r.exit == 0, let j, let s = SettingsInfo.decode(j) { return .ok(s) }
+        if let e = j.flatMap({ str($0["error"]) }) { return .failed("\(what): \(e).") }
+        return .failed("\(what): memmon's answer could not be read.")
+    }
+}
+
+/// memmon's notifications switch, read from config.json for the 10 s runner
+/// check. A missing or unreadable file means the default, on; only an
+/// explicit false turns MemmonBar's intervention notices off.
+func notificationsEnabled(configPath: String) -> Bool {
+    guard let d = FileManager.default.contents(atPath: configPath),
+          let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return true }
+    return (j["notifications"] as? Bool) != false
 }
 
 // MARK: - action outcomes
@@ -1977,6 +2074,13 @@ final class Model: ObservableObject {
     var pressureEvents = 0
     /// A suggestion's token is used only from a sample at most this old.
     static let suggestionTTL = 120.0
+
+    /// The Settings panel replaces the list while open.
+    @Published var settingsOpen = false
+    @Published var settings: SettingsInfo?
+    @Published var settingsError: String?
+    /// The setting being changed; every control waits for memmon's answer.
+    @Published var settingsBusy: String?
     /// Off for fixtures: a rendered or audited state must never call memmon.
     /// Confirmed actions are recorded in `actionLog` instead.
     var live = true
@@ -2195,6 +2299,80 @@ final class Model: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = CLI.run(args, timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    func openSettings() {
+        settingsOpen = true
+        settingsError = nil
+        loadSettings()
+    }
+
+    func closeSettings() { settingsOpen = false }
+
+    func loadSettings() { settingsCall(["settings", "--json"], key: "load") }
+
+    /// `memmon settings set <key> <value>`. The panel shows only what memmon
+    /// answers back, never the value it asked for.
+    func changeSetting(_ key: String, _ value: String) {
+        guard settingsBusy == nil else { return }
+        // A gate mode memmon would not honour (MEMMON_GATE wins) is never
+        // written, and neither is one chosen before the source was known.
+        if key == "gate_mode", settings?.gateLocked ?? true { return }
+        settingsCall(["settings", "set", key, value], key: key)
+    }
+
+    func setFlag(_ key: String, _ on: Bool) { changeSetting(key, on ? "true" : "false") }
+
+    /// Pause stays `memmon --off [DURATION]` / `memmon --on`; "forever" is
+    /// --off with no duration, nil is Resume.
+    func pauseProtection(_ duration: String?) {
+        guard settingsBusy == nil else { return }
+        let args = duration == nil ? ["--on"] : duration == "forever" ? ["--off"] : ["--off", duration!]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        settingsBusy = "pause"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout)
+            DispatchQueue.main.async {
+                self.settingsBusy = nil
+                if r.exit != 0 {
+                    self.settingsError = "Could not change the pause: "
+                        + (r.timedOut ? "memmon did not answer." : r.launchError ?? "memmon reported an error.")
+                }
+                self.loadSettings()
+                self.refresh()
+            }
+        }
+    }
+
+    func openDataFolder() {
+        guard let dir = settings?.stateDir else { return }
+        guard live else { actionLog.append("open " + dir); return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: dir, isDirectory: true))
+    }
+
+    /// One argv for both paths, so a fixture logs exactly what memmon gets.
+    private func settingsCall(_ args: [String], key: String) {
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        settingsBusy = key
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = SettingsOutcome.of(CLI.run(args, timeout: CLI.ownersTimeout), key: key)
+            DispatchQueue.main.async {
+                self.settingsBusy = nil
+                self.applySettings(outcome, key: key)
+            }
+        }
+    }
+
+    func applySettings(_ outcome: SettingsOutcome, key: String) {
+        switch outcome {
+        case .ok(let s):
+            settings = s
+            settingsError = nil
+            alerts?.enabled = s.notifications
+            if key != "load" { refresh() }
+        case .failed(let message):
+            settingsError = message
         }
     }
 
@@ -3954,6 +4132,79 @@ struct SuggestionRow: View {
     }
 }
 
+/// A switch drawn in SwiftUI: the native one is an AppKit control that the
+/// offscreen renderer leaves blank.
+struct SwitchToggle: View {
+    var title: String
+    var line: String?
+    var on: Bool
+    var enabled: Bool
+    var onChange: (Bool) -> Void
+
+    var body: some View {
+        Button { if enabled { onChange(!on) } } label: {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(ft(12, .medium)).foregroundColor(P.text)
+                    if let line {
+                        Text(line).font(ft(11)).foregroundColor(P.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                ZStack(alignment: on ? .trailing : .leading) {
+                    Capsule().fill(on ? P.accent : P.soft)
+                        .overlay(Capsule().stroke(on ? Color.clear : P.border, lineWidth: 1))
+                    Circle().fill(on ? P.onTint : P.muted.opacity(0.6)).frame(width: 14, height: 14).padding(2)
+                        .shadow(color: .black.opacity(0.15), radius: 1, y: 0.5)
+                }
+                .frame(width: 32, height: 18)
+                .padding(.top, 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.5)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title + (line.map { ". " + $0 } ?? ""))
+        .accessibilityValue(on ? "on" : "off")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// A segmented choice for a setting, in the ModeSegmented shape.
+struct ChoiceSegmented: View {
+    var choices: [(id: String, label: String, short: String, help: String)]
+    var selected: String
+    var enabled: Bool
+    var onSet: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(choices, id: \.id) { c in
+                let on = c.id == selected
+                Button { if enabled && !on { onSet(c.id) } } label: {
+                    Text(c.short).font(ft(11, on ? .semibold : .regular)).lineLimit(1)
+                        .foregroundColor(on ? P.accent : P.muted)
+                        .frame(maxWidth: .infinity).padding(.vertical, 4)
+                        .background(Capsule().fill(on ? P.accent.opacity(0.14) : Color.clear))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(c.help)
+                .accessibilityLabel(on ? "\(c.label), current choice" : "Choose \(c.label)")
+                .accessibilityHint(c.help)
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(Capsule().fill(P.soft))
+        .overlay(Capsule().stroke(P.border, lineWidth: 1))
+        .opacity(enabled ? 1 : 0.5)
+        .disabled(!enabled)
+    }
+}
+
 struct BodyHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
@@ -4275,13 +4526,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             header.background(GeometryReader { Color.clear.preference(key: ChromeHeightKey.self, value: $0.size.height) })
             Rectangle().fill(P.border).frame(height: 1)
-            if let snap = model.snap {
+            if model.snap != nil || model.settingsOpen {
                 if flattened {
-                    content(snap)
+                    mainBody
                 } else {
                     ScrollViewReader { proxy in
                         ScrollView {
-                            content(snap).background(GeometryReader {
+                            mainBody.background(GeometryReader {
                                 Color.clear.preference(key: BodyHeightKey.self, value: $0.size.height)
                             })
                         }
@@ -4301,6 +4552,15 @@ struct ContentView: View {
         }
         .onPreferenceChange(BodyHeightKey.self) { bodyHeight = $0 }
         .onPreferenceChange(ChromeHeightKey.self) { chromeHeight = $0 }
+    }
+
+    /// The list, or the Settings panel in its place.
+    @ViewBuilder private var mainBody: some View {
+        if model.settingsOpen {
+            settingsPanel
+        } else if let snap = model.snap {
+            content(snap)
+        }
     }
 
     private var loading: some View {
@@ -4338,9 +4598,149 @@ struct ContentView: View {
             StatusPill(state: statusState(model.snap, refreshing: model.refreshing,
                                           stillSampling: model.stillSampling))
                 .id(model.tick)
+            ActionButton(title: "Settings", icon: model.settingsOpen ? "xmark" : "gearshape", variant: .icon) {
+                withAnimation(motion(0.12)) {
+                    if model.settingsOpen { model.closeSettings() } else { model.openSettings() }
+                }
+            }
+            .help(model.settingsOpen ? "Close settings" : "Settings")
+            .accessibilityLabel(model.settingsOpen ? "Close settings" : "Settings")
         }
         .padding(.horizontal, 16).padding(.top, 13).padding(.bottom, 12)
         .background(LinearGradient(colors: [P.headerTop, P.headerBottom], startPoint: .top, endPoint: .bottom))
+    }
+
+    // MARK: settings (D43)
+
+    private func settingsCard<C: View>(_ title: String, _ icon: String, @ViewBuilder _ body: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 12, weight: .medium)).foregroundColor(P.muted)
+                    .accessibilityHidden(true)
+                Text(title).font(ft(13, .medium)).foregroundColor(P.text).accessibilityAddTraits(.isHeader)
+            }
+            body()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel(12)
+    }
+
+    private var settingsPanel: some View {
+        let busy = model.settingsBusy != nil
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Settings").font(ft(15, .semibold)).accessibilityAddTraits(.isHeader)
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                ActionButton(title: "Done", variant: .link) { withAnimation(motion(0.12)) { model.closeSettings() } }
+                    .accessibilityLabel("Close settings")
+            }
+            .padding(.horizontal, 4)
+            if let e = model.settingsError {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "xmark.octagon").font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(P.red).padding(.top, 1).accessibilityHidden(true)
+                    Text(e).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ActionButton(title: "Dismiss", icon: "xmark", variant: .icon) { model.settingsError = nil }
+                        .accessibilityLabel("Dismiss the settings error")
+                        .padding(.top, -3)
+                }
+                .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(P.panel))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(P.red.opacity(0.62), lineWidth: 1))
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Settings error: " + e)
+            }
+            if let st = model.settings {
+                settingsCards(st, busy: busy)
+            } else if model.settingsError == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading settings…").font(ft(12)).foregroundColor(P.muted)
+                }
+                .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ActionButton(title: "Try again", icon: "arrow.clockwise") { model.loadSettings() }
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 12)
+        .onExitCommand { withAnimation(motion(0.12)) { model.closeSettings() } }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings")
+    }
+
+    @ViewBuilder private func settingsCards(_ st: SettingsInfo, busy: Bool) -> some View {
+        let gate = SettingsInfo.gateChoice(st.gateMode)
+        settingsCard("Command protection", "shield") {
+            HStack(spacing: 8) {
+                Text("Stop heavy commands at").font(ft(11)).foregroundColor(P.muted).lineLimit(1).fixedSize()
+                ChoiceSegmented(choices: st.gateChoices.map { m in
+                    let c = SettingsInfo.gateChoice(m)
+                    return (m, c.label, c.short, c.label + ": " + c.line)
+                }, selected: st.gateMode, enabled: !busy && !st.gateLocked) { model.changeSetting("gate_mode", $0) }
+            }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Gate mode, \(gate.label)" + (st.gateLocked ? ", locked: " + (st.warning ?? SettingsInfo.envWarning) : ""))
+            Text(gate.line).font(ft(11)).foregroundColor(P.muted).fixedSize(horizontal: false, vertical: true)
+            if st.gateLocked {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "lock").font(.system(size: 11, weight: .semibold)).padding(.top, 1)
+                    Text(st.warning ?? SettingsInfo.envWarning).font(ft(11))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundColor(P.amber)
+                .accessibilityElement(children: .combine)
+            }
+            Rectangle().fill(P.border).frame(height: 1)
+            Text(st.pausedForever ? "Paused until you resume · every command runs without a memory check"
+                 : st.paused ? "Paused until \(eventTime(st.pausedUntil ?? 0)) · every command runs without a memory check"
+                 : "Not paused")
+                .font(ft(11)).foregroundColor(st.paused ? P.amber : P.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach([("1 h", "1h"), ("8 h", "8h"), ("Until resumed", "forever")], id: \.1) { label, d in
+                    ActionButton(title: label) { model.pauseProtection(d) }
+                        .accessibilityLabel(d == "forever" ? "Pause command protection until resumed"
+                                                           : "Pause command protection for \(label)")
+                }
+                Spacer(minLength: 0)
+                if st.paused {
+                    ActionButton(title: "Resume", icon: "play.fill", variant: .primary) { model.pauseProtection(nil) }
+                        .accessibilityLabel("Resume command protection")
+                }
+            }
+            .disabled(busy).opacity(busy ? 0.5 : 1)
+        }
+        settingsCard("Managed jobs", "list.bullet.rectangle") {
+            if let mode = st.runnerMode {
+                ModeSegmented(mode: mode) { model.changeSetting("runner_mode", $0) }
+                    .disabled(busy).opacity(busy ? 0.5 : 1)
+            }
+            SwitchToggle(title: "Auto-cancel interruptible jobs under CRITICAL",
+                         line: "memmon stops jobs started with --interruptible after 10 s at CRITICAL",
+                         on: st.autoCancel, enabled: !busy) { model.setFlag("auto_cancel_interruptible", $0) }
+        }
+        settingsCard("Under pressure", "exclamationmark.triangle") {
+            SwitchToggle(title: "Suggest stops under pressure",
+                         line: "Lists heavy jobs memmon can’t hold. memmon never stops them on its own.",
+                         on: st.suggestions, enabled: !busy) { model.setFlag("pressure_suggestions", $0) }
+            SwitchToggle(title: "Notifications",
+                         line: "Sampling gaps, stop suggestions and managed jobs that need you",
+                         on: st.notifications, enabled: !busy) { model.setFlag("notifications", $0) }
+        }
+        if let dir = st.stateDir {
+            HStack(spacing: 8) {
+                ActionButton(title: "Open data folder", icon: "folder") { model.openDataFolder() }
+                    .accessibilityLabel("Open data folder")
+                Text((dir as NSString).abbreviatingWithTildeInPath)
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(P.muted)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            .padding(.horizontal, 4)
+        }
     }
 
     private func content(_ s: OwnersSnap) -> some View {
@@ -5134,6 +5534,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let model = Model()
     let cache = NSString(string: "~/.claude/memmon/latest.json").expandingTildeInPath
     let runnerDir = NSString(string: "~/.claude/memmon/runner").expandingTildeInPath
+    let configPath = NSString(string: "~/.claude/memmon/config.json").expandingTildeInPath
     let pressureWatch = PressureWatch()
     /// One runner read at a time; a slow disk skips a tick instead of piling up.
     var readingRunner = false
@@ -5161,11 +5562,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
             guard !self.readingRunner, self.model.alerts != nil else { return }
             self.readingRunner = true
-            let dir = self.runnerDir
+            let dir = self.runnerDir, config = self.configPath
             DispatchQueue.global(qos: .utility).async {
                 let rows = runnerRows(dir)
+                let on = notificationsEnabled(configPath: config)
                 DispatchQueue.main.async {
                     self.readingRunner = false
+                    self.model.alerts?.enabled = on
                     self.model.alerts?.observe(rows)
                 }
             }
@@ -5237,7 +5640,13 @@ struct RenderOptions {
     var confirmSuggestion: String?
     /// The gap notice key already dismissed.
     var dismissedGap: Double?
+    /// The Settings panel is open, showing `_settings`, after an optional
+    /// `settings_set` outcome ({key, exit, stdout}).
+    var settings = false
 }
+
+/// The fixture's own `_view`, for view state richer than RenderOptions holds.
+var fixtureView: [String: Any] = [:]
 
 /// A fixture may name a `_base` fixture whose keys it overrides, and carries
 /// its own view state in `_view`; command-line flags win over both.
@@ -5277,6 +5686,8 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.showAll = view["show_all"] as? [String] ?? []
     o.confirmSuggestion = argValue("--confirm-suggestion") ?? str(view["confirm_suggestion"])
     o.dismissedGap = argValue("--dismissed-gap").flatMap(Double.init) ?? num(view["dismissed_gap"])
+    o.settings = ARGS.contains("--settings") || (view["settings"] as? Bool ?? false)
+    fixtureView = view
     return o
 }
 
@@ -5303,6 +5714,17 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
         m.showAll.insert(sec)
     }
     if let d = o.dismissedGap { m.prefs.set(d, PrefKey.dismissedGap) }
+    if o.settings {
+        m.settingsOpen = true
+        m.settings = (json["_settings"] as? [String: Any]).flatMap(SettingsInfo.decode)
+        if let set = fixtureView["settings_set"] as? [String: Any] {
+            var r = CLIResult(exit: int(set["exit"]).map { Int32($0) }, stdout: Data())
+            if let obj = set["stdout"], JSONSerialization.isValidJSONObject(obj) {
+                r.stdout = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+            }
+            m.applySettings(SettingsOutcome.of(r, key: str(set["key"]) ?? "load"), key: "load")
+        }
+    }
     if let id = o.confirmSuggestion {
         guard let sg = snap.suggestions.first(where: { $0.id == id }) else { fail("no suggestion \(id) in the fixture") }
         m.ask(.suggestion(sg.asJob), snap.owners.first { $0.id == sg.ownerId }
@@ -5778,6 +6200,51 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     report["next"] = gapNotice(n, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
                 }
                 report["stored"] = model.dismissedGap ?? NSNull()
+            case "settings":
+                // Drive the panel's controls in order (`--do a,b`), in fixture
+                // mode or, with `--script`, against a stub memmon.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                final class Count: Notifier {
+                    var n = 0
+                    func post(id: String, title: String, body: String, done: @escaping (Bool) -> Void) { n += 1; done(true) }
+                }
+                let posts = Count()
+                model.alerts = InterventionAlerts(notifier: posts, store: MemoryStore())
+                var jobSeq = 0
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    let parts = step.split(separator: ":", maxSplits: 1).map(String.init)
+                    let v = parts.count > 1 ? parts[1] : ""
+                    switch parts[0] {
+                    case "open": model.openSettings()
+                    case "close": model.closeSettings()
+                    case "gate": model.changeSetting("gate_mode", v)
+                    case "runner": model.changeSetting("runner_mode", v)
+                    case "auto": model.setFlag("auto_cancel_interruptible", v == "on")
+                    case "suggest": model.setFlag("pressure_suggestions", v == "on")
+                    case "notify": model.setFlag("notifications", v == "on")
+                    case "pause": model.pauseProtection(v)
+                    case "resume": model.pauseProtection(nil)
+                    case "folder": model.openDataFolder()
+                    case "intervene":
+                        // A new job needing intervention reaches the alerts.
+                        jobSeq += 1
+                        model.alerts?.observe([ManagedJob(id: String(format: "%032x", jobSeq), resource: "heavy",
+                                                          label: "Search index rebuild", state: "intervention_needed",
+                                                          reason: "", elapsed: 1)])
+                    default: fail("unknown settings step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && model.settingsBusy != nil { spin(0.05) }
+                }
+                report["actions"] = model.actionLog
+                report["open"] = model.settingsOpen
+                report["error"] = model.settingsError ?? NSNull()
+                report["gate_mode"] = model.settings?.gateMode ?? NSNull()
+                report["locked"] = model.settings?.gateLocked ?? NSNull()
+                report["notifications"] = model.settings?.notifications ?? NSNull()
+                report["alerts_enabled"] = model.alerts?.enabled ?? NSNull()
+                report["posted"] = posts.n
             case "run-mode":
                 guard let mode = argValue("--mode") else { fail("run-mode needs --mode") }
                 if let script = argValue("--script") { CLI.script = script; model.live = true }
@@ -6181,6 +6648,7 @@ if ARGS.contains("--notify-probe") {
     rec.failures = argValue("--fail-adds").flatMap(Int.init) ?? 0
     let store: PrefStore = argValue("--store").map { FileStore(path: $0) } ?? MemoryStore()
     let alerts = InterventionAlerts(notifier: rec, store: store)
+    if let cfg = argValue("--config") { alerts.enabled = notificationsEnabled(configPath: cfg) }
     let rounds = seq.map { alerts.observe($0.map(ManagedJob.decode)) }
     if let dir = argValue("--runner-dir") { _ = alerts.observe(runnerRows(dir)) }
     let data = try! JSONSerialization.data(withJSONObject: ["rounds": rounds, "posted": rec.posted,
