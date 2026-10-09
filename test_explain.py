@@ -44,7 +44,8 @@ def payload():
          "footprint_bytes": int(9.5 * GB), "activity": "Running · cd ~/code/acme-web && pnpm test",
          "cpu_cores": 1.2, "root": {"pid": 4242, "start": [1, 2]}, "token": TOKEN,
          "cwd": "/Volumes/someone/acme-web",
-         "jobs": [{"kind": "test", "label": "vitest", "footprint_bytes": int(8.8 * GB),
+         "jobs": [{"job_id": "4300.1.2", "kind": "test", "label": "vitest",
+                   "footprint_bytes": int(8.8 * GB), "action": "stop-job",
                    "root": {"pid": 4300}, "token": TOKEN},
                   {"kind": "conversation", "label": "Conversation", "footprint_bytes": GB}]},
         {"owner_id": "service:vm:colima", "kind": "service", "title": "VM · colima",
@@ -250,6 +251,7 @@ class ModeTests(unittest.TestCase):
             self.assertIn(want, s)
         cands = [l for l in s.splitlines() if re.match(r"\d+\. ", l)]
         self.assertLessEqual(len(cands), ex.STOP_CANDIDATES)
+        self.assertEqual(sum('"vitest"' in l for l in cands), 1, "a suggested job is listed once")
 
     def test_patterns_summary_content_and_hygiene(self):
         p = quiet_payload()
