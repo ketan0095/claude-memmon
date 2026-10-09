@@ -2155,3 +2155,89 @@ class NotificationClickTests(unittest.TestCase):
         info = r["posted"][0]["user_info"]
         self.assertEqual(info, {"run_id": "a" * 32, "state": "intervention_needed",
                                 "label": "Search index rebuild", "wrapper_pid": 48500, "child_pid": 48501})
+
+
+class UsageCardTests(StubCase):
+    """D45: the "Last 7 days" card. It is collapsed by default, reads
+    history only while open (cached 5 min), and never invents a day."""
+
+    def probe(self, fixture):
+        return s2(fixture)["s2"]["usage"]
+
+    def test_three_views_decode_and_summarise(self):
+        u = self.probe("usage-protection.json")["views"]
+        self.assertEqual([b["label"] for b in u["memory"]["bars"]], ["Fri", "Sat", "Sun", "Mon", "Tue", "Wed", "Thu"])
+        self.assertEqual(u["memory"]["summary"], "Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.")
+        self.assertEqual(u["memory"]["bars"][4]["spoken"], "Tue, peak 44.1 GB, average 33.8 GB")
+        self.assertEqual(u["consumers"]["summary"],
+                         "Top consumers on average: Claude sessions 11.2 GB, Shared services 7.1 GB, Mac apps 4.6 GB.")
+        self.assertEqual(u["protection"]["summary"],
+                         "16 warned and 7 stopped this week; managed jobs held 7, cancelled 1.")
+        self.assertIn("managed-job holds and cancels not recorded",
+                      self.probe("usage-memory.json")["views"]["protection"]["summary"])
+
+    def test_empty_days_stay_empty(self):
+        u = self.probe("usage-empty-days.json")["views"]
+        for view in ("memory", "consumers"):
+            sat, sun = u[view]["bars"][1], u[view]["bars"][2]
+            self.assertEqual((sat["fraction"], sat["empty"], sat["spoken"]), (None, True, "Sat, no samples"), view)
+            self.assertEqual(sun["fraction"], None, view)
+        tue = u["memory"]["bars"][4]
+        self.assertTrue(tue["few"])
+        self.assertTrue(tue["spoken"].endswith("only 42 samples"))
+        found = said("usage-empty-days.json")
+        self.assertIn("Sat, no samples", found)
+        self.assertTrue(any("No samples: Sat, Sun" in l for l in found), found)
+        self.assertTrue(any("Few samples: Tue (42)" in l for l in found), found)
+
+    def test_a_day_with_no_samples_drops_any_values_it_carries(self):
+        p = payload("usage-empty-days.json")
+        p["_usage"]["series"][1].update(mem_peak_bytes=40 * 1024 ** 3, by_section={"claude": 1})
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "memory"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]["views"]
+        self.assertIsNone(u["memory"]["bars"][1]["fraction"])
+        self.assertIsNone(u["consumers"]["bars"][1]["fraction"])
+
+    def stub(self):
+        calls = self.dir / "calls.jsonl"
+        owners = self.dir / "owners.json"
+        owners.write_text(json.dumps(effective(FIXTURES / "overview.json")))
+        usage = effective(FIXTURES / "usage-memory.json")["_usage"]
+        script = self.dir / "memmon_usage.py"
+        script.write_text(
+            "import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:2] == ['usage']:\n"
+            f"    print(json.dumps({usage!r}))\n"
+            "else:\n"
+            f"    print(open({str(owners)!r}).read())\n")
+        return str(script), calls
+
+    def calls(self, path):
+        return [json.loads(l)[0] for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_no_fetch_while_collapsed_or_on_refresh(self):
+        script, calls = self.stub()
+        r = host("usage", FIXTURES / "overview.json", "--script", script, "--do", "refresh,refresh")
+        self.assertFalse(r["open"])
+        self.assertEqual(self.calls(calls), ["owners", "owners"])
+        r = host("usage", FIXTURES / "overview.json", "--script", script, "--do", "expand,refresh,view:consumers")
+        self.assertTrue(r["loaded"])
+        self.assertEqual(self.calls(calls).count("usage"), 1)
+
+    def test_history_is_cached_for_five_minutes(self):
+        script, calls = self.stub()
+        host("usage", FIXTURES / "overview.json", "--script", script,
+             "--do", "expand,collapse,age:299,expand,collapse,age:2,expand")
+        self.assertEqual(self.calls(calls).count("usage"), 2)
+
+    def test_collapsed_by_default_and_spoken_as_one_line(self):
+        self.assertIn("Last 7 days", said("overview.json"))
+        cached = said("usage-collapsed.json")
+        self.assertIn("Last 7 days, Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", cached)
+        expanded = said("usage-memory.json")
+        self.assertIn("Today’s peak 41.2 GB of 48.0 GB; highest this week 44.1 GB.", expanded)
+        self.assertIn("Fri, peak 34.2 GB, average 26.1 GB", expanded)
+        self.assertIn("Choose Top consumers", expanded)

@@ -1557,6 +1557,148 @@ func notificationsEnabled(configPath: String) -> Bool {
     return (j["notifications"] as? Bool) != false
 }
 
+// MARK: - usage history (D45)
+
+/// One day of `memmon usage --json`. A day the sampler never ran has
+/// samples 0 and nulls; nothing is interpolated.
+struct UsageDay: Identifiable {
+    var date: String
+    var samples: Int
+    var peak: Double?, avg: Double?
+    var bySection: [String: Double] = [:]
+    var warned: Int?, stopped: Int?
+    var held: Int?, cancelled: Int?
+    var id: String { date }
+    var empty: Bool { samples == 0 }
+
+    /// A full day at one sample a minute is 1440; under a tenth of that the
+    /// day is shown with its count, because it may not be representative.
+    var few: Bool { samples > 0 && samples < 144 }
+
+    /// "Mon" for a "YYYY-MM-DD" date, in a fixed English calendar.
+    var weekday: String {
+        let p = DateFormatter(); p.locale = Locale(identifier: "en_US_POSIX"); p.dateFormat = "yyyy-MM-dd"
+        guard let d = p.date(from: date) else { return date }
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE"
+        return f.string(from: d)
+    }
+}
+
+struct UsageData {
+    var days: [UsageDay]
+    var ram: Double?
+    var complete: Bool?
+
+    /// The sections memmon reports, in ring order, each with the ring's colour.
+    static let sections: [(key: String, name: String)] = [
+        ("claude", "Claude sessions"), ("codex", "Codex"), ("browser", "Browsers"),
+        ("app", "Mac apps"), ("service", "Shared services"), ("other", "Other"),
+    ]
+
+    static func color(_ key: String) -> Color {
+        switch key {
+        case "claude": return P.sectionClaude
+        case "codex": return P.sectionCodex
+        case "browser": return P.sectionBrowser
+        case "app": return P.sectionApp
+        case "service": return P.sectionService
+        default: return P.system
+        }
+    }
+
+    static func decode(_ j: [String: Any]) -> UsageData? {
+        guard num(j["schema_version"]) != nil, let rows = j["series"] as? [[String: Any]] else { return nil }
+        let days = rows.compactMap { d -> UsageDay? in
+            guard let date = str(d["date"]) else { return nil }
+            var u = UsageDay(date: date, samples: int(d["samples"]) ?? 0)
+            u.peak = num(d["mem_peak_bytes"]); u.avg = num(d["mem_avg_bytes"])
+            for (k, v) in d["by_section"] as? [String: Any] ?? [:] { if let b = num(v) { u.bySection[k] = b } }
+            if let g = d["gate"] as? [String: Any] { u.warned = int(g["warned"]); u.stopped = int(g["stopped"]) }
+            if let r = d["runner"] as? [String: Any] { u.held = int(r["held"]); u.cancelled = int(r["cancelled"]) }
+            if u.empty { u.peak = nil; u.avg = nil; u.bySection = [:] }    // a day with no samples has no values
+            return u
+        }
+        return UsageData(days: days, ram: num(j["ram_bytes"]),
+                         complete: (j["coverage"] as? [String: Any])?["complete"] as? Bool)
+    }
+
+    /// The sections with the most memory over the days that have samples.
+    var topSections: [(key: String, name: String, avg: Double)] {
+        let measured = days.filter { !$0.empty }
+        guard !measured.isEmpty else { return [] }
+        return UsageData.sections.compactMap { s -> (String, String, Double)? in
+            let total = measured.reduce(0) { $0 + ($1.bySection[s.key] ?? 0) }
+            return total > 0 ? (s.key, s.name, total / Double(measured.count)) : nil
+        }.sorted { $0.2 > $1.2 }.prefix(3).map { $0 }
+    }
+
+    var runnerRecorded: Bool { days.contains { $0.held != nil || $0.cancelled != nil } }
+}
+
+enum UsageView: String, CaseIterable {
+    case memory, consumers, protection
+    var label: String {
+        switch self {
+        case .memory: return "Memory"
+        case .consumers: return "Top consumers"
+        case .protection: return "Protection"
+        }
+    }
+}
+
+/// One bar as the chart draws and speaks it.
+struct UsageBar {
+    var day: UsageDay
+    var label: String
+    var fraction: Double?       // nil: no samples, drawn as a stub
+    var spoken: String
+}
+
+/// The bars and the summary sentence for one view. Empty days stay empty.
+func usageBars(_ u: UsageData, _ view: UsageView) -> (bars: [UsageBar], summary: String) {
+    switch view {
+    case .memory:
+        let top = max(u.ram ?? 0, u.days.compactMap { $0.peak }.max() ?? 0, 1)
+        let bars = u.days.map { d -> UsageBar in
+            guard !d.empty, let p = d.peak else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
+            var s = "\(d.weekday), peak \(gb(p))" + (d.avg.map { ", average \(gb($0))" } ?? "")
+            if d.few { s += ", only \(plural(d.samples, "sample"))" }
+            return UsageBar(day: d, label: d.weekday, fraction: p / top, spoken: s)
+        }
+        let today = u.days.last
+        let head = today.flatMap { $0.peak }.map { "Today’s peak \(gb($0))" + (u.ram.map { " of \(gb($0))" } ?? "") }
+            ?? "No samples today"
+        let peaks = u.days.compactMap { $0.peak }
+        return (bars, head + (peaks.isEmpty ? "" : "; highest this week \(gb(peaks.max()!))") + ".")
+    case .consumers:
+        let totals = u.days.map { d in d.bySection.values.reduce(0, +) }
+        let top = max(totals.max() ?? 0, 1)
+        let bars = u.days.enumerated().map { k, d -> UsageBar in
+            guard !d.empty, totals[k] > 0 else { return UsageBar(day: d, label: d.weekday, fraction: nil, spoken: "\(d.weekday), no samples") }
+            let parts = UsageData.sections.compactMap { s in d.bySection[s.key].flatMap { $0 > 0 ? "\(s.name) \(gb($0))" : nil } }
+            return UsageBar(day: d, label: d.weekday, fraction: totals[k] / top,
+                            spoken: "\(d.weekday), " + parts.joined(separator: ", "))
+        }
+        let names = u.topSections.map { "\($0.name) \(gb($0.avg))" }
+        return (bars, names.isEmpty ? "No samples this week." : "Top consumers on average: " + names.joined(separator: ", ") + ".")
+    case .protection:
+        let top = Double(max(u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0, 1))
+        let bars = u.days.map { d -> UsageBar in
+            let w = d.warned ?? 0, st = d.stopped ?? 0
+            return UsageBar(day: d, label: d.weekday, fraction: Double(w + st) / top,
+                            spoken: "\(d.weekday), \(w) warned, \(st) stopped")
+        }
+        let w = u.days.reduce(0) { $0 + ($1.warned ?? 0) }, st = u.days.reduce(0) { $0 + ($1.stopped ?? 0) }
+        var s = "\(w) warned and \(st) stopped this week"
+        if u.runnerRecorded {
+            s += "; managed jobs held \(u.days.reduce(0) { $0 + ($1.held ?? 0) }), cancelled \(u.days.reduce(0) { $0 + ($1.cancelled ?? 0) })"
+        } else {
+            s += "; managed-job holds and cancels not recorded"
+        }
+        return (bars, s + ".")
+    }
+}
+
 // MARK: - action outcomes
 
 struct ActOutcome {
@@ -2131,6 +2273,17 @@ final class Model: ObservableObject {
     @Published var settingsError: String?
     /// The setting being changed; every control waits for memmon's answer.
     @Published var settingsBusy: String?
+
+    /// The "Last 7 days" card: collapsed by default, and history is read
+    /// only once it is opened, never on the refresh path.
+    @Published var usageOpen = false
+    @Published var usageView: UsageView = .memory
+    @Published var usage: UsageData?
+    @Published var usageError: String?
+    @Published var usageLoading = false
+    /// When the cached history was read, on `clock`; it is kept 5 min.
+    var usageFetchedAt: Double?
+    static let usageTTL = 300.0
     /// Off for fixtures: a rendered or audited state must never call memmon.
     /// Confirmed actions are recorded in `actionLog` instead.
     var live = true
@@ -2398,6 +2551,36 @@ final class Model: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = CLI.run(args, timeout: CLI.ownersTimeout)
             DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    func toggleUsage() {
+        usageOpen.toggle()
+        if usageOpen { loadUsage() }
+    }
+
+    /// `memmon usage --json`, only while the card is open and the cache is
+    /// older than 5 min (or empty).
+    func loadUsage() {
+        guard usageOpen, !usageLoading else { return }
+        if usage != nil, let at = usageFetchedAt, clock() - at < Model.usageTTL { return }
+        let args = ["usage", "--json"]
+        guard live else { actionLog.append("memmon " + args.joined(separator: " ")); return }
+        usageLoading = true
+        usageError = nil
+        DispatchQueue.global(qos: .utility).async {
+            let r = CLI.run(args, timeout: CLI.ownersTimeout)
+            let parsed = r.exit == 0 ? ((try? JSONSerialization.jsonObject(with: r.stdout)) as? [String: Any])
+                .flatMap(UsageData.decode) : nil
+            DispatchQueue.main.async {
+                self.usageLoading = false
+                if let parsed {
+                    self.usage = parsed
+                    self.usageFetchedAt = self.clock()
+                } else {
+                    self.usageError = r.timedOut ? "memmon did not answer in time" : "memmon could not read the history"
+                }
+            }
         }
     }
 
@@ -4304,6 +4487,231 @@ struct ChoiceSegmented: View {
     }
 }
 
+/// The "Last 7 days" card (D45). Collapsed it is one quiet line; its
+/// sparkline shows only history already read, never a fetch of its own.
+struct UsageCard: View {
+    @ObservedObject var model: Model
+    var animate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var grown = false
+
+    static let chartHeight: CGFloat = 84
+    private var motion: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.16) }
+    private var growth: CGFloat { animate && !reduceMotion && !grown ? 0 : 1 }
+
+    var body: some View {
+        if model.usageOpen { expanded } else { collapsed }
+    }
+
+    private var collapsed: some View {
+        let today = model.usage?.days.last?.peak
+        return Button { withAnimation(motion) { model.toggleUsage() } } label: {
+            HStack(spacing: 8) {
+                Chevron(open: false)
+                Text("Last 7 days").font(ft(12, .medium)).foregroundColor(P.text)
+                Spacer(minLength: 6)
+                sparkline
+                if let today { Text("today \(gb(today))").font(ft(11)).foregroundColor(P.muted).monospacedDigit() }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .panel(10)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Last 7 days" + (model.usage.map { ", " + usageBars($0, .memory).summary } ?? ""))
+        .accessibilityValue("collapsed")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var sparkline: some View {
+        let bars = model.usage.map { usageBars($0, .memory).bars }
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(0..<7, id: \.self) { k in
+                let f = bars.flatMap { k < $0.count ? $0[k].fraction : nil }
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(f == nil ? P.border : P.accent.opacity(0.75))
+                    .frame(width: 3, height: f.map { 3 + 11 * CGFloat($0) } ?? 3)
+            }
+        }
+        .frame(height: 14, alignment: .bottom)
+        .accessibilityHidden(true)
+    }
+
+    private var expanded: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Button { withAnimation(motion) { model.toggleUsage() } } label: {
+                HStack(spacing: 8) {
+                    Chevron(open: true)
+                    Text("Last 7 days").font(ft(13, .medium)).foregroundColor(P.text)
+                    Spacer()
+                    if model.usageLoading { ProgressView().controlSize(.small) }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Last 7 days")
+            .accessibilityValue("expanded")
+            ChoiceSegmented(choices: UsageView.allCases.map { ($0.rawValue, $0.label, $0.label, $0.label) },
+                            selected: model.usageView.rawValue, enabled: true) { v in
+                withAnimation(motion) { model.usageView = UsageView(rawValue: v) ?? .memory }
+            }
+            if let u = model.usage {
+                chart(u)
+            } else if let e = model.usageError {
+                HStack(spacing: 8) {
+                    Text("Could not read the last 7 days: \(e).").font(ft(12)).foregroundColor(P.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    ActionButton(title: "Try again", icon: "arrow.clockwise") { model.loadUsage() }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading the last 7 days…").font(ft(12)).foregroundColor(P.muted)
+                }
+                .frame(maxWidth: .infinity, minHeight: 60)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .panel(12)
+        .onAppear { if animate && !reduceMotion { withAnimation(.easeOut(duration: 0.5)) { grown = true } } }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Last 7 days")
+    }
+
+    @ViewBuilder private func chart(_ u: UsageData) -> some View {
+        let view = model.usageView
+        let (bars, summary) = usageBars(u, view)
+        Text(summary).font(ft(12)).foregroundColor(P.text).fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(summary)
+        ZStack(alignment: .bottomLeading) {
+            HStack(alignment: .bottom, spacing: 10) {
+                ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
+                    column(bar, u, view)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .help(bar.spoken)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(bar.spoken)
+                }
+            }
+            if view == .memory, let ram = u.ram {
+                let top = max(ram, u.days.compactMap { $0.peak }.max() ?? 0, 1)
+                Rectangle().stroke(P.muted.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .frame(height: 1)
+                    .offset(y: -UsageCard.chartHeight * CGFloat(ram / top))
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(height: UsageCard.chartHeight)
+        .animation(reduceMotion || !animate ? nil : .easeOut(duration: 0.3), value: view)
+        HStack(spacing: 10) {
+            ForEach(Array(bars.enumerated()), id: \.offset) { _, bar in
+                Text(bar.label).font(ft(10)).foregroundColor(bar.day.empty ? P.muted.opacity(0.6) : P.muted)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .accessibilityHidden(true)
+        legend(u, view)
+        notes(u)
+    }
+
+    @ViewBuilder private func column(_ bar: UsageBar, _ u: UsageData, _ view: UsageView) -> some View {
+        let h = UsageCard.chartHeight
+        if bar.day.empty && view != .protection {
+            // No samples: a faint stub, never a guessed value.
+            RoundedRectangle(cornerRadius: 1.5).fill(P.border).frame(width: 14, height: 3)
+        } else {
+            switch view {
+            case .memory:
+                let top = max(u.ram ?? 0, u.days.compactMap { $0.peak }.max() ?? 0, 1)
+                ZStack(alignment: .bottom) {
+                    RoundedRectangle(cornerRadius: 3).fill(P.accent.opacity(bar.day.few ? 0.45 : 0.85))
+                        .frame(width: 14, height: max(2, h * CGFloat(bar.fraction ?? 0) * growth))
+                    if let avg = bar.day.avg {
+                        Circle().fill(P.text).frame(width: 5, height: 5)
+                            .offset(y: -h * CGFloat(avg / top) * growth + 2.5)
+                    }
+                }
+            case .consumers:
+                let total = bar.day.bySection.values.reduce(0, +)
+                let k = total > 0 ? CGFloat(bar.fraction ?? 0) / CGFloat(total) : 0
+                VStack(spacing: 1) {
+                    ForEach(UsageData.sections.reversed(), id: \.key) { s in
+                        if let v = bar.day.bySection[s.key], v > 0 {
+                            Rectangle().fill(UsageData.color(s.key)).frame(height: max(1, h * k * CGFloat(v) * growth))
+                        }
+                    }
+                }
+                .frame(width: 14)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .opacity(bar.day.few ? 0.55 : 1)
+            case .protection:
+                let top = CGFloat(max(u.days.map { ($0.warned ?? 0) + ($0.stopped ?? 0) }.max() ?? 0, 1))
+                HStack(alignment: .bottom, spacing: 2) {
+                    RoundedRectangle(cornerRadius: 2).fill(P.amber)
+                        .frame(width: 6, height: max(2, h * CGFloat(bar.day.warned ?? 0) / top * growth))
+                    RoundedRectangle(cornerRadius: 2).fill(P.red)
+                        .frame(width: 6, height: max(2, h * CGFloat(bar.day.stopped ?? 0) / top * growth))
+                }
+                .opacity((bar.day.warned ?? 0) + (bar.day.stopped ?? 0) == 0 ? 0.35 : 1)
+            }
+        }
+    }
+
+    @ViewBuilder private func legend(_ u: UsageData, _ view: UsageView) -> some View {
+        HStack(spacing: 12) {
+            switch view {
+            case .memory:
+                legendItem(P.accent.opacity(0.85), "Daily peak")
+                legendItem(P.text, "Average", dot: true)
+                if u.ram != nil { legendItem(P.muted, "RAM", dashed: true) }
+            case .consumers:
+                ForEach(u.topSections, id: \.key) { s in legendItem(UsageData.color(s.key), s.name) }
+            case .protection:
+                legendItem(P.amber, "Warned")
+                legendItem(P.red, "Stopped")
+            }
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        if view == .protection {
+            Text(u.runnerRecorded
+                 ? "Managed jobs: held \(u.days.reduce(0) { $0 + ($1.held ?? 0) }) · cancelled \(u.days.reduce(0) { $0 + ($1.cancelled ?? 0) })"
+                 : "Managed-job holds and cancels: not recorded")
+                .font(ft(11)).foregroundColor(P.muted)
+        }
+    }
+
+    private func legendItem(_ c: Color, _ name: String, dot: Bool = false, dashed: Bool = false) -> some View {
+        HStack(spacing: 5) {
+            if dashed {
+                Rectangle().stroke(c, style: StrokeStyle(lineWidth: 1, dash: [3, 2])).frame(width: 12, height: 1)
+            } else if dot {
+                Circle().fill(c).frame(width: 5, height: 5)
+            } else {
+                RoundedRectangle(cornerRadius: 2).fill(c).frame(width: 8, height: 8)
+            }
+            Text(name).font(ft(11)).foregroundColor(P.muted).lineLimit(1)
+        }
+    }
+
+    /// Days with no samples, or too few to stand for the day, are named.
+    @ViewBuilder private func notes(_ u: UsageData) -> some View {
+        let empty = u.days.filter { $0.empty }.map { $0.weekday }
+        let few = u.days.filter { $0.few }.map { "\($0.weekday) (\($0.samples))" }
+        if !empty.isEmpty || !few.isEmpty || u.complete == false {
+            VStack(alignment: .leading, spacing: 2) {
+                if !empty.isEmpty { Text("No samples: " + empty.joined(separator: ", ")) }
+                if !few.isEmpty { Text("Few samples: " + few.joined(separator: ", ")) }
+                if u.complete == false { Text("History before \(u.days.first?.weekday ?? "this week") is incomplete.") }
+            }
+            .font(ft(11)).foregroundColor(P.muted)
+            .accessibilityElement(children: .combine)
+        }
+    }
+}
+
 struct BodyHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
@@ -4864,6 +5272,7 @@ struct ContentView: View {
             if !s.shownSuggestions.isEmpty {
                 underPressure(s).padding(.horizontal, 12).padding(.bottom, 12)
             }
+            UsageCard(model: model, animate: !flattened).padding(.horizontal, 12).padding(.bottom, 12)
             toolbar.padding(.horizontal, 16).padding(.bottom, 8)
             HStack {
                 Text("Task / app")
@@ -5760,6 +6169,9 @@ struct RenderOptions {
     /// The Settings panel is open, showing `_settings`, after an optional
     /// `settings_set` outcome ({key, exit, stdout}).
     var settings = false
+    /// `_usage` history: "memory" / "consumers" / "protection" opens the card
+    /// on that view; "collapsed" leaves it closed with the history cached.
+    var usage: String?
 }
 
 /// The fixture's own `_view`, for view state richer than RenderOptions holds.
@@ -5804,6 +6216,7 @@ func renderOptions(_ view: [String: Any], fixtureDir: String) -> RenderOptions {
     o.confirmSuggestion = argValue("--confirm-suggestion") ?? str(view["confirm_suggestion"])
     o.dismissedGap = argValue("--dismissed-gap").flatMap(Double.init) ?? num(view["dismissed_gap"])
     o.settings = ARGS.contains("--settings") || (view["settings"] as? Bool ?? false)
+    o.usage = argValue("--usage") ?? str(view["usage"])
     fixtureView = view
     return o
 }
@@ -5831,6 +6244,12 @@ func fixtureModel(_ json: [String: Any], _ o: RenderOptions) -> Model {
         m.showAll.insert(sec)
     }
     if let d = o.dismissedGap { m.prefs.set(d, PrefKey.dismissedGap) }
+    if let v = o.usage {
+        m.usage = (json["_usage"] as? [String: Any]).flatMap(UsageData.decode)
+        m.usageFetchedAt = m.clock()
+        if let view = UsageView(rawValue: v) { m.usageView = view; m.usageOpen = true }
+        else if v != "collapsed" { fail("unknown usage view \(v)") }
+    }
     if o.settings {
         m.settingsOpen = true
         m.settings = (json["_settings"] as? [String: Any]).flatMap(SettingsInfo.decode)
@@ -6317,6 +6736,31 @@ final class HostSelftest: NSObject, NSApplicationDelegate {
                     report["next"] = gapNotice(n, dismissed: model.dismissedGap, now: nowTs())?.text ?? NSNull()
                 }
                 report["stored"] = model.dismissedGap ?? NSNull()
+            case "usage":
+                // `--do` steps against a stub memmon (`--script`): refresh,
+                // expand, collapse, age:<s> (moves the cache clock), view:<v>.
+                if let script = argValue("--script") { CLI.script = script; model.live = true }
+                var offset = 0.0
+                let base = model.clock
+                model.clock = { base() + offset }
+                for step in (argValue("--do") ?? "").split(separator: ",").map(String.init) {
+                    let parts = step.split(separator: ":", maxSplits: 1).map(String.init)
+                    switch parts[0] {
+                    case "refresh": model.refresh()
+                    case "expand": if !model.usageOpen { model.toggleUsage() }
+                    case "collapse": if model.usageOpen { model.toggleUsage() }
+                    case "age": offset += Double(parts[1]) ?? 0
+                    case "view": model.usageView = UsageView(rawValue: parts[1]) ?? .memory
+                    default: fail("unknown usage step \(step)")
+                    }
+                    let deadline = Date().addingTimeInterval(8)
+                    spin(0.05)
+                    while Date() < deadline && (model.usageLoading || model.refreshing) { spin(0.05) }
+                }
+                report["open"] = model.usageOpen
+                report["loaded"] = model.usage != nil
+                report["error"] = model.usageError ?? NSNull()
+                report["actions"] = model.actionLog
             case "notice-click":
                 // A click on a notification for `--run-id`, then the refresh
                 // it starts lands with `--next` (default: the same payload).
@@ -6749,7 +7193,19 @@ if ARGS.contains("--sections-probe") {
     let hold: Any = snapS2.runner.flatMap { r in
         snapS2.heldWork.map { HoldBanner(kind: $0, window: r.hysteresis ?? 30, remaining: r.recoveryRemaining).text }
     } ?? NSNull()
+    let usage: Any = m.usage.map { u -> [String: Any] in
+        var views: [String: Any] = [:]
+        for v in UsageView.allCases {
+            let (bars, summary) = usageBars(u, v)
+            views[v.rawValue] = ["summary": summary,
+                                 "bars": bars.map { ["label": $0.label, "fraction": $0.fraction.map { $0 as Any } ?? NSNull(),
+                                                     "spoken": $0.spoken, "empty": $0.day.empty, "few": $0.day.few] }]
+        }
+        return ["views": views, "top": u.topSections.map { $0.key }, "runner_recorded": u.runnerRecorded,
+                "open": m.usageOpen]
+    } ?? NSNull()
     let s2: [String: Any] = [
+        "usage": usage,
         "pressure": ["word": pressureWord(level), "tone": levelTone(level).rawValue,
                      "headline": pressureHeadline(level, reason: snapS2.system.levelReason).shown,
                      "glyph": levelTone(level) == .muted],
