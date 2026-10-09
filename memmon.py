@@ -3513,11 +3513,7 @@ ENV_WARNING = "MEMMON_GATE in the hook environment overrides this setting"
 
 def _runner_settings() -> dict:
     import memmon_runner
-    get = getattr(memmon_runner, "get_settings", None)
-    if get is not None:
-        return get(STATE_DIR)
-    mode, _, auto = memmon_runner.read_mode(STATE_DIR)
-    return {"runner_mode": mode, "auto_cancel_interruptible": auto}
+    return memmon_runner.get_settings(STATE_DIR)
 
 
 def settings_payload() -> dict:
@@ -3575,11 +3571,7 @@ def settings_set(key: str, raw: str) -> dict:
             raise ValueError(f"{key} must be true or false")
         value = raw == "true"
         if key == "auto_cancel_interruptible":
-            setter = getattr(memmon_runner, "set_auto_cancel", None)
-            if setter is not None:
-                setter(STATE_DIR, value)
-            else:
-                memmon_runner.write_mode(STATE_DIR, None, value)
+            memmon_runner.set_auto_cancel(STATE_DIR, value)
         else:
             _update_config(key, value)
     return settings_payload()
@@ -3599,7 +3591,7 @@ def settings_cli(argv: list) -> int:
             print(json.dumps({"error": f"unknown setting; one of {', '.join(SETTING_KEYS)}",
                               "key": argv[1]}))
             return 2
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:      # the runner's own refusals too
             print(json.dumps({"error": str(exc), "key": argv[1]}))
             return 2
         print(json.dumps(out))
