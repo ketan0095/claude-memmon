@@ -260,9 +260,17 @@ def pattern_triggers(payload: dict, week: dict) -> list:
     return fired
 
 
+def healthy(payload: dict) -> bool:
+    """HEALTHY, or UNKNOWN (no rate baseline yet, as just after start-up)
+    while the kernel itself says normal. UNKNOWN with the kernel at warn,
+    critical or unreadable is pressure."""
+    sysb = payload.get("system") or {}
+    level = sysb.get("score_level") or "UNKNOWN"
+    return level == "HEALTHY" or (level == "UNKNOWN" and sysb.get("pressure_level") == "normal")
+
+
 def select_mode(payload: dict, week: dict | None) -> str:
-    level = (payload.get("system") or {}).get("score_level") or "UNKNOWN"
-    if level != "HEALTHY":          # WATCH, DANGER, CRITICAL and UNKNOWN (NOW_LEVELS)
+    if not healthy(payload):        # WATCH, DANGER, CRITICAL, or UNKNOWN under kernel pressure
         return "now"
     return "patterns" if week is not None and pattern_triggers(payload, week) else "quiet"
 
@@ -327,8 +335,10 @@ def filter_reply(text: str, labels: list) -> list:
     anything that looks like a command."""
     keep = []
     for line in (text or "").splitlines():
+        # The menu bar shows this verbatim: no Markdown emphasis or list markers.
+        line = re.sub(r"\*\*|__|`", "", line)
         line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        if not line or "`" in line or line.startswith(("$", "sudo ", "kill ")):
+        if not line or line.startswith(("$", "sudo ", "kill ")):
             continue
         low = line.lower()
         if any(l.lower() in low for l in labels):
@@ -415,7 +425,7 @@ def cli(argv, payload_fn, pressure_fn=None, timeout: float = TIMEOUT_S, week_fn=
         except Exception:
             pass
     week = None
-    if (payload.get("system") or {}).get("score_level") == "HEALTHY":
+    if healthy(payload):
         try:
             week = (week_fn or load_week)()
         except Exception:

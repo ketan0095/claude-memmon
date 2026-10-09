@@ -217,7 +217,7 @@ def week(peak_frac=0.5, warned=0, owner_days=None, rules=None):
 class ModeTests(unittest.TestCase):
     def test_pressure_selects_now(self):
         for level in ("WATCH", "DANGER", "CRITICAL", "UNKNOWN", None):
-            p = payload()
+            p = payload()               # kernel at warning
             p["system"]["score_level"] = level
             with self.subTest(level=level):
                 self.assertEqual(ex.select_mode(p, week()), "now")
@@ -237,12 +237,33 @@ class ModeTests(unittest.TestCase):
                 self.assertEqual(ex.select_mode(p, w), "patterns")
                 self.assertTrue(ex.pattern_triggers(p, w))
 
+    def test_unknown_follows_the_kernel_level(self):
+        """Just after start-up the score is UNKNOWN: with the kernel at normal
+        the machine is healthy (patterns or quiet); otherwise it is now."""
+        for kernel, want in (("normal", "quiet"), ("warning", "now"), ("critical", "now"),
+                             (None, "now")):
+            p = quiet_payload()
+            p["system"].update(score_level="UNKNOWN", pressure_level=kernel)
+            with self.subTest(kernel=kernel):
+                self.assertEqual(ex.select_mode(p, week()), want)
+        p = quiet_payload()
+        p["system"].update(score_level="UNKNOWN", pressure_level="normal")
+        self.assertEqual(ex.select_mode(p, week(warned=1)), "patterns")
+
     def test_healthy_without_triggers_is_quiet(self):
         idle = quiet_payload()
         idle["owners"][1].update(activity="Idle", footprint_bytes=6 * GB)
         self.assertEqual(ex.select_mode(quiet_payload(), week()), "quiet")
         self.assertEqual(ex.select_mode(idle, week(owner_days={"VM · colima": 3})), "quiet")
         self.assertEqual(ex.select_mode(quiet_payload(), week(peak_frac=0.74)), "quiet")
+
+    def test_clean_drops_only_unsafe_words_from_titles(self):
+        """The fixture's "…at please" is its own path being removed, not a
+        mangled title: ordinary titles pass through whole."""
+        for title in ("Checkout refactor", "acme-web: fix login (v2)", "VM · colima"):
+            self.assertEqual(ex.clean(title), title)
+        self.assertEqual(ex.clean("Fix build at /Volumes/x/acme-web now"), "Fix build at now")
+        self.assertEqual(len(ex.clean("Checkout refactor " * 5)), ex.TITLE_MAX)
 
     def test_now_summary_lists_evidence(self):
         s = ex.plan(payload(), None)["prompt"]
@@ -300,6 +321,19 @@ class ReplyTests(StubBase):
         self.assertEqual(code, 0)
         self.assertEqual(out["text"],
                          "Stop vitest in Checkout refactor; it is idle and frees about 8.8 GB.")
+
+    def test_markdown_is_stripped_and_backticked_names_kept(self):
+        reply = ("1. **Stop `vitest`** in __Checkout refactor__; frees about 8.8 GB.|"
+                 "- `kill 4300` to stop vitest")
+        _, out = self.run_cli(payload(), None, reply)
+        self.assertEqual(out["text"], "Stop vitest in Checkout refactor; frees about 8.8 GB.")
+
+    def test_unknown_with_normal_kernel_asks_nothing(self):
+        p = quiet_payload()
+        p["system"].update(score_level="UNKNOWN", pressure_level="normal")
+        _, out = self.run_cli(p, week())
+        self.assertEqual(out["mode"], "quiet")
+        self.assertFalse((self.bin / "call.json").exists())
 
     def test_reply_capped_at_three_lines(self):
         reply = "|".join(f"{i}. Stop vitest, step {i}." for i in range(1, 6))
