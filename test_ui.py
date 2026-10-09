@@ -1104,6 +1104,25 @@ class HeaderAndRingTests(unittest.TestCase):
         self.assertNotIn("child processes included once", spoken)
         self.assertNotIn("Memory figures are estimates", spoken)
 
+    def test_jewel_palette_and_separable_neutrals(self):
+        t = run_json("--palette-probe")
+        want = {"claude": ("7c3aed", "a78bfa"), "codex": ("0d9488", "2dd4bf"), "job": ("ea580c", "fb923c"),
+                "browser": ("2563eb", "60a5fa"), "dev": ("16a34a", "4ade80"), "app": ("db2777", "f472b6"),
+                "service": ("ca8a04", "facc15"), "background": ("94a3b8", "8391a7")}
+        for sec, (light, dark) in want.items():
+            self.assertEqual(t["tokens"]["section." + sec], {"light": light, "dark": dark}, sec)
+        def lum(h):
+            r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        for theme in ("light", "dark"):
+            levels = sorted(lum(t["tokens"][k][theme]) for k in ("section.background", "system", "track"))
+            # Background, System & other and the free track must not blend.
+            self.assertGreater(min(b - a for a, b in zip(levels, levels[1:])), 0.08, theme)
+
+    def test_mood_face_is_still_under_reduce_motion(self):
+        t = run_json("--palette-probe")
+        self.assertEqual((t["mood_animates"], t["mood_animates_reduced"]), (True, False))
+
     def test_legend_rows_open_their_section(self):
         found = labels(a11y("overview.json"))
         self.assertIn("Show Claude sessions in the list, 9.5 GB", found)

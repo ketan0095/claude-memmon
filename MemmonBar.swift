@@ -2979,6 +2979,8 @@ struct ChromeHeightKey: PreferenceKey {
 /// renders and Reduce Motion get the finished, still picture.
 func ringSweeps(reduceMotion: Bool, animate: Bool) -> Bool { animate && !reduceMotion }
 func dotPulses(reduceMotion: Bool) -> Bool { !reduceMotion }
+/// The header face moves only when motion is allowed.
+func moodAnimates(reduceMotion: Bool) -> Bool { !reduceMotion }
 
 /// The header's face: how the machine feels, from the sample on screen. A
 /// stale or missing sample never looks calm.
@@ -3046,7 +3048,7 @@ struct MoodFace: View {
             .rotationEffect(.degrees(phase ? m.angle : (m.angle == 0 ? 0 : -m.angle)))
             .onAppear {
                 // Renders and Reduce Motion get the still face.
-                guard dotPulses(reduceMotion: reduceMotion) else { return }
+                guard moodAnimates(reduceMotion: reduceMotion) else { return }
                 withAnimation(.easeInOut(duration: m.period).repeatForever(autoreverses: true)) { phase = true }
             }
     }
@@ -4795,6 +4797,28 @@ if ARGS.contains("--selftest-quit-app") {
     exit(0)
 }
 if ARGS.contains("--act-probe") { actProbe(); exit(0) }
+if ARGS.contains("--palette-probe") {
+    // The section and neutral colours as each theme resolves them.
+    _ = NSApplication.shared
+    func hex(_ c: Color, _ name: NSAppearance.Name) -> String {
+        var out = ""
+        NSAppearance(named: name)!.performAsCurrentDrawingAppearance {
+            let n = NSColor(c).usingColorSpace(.sRGB)!
+            out = String(format: "%02x%02x%02x", Int(round(n.redComponent * 255)),
+                         Int(round(n.greenComponent * 255)), Int(round(n.blueComponent * 255)))
+        }
+        return out
+    }
+    var tokens: [String: Color] = ["system": P.system, "track": P.track]
+    for s in OwnerSection.allCases { tokens["section." + s.rawValue] = P.section(s) }
+    var out: [String: [String: String]] = [:]
+    for (k, c) in tokens { out[k] = ["light": hex(c, .aqua), "dark": hex(c, .darkAqua)] }
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "tokens": out, "mood_animates": moodAnimates(reduceMotion: false),
+        "mood_animates_reduced": moodAnimates(reduceMotion: true)], options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
 if ARGS.contains("--sections-probe") {
     // How a fixture's owners fall into sections, as the list would show them.
     _ = NSApplication.shared
