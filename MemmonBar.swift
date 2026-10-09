@@ -99,8 +99,8 @@ enum P {
     static let headerTop = token(rgb(0xebe4ff), rgb(0x2f2154))
     static let headerBottom = token(rgb(0xf7f4ff), rgb(0x1c1830))
     /// The donut's grey parts: memory outside every section, and free memory.
-    static let system = token(rgb(0xb3aec2), rgb(0x5a5570))
-    static let track = token(rgb(0xe9e6f2), rgb(0x2c2a3b))
+    static let system = token(rgb(0xcbd5e1), rgb(0x46526a))
+    static let track = token(rgb(0xeef0f5), rgb(0x232838))
 
     /// One colour per owner section, shared by the ring, legend and headers.
     static func section(_ s: OwnerSection) -> Color {
@@ -115,14 +115,14 @@ enum P {
         case .background: return sectionBackground
         }
     }
-    static let sectionClaude = token(rgb(0x7a5ad8), rgb(0xb29cff))
-    static let sectionCodex = token(rgb(0x23857f), rgb(0x6dd1c6))
-    static let sectionJob = token(rgb(0xc26a2e), rgb(0xf2a76f))
-    static let sectionBrowser = token(rgb(0x3474cf), rgb(0x86b4ff))
-    static let sectionDev = token(rgb(0x4f8f2f), rgb(0x9fd77c))
-    static let sectionApp = token(rgb(0xbb4a8a), rgb(0xf09bc9))
-    static let sectionService = token(rgb(0xa98316), rgb(0xe6c65a))
-    static let sectionBackground = token(rgb(0x8c86a2), rgb(0x8f89a6))
+    static let sectionClaude = token(rgb(0x7c3aed), rgb(0xa78bfa))
+    static let sectionCodex = token(rgb(0x0d9488), rgb(0x2dd4bf))
+    static let sectionJob = token(rgb(0xea580c), rgb(0xfb923c))
+    static let sectionBrowser = token(rgb(0x2563eb), rgb(0x60a5fa))
+    static let sectionDev = token(rgb(0x16a34a), rgb(0x4ade80))
+    static let sectionApp = token(rgb(0xdb2777), rgb(0xf472b6))
+    static let sectionService = token(rgb(0xca8a04), rgb(0xfacc15))
+    static let sectionBackground = token(rgb(0x94a3b8), rgb(0x8391a7))
 
     /// An unknown level is muted, never green: a missing reading is not health.
     static func tint(_ level: String?) -> Color {
