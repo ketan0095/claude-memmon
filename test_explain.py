@@ -30,8 +30,7 @@ if mode == "sleep":
 if mode == "fail":
     sys.stderr.write("x" * 500 + "auth failed")
     sys.exit(3)
-print(reply.replace("|", "\\n") if reply else
-      "1. Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
+print(reply if reply else "vitest | Stop the idle test run | idle 31 min, frees 8.8 GB")
 """
 
 
@@ -143,7 +142,7 @@ class CallTests(StubBase):
         code, out = self.cli("--json")
         self.assertEqual(code, 0)
         res = json.loads(out)
-        self.assertIn("Checkout refactor", res["text"])
+        self.assertEqual(res["items"][0]["owner"], "vitest")
         self.assertEqual(res["model"], "claude-haiku-5-5")
         call = self.call()
         self.assertEqual(call["argv"], ["-p", "--model", "claude-haiku-5-5", "--output-format",
@@ -185,7 +184,7 @@ class CallTests(StubBase):
         with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
             code, out = self.cli()
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "Stop the vitest run in Checkout refactor; it holds 8.8 GB.")
+        self.assertEqual(out.strip(), "vitest: Stop the idle test run (idle 31 min, frees 8.8 GB)")
         self.assertEqual(popen.call_count, 1, "one process: claude itself")
 
 
@@ -310,35 +309,60 @@ class ReplyTests(StubBase):
         code, out = self.run_cli(quiet_payload(), week())
         self.assertEqual(code, 0)
         self.assertEqual(out, {"mode": "quiet", "title": "Nothing to do",
-                               "text": "Nothing to do. Memory is healthy."})
+                               "text": "Nothing to do. Memory is healthy.", "items": []})
         self.assertFalse((self.bin / "call.json").exists())
         code, out = self.run_cli(quiet_payload(), week(), None, "--preview")
         self.assertEqual((out["would_send"], out["mode"]), (False, "quiet"))
         self.assertIn("Nothing would be sent", out["preview"])
         self.assertFalse((self.bin / "call.json").exists())
 
-    def test_generic_lines_are_dropped(self):
-        reply = ("1. Close some browser tabs to free memory.|"
-                 "2. Stop vitest in Checkout refactor; it is idle and frees about 8.8 GB.|"
-                 "3. Restart your Mac.|`kill 4300` to stop vitest")
+    def test_piped_lines_parse_into_items_and_text(self):
+        reply = ("vitest | Stop the idle test run | idle 31 min, frees 8.8 GB\n"
+                 "VM · colima | Stop the VM between sessions | idle, holds 6.0 GB")
         code, out = self.run_cli(payload(), None, reply)
         self.assertEqual(code, 0)
-        self.assertEqual(out["text"],
-                         "Stop vitest in Checkout refactor; it is idle and frees about 8.8 GB.")
+        self.assertEqual(out["items"], [
+            {"owner": "vitest", "action": "Stop the idle test run",
+             "why": "idle 31 min, frees 8.8 GB"},
+            {"owner": "VM · colima", "action": "Stop the VM between sessions",
+             "why": "idle, holds 6.0 GB"}])
+        self.assertEqual(out["text"], "vitest: Stop the idle test run (idle 31 min, frees 8.8 GB)\n"
+                                      "VM · colima: Stop the VM between sessions (idle, holds 6.0 GB)")
+        self.assertIn("owner | action | why", self.call()["stdin"])
 
-    def test_markdown_is_stripped_and_backticked_names_kept(self):
-        reply = ("1. **Stop `vitest`** in __Checkout refactor__; frees about 8.8 GB.|"
-                 "- `kill 4300` to stop vitest")
+    def test_quotes_markdown_and_case_are_normalised(self):
+        reply = ('1. **"VITEST"** | **Stop** the `idle` test run | \u201cidle 31 min\u201d\n'
+                 '- \u201cvm · colima\u201d | Stop it | ')
         _, out = self.run_cli(payload(), None, reply)
-        self.assertEqual(out["text"], "Stop vitest in Checkout refactor; frees about 8.8 GB.")
+        self.assertEqual(out["items"], [
+            {"owner": "vitest", "action": "Stop the idle test run", "why": "idle 31 min"},
+            {"owner": "VM · colima", "action": "Stop it", "why": ""}])
+        self.assertNotRegex(out["text"], r'["*`\u201c\u201d]')
+
+    def test_unknown_owner_and_generic_lines_are_dropped(self):
+        reply = ("Browser tabs | Close some tabs | frees memory\n"
+                 "Close some browser tabs to free memory.\n"
+                 "vitest | Stop the idle test run | idle 31 min\n"
+                 "Restart your Mac.\n"
+                 "vitest | kill 4300 | it is idle\n"
+                 "`kill 4300` to stop vitest")
+        _, out = self.run_cli(payload(), None, reply)
+        self.assertEqual([i["owner"] for i in out["items"]], ["vitest"])
+        self.assertEqual(out["text"], "vitest: Stop the idle test run (idle 31 min)")
+
+    def test_line_without_pipes_names_a_label(self):
+        reply = 'Stop "VM · colima" between sessions; it holds 6.0 GB.'
+        _, out = self.run_cli(payload(), None, reply)
+        self.assertEqual(out["items"], [{"owner": "VM · colima",
+                                         "action": "Stop between sessions; it holds 6.0 GB.",
+                                         "why": ""}])
+        self.assertEqual(out["text"], "VM · colima: Stop between sessions; it holds 6.0 GB.")
 
     def test_headings_quotes_and_single_emphasis_are_stripped(self):
-        reply = ("## Stop *vitest* in _Checkout refactor_; frees about 8.8 GB.|"
-                 "> Leave acme_web_dev running.")
-        labels = ["vitest", "acme_web_dev"]
-        self.assertEqual(ex.filter_reply(reply.replace("|", "\n"), labels),
-                         ["Stop vitest in Checkout refactor; frees about 8.8 GB.",
-                          "Leave acme_web_dev running."])
+        items = ex.parse_items("## *vitest* | Stop _now_ | idle\n> acme_web_dev | Leave it running |",
+                               ["vitest", "acme_web_dev"])
+        self.assertEqual(items, [{"owner": "vitest", "action": "Stop now", "why": "idle"},
+                                 {"owner": "acme_web_dev", "action": "Leave it running", "why": ""}])
 
     def test_the_call_is_bounded_to_sixty_seconds_by_default(self):
         import inspect
@@ -353,20 +377,22 @@ class ReplyTests(StubBase):
         self.assertEqual(out["mode"], "quiet")
         self.assertFalse((self.bin / "call.json").exists())
 
-    def test_reply_capped_at_three_lines(self):
-        reply = "|".join(f"{i}. Stop vitest, step {i}." for i in range(1, 6))
+    def test_reply_capped_at_three_items(self):
+        reply = "\n".join(f"vitest | Stop it, step {i} | idle" for i in range(1, 6))
         _, out = self.run_cli(payload(), None, reply)
+        self.assertEqual(len(out["items"]), ex.REPLY_LINES)
         self.assertEqual(len(out["text"].splitlines()), ex.REPLY_LINES)
 
     def test_nothing_specific_left_is_quiet(self):
-        _, out = self.run_cli(payload(), None, "Close tabs.|Quit unused apps.")
-        self.assertEqual((out["mode"], out["text"], out["asked"]),
-                         ("quiet", "Nothing to do. Memory is healthy.", "now"))
+        _, out = self.run_cli(payload(), None, "Close tabs.\nQuit unused apps.")
+        self.assertEqual((out["mode"], out["text"], out["asked"], out["items"]),
+                         ("quiet", "Nothing to do. Memory is healthy.", "now", []))
 
     def test_patterns_mode_end_to_end(self):
-        reply = "Run one \"VM · colima\" instead of leaving it idle all week."
+        reply = "VM · colima | Stop it when no session needs it | idle, held 6.0 GB most days"
         _, out = self.run_cli(quiet_payload(), week(warned=2), reply)
         self.assertEqual((out["mode"], out["title"]), ("patterns", "Patterns this week"))
+        self.assertEqual(out["items"][0]["owner"], "VM · colima")
         self.assertTrue(self.call()["stdin"].startswith(ex.PROMPT_PATTERNS))
 
 

@@ -40,16 +40,18 @@ QUIET_TEXT = "Nothing to do. Memory is healthy."
 PREAMBLE = ("You are helping someone on a Mac that runs several AI coding agents and dev "
             "tools. Below is memmon's view of memory: what each owner is, how idle it is, "
             "and whether memmon can stop it, which Activity Monitor cannot tell them.\n")
+LINE_FORMAT = (
+    "Each line is exactly: owner | action | why. owner is written exactly as in the "
+    "summary, without the quotes. action is imperative, at most 12 words. why gives the "
+    "evidence with its number, at most 14 words. No other text: no heading, numbering, "
+    "Markdown, shell commands or code.\n\n")
 PROMPT_NOW = PREAMBLE + (
     "Memory is under pressure now. Using only the candidates listed, write at most 3 "
-    "lines, ranked by memory freed and then by safety. Each line names the candidate's "
-    "owner exactly as it is written in quotes, says why stopping it is safe, and roughly "
-    "how many GB it frees. Plain text only, no shell commands or code.\n\n")
+    "lines, ranked by memory freed and then by safety; say in why how many GB it frees "
+    "and why stopping it is safe. " + LINE_FORMAT)
 PROMPT_PATTERNS = PREAMBLE + (
     "Memory is healthy right now. From the week's patterns below, write at most 3 lines, "
-    "each one structural change that would prevent the next memory squeeze. Each line "
-    "names the owner it concerns exactly as it is written in quotes. Plain text only, no "
-    "shell commands or code.\n\n")
+    "each one structural change that would prevent the next memory squeeze. " + LINE_FORMAT)
 KIND = {"claude": "Claude session", "codex": "Codex", "codex-app": "Codex app",
         "codex-ui": "Codex", "app": "app", "service": "service", "job": "managed job",
         "unknown": "unattributed"}
@@ -329,27 +331,64 @@ def owner_labels(summary: str) -> list:
     return sorted(names - set(KIND.values()), key=len, reverse=True)
 
 
-def filter_reply(text: str, labels: list) -> list:
-    """Keep at most 3 plain lines that each name an owner from the summary.
-    Generic advice ("close some tabs") names none and is dropped, and so is
-    anything that looks like a command."""
-    keep = []
-    for line in (text or "").splitlines():
-        # The menu bar shows this verbatim: no Markdown headings, quotes,
-        # emphasis or list markers. Word-bounded single * or _ only, so a
-        # snake_case owner name keeps its underscores.
-        line = re.sub(r"\*\*|__|`", "", line)
-        line = re.sub(r"(?<![\w*])[*_]([^*_\n]+?)[*_](?![\w*])", r"\1", line)
-        line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*)+", "", line)
-        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        if not line or line.startswith(("$", "sudo ", "kill ")):
+_QUOTES = re.compile(r'["\u201c\u201d\u2018\u2019]')
+
+
+def _plain(line: str) -> str:
+    """The menu bar shows this verbatim: no Markdown headings, block quotes,
+    emphasis, list markers or quote marks. Word-bounded single * or _ only,
+    so a snake_case owner name keeps its underscores."""
+    line = re.sub(r"\*\*|__|`", "", line)
+    line = re.sub(r"(?<![\w*])[*_]([^*_\n]+?)[*_](?![\w*])", r"\1", line)
+    line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*)+", "", line)
+    line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line)
+    return _QUOTES.sub("", line).strip()
+
+
+def _commandish(text: str) -> bool:
+    return text.startswith(("$", "sudo ", "kill "))
+
+
+def _label_in(text: str, labels: list) -> str | None:
+    """The longest summary label the text names, case-insensitively."""
+    low = text.lower()
+    return next((l for l in labels if l.lower() in low), None)
+
+
+def parse_items(text: str, labels: list) -> list:
+    """At most 3 {owner, action, why} from the reply. A line is
+    `owner | action | why`; owner must be a label from the summary (quotes
+    stripped, any case) and is reported in the summary's spelling. A line
+    without pipes still counts when it names a label: that label is the
+    owner and the line, minus the quoted label, is the action. Generic
+    advice names no label and is dropped, as is anything command-like."""
+    labels = sorted(labels, key=len, reverse=True)
+    by_low = {l.lower(): l for l in labels}
+    items = []
+    for raw in (text or "").splitlines():
+        if "|" in raw:
+            parts = [_plain(p) for p in raw.split("|")]
+            owner_txt, action = parts[0], parts[1] if len(parts) > 1 else ""
+            why = " ".join(p for p in parts[2:] if p)
+            owner = by_low.get(owner_txt.lower()) or _label_in(owner_txt, labels)
+        else:
+            line = raw
+            owner = _label_in(_plain(line), labels)
+            if owner:
+                line = re.sub(r'["\u201c\u2018]\s*' + re.escape(owner) + r'\s*["\u201d\u2019]',
+                              "", line, flags=re.I)
+            action, why = re.sub(r"\s{2,}", " ", _plain(line)).strip(" ;,:"), ""
+        if not owner or not action or _commandish(action) or _commandish(_plain(raw)):
             continue
-        low = line.lower()
-        if any(l.lower() in low for l in labels):
-            keep.append(line)
-        if len(keep) == REPLY_LINES:
+        items.append({"owner": owner, "action": action, "why": why})
+        if len(items) == REPLY_LINES:
             break
-    return keep
+    return items
+
+
+def items_text(items: list) -> str:
+    return "\n".join(f"{i['owner']}: {i['action']}" + (f" ({i['why']})" if i["why"] else "")
+                     for i in items)
 
 
 # ------------------------------------------------------------------- call
@@ -393,7 +432,7 @@ def run_claude(prompt: str, timeout: float = TIMEOUT_S, binary: str | None = Non
 
 
 def quiet_result() -> dict:
-    return {"mode": "quiet", "title": TITLES["quiet"], "text": QUIET_TEXT}
+    return {"mode": "quiet", "title": TITLES["quiet"], "text": QUIET_TEXT, "items": []}
 
 
 def plan(payload: dict, week: dict | None) -> dict:
@@ -454,9 +493,9 @@ def cli(argv, payload_fn, pressure_fn=None, timeout: float = TIMEOUT_S, week_fn=
             print(json.dumps({"error": str(exc), "mode": p["mode"]}) if args.json
                   else f"memmon: {exc}", file=sys.stdout if args.json else sys.stderr)
             return 2
-        lines = filter_reply(result["text"], p["labels"])
-        if lines:
-            result.update(mode=p["mode"], title=p["title"], text="\n".join(lines))
+        items = parse_items(result["text"], p["labels"])
+        if items:
+            result.update(mode=p["mode"], title=p["title"], items=items, text=items_text(items))
         else:
             result.update(quiet_result(), asked=p["mode"])
     print(json.dumps(result) if args.json else result["text"])
