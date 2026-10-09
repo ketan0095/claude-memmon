@@ -33,7 +33,7 @@ Under it, one line says whether heavy commands are protected: `off`,
 
 **Owners** — one row per owner (see *Owners and targeted stops* below): a
 Claude session, a Codex thread or daemon, an app, a VM, a managed job, or the
-unattributed rest. Sort by memory, CPU or growth. A row shows its title, what
+unattributed rest. Sort by memory or CPU. A row shows its title, what
 it is doing, and where it runs (project · worktree · confidence). A value
 memmon could not measure shows `—` and the reason, and sorts last. Expand a
 session to see its builds, tests and servers, each with its own Stop button;
@@ -467,9 +467,10 @@ be read without privileges; they are listed as "not itemised", never as zero.
 A number memmon could not read is shown as `—` with the reason, never as 0.
 
 CPU needs two samples. The popover takes them a second apart; the sampler keeps
-a baseline so the next tick can measure against it. Growth per 10 minutes needs
-at least 5 samples over 10 minutes with no gap longer than 3 minutes, so a
-freshly started owner, or one seen across a sleep, says "not enough history".
+a baseline so the next tick can measure against it. Growth per 10 minutes, shown in an
+owner's technical details, needs at least 5 samples over 10 minutes with no gap
+longer than 3 minutes, so a freshly started owner, or one seen across a sleep,
+says "not enough history".
 
 ### Stopping something
 

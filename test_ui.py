@@ -1106,10 +1106,14 @@ class HeaderAndRingTests(unittest.TestCase):
         self.assertIn("memmon mood: calm, memory pressure is normal", found)
         self.assertIn("memmon mood: asleep, the sample is stale", labels(a11y("stale-paused.json")))
         self.assertIn("memmon mood: unsure, memory pressure is unknown", labels(a11y("unavailable.json")))
-        danger = labels(a11y("under-pressure.json")) if (FIXTURES / "under-pressure.json").exists() else None
-        if danger is not None:
-            self.assertTrue(any(l.startswith("memmon mood: strained") or l.startswith("memmon mood: overheating")
-                                for l in danger), danger[:5])
+        self.assertIn("memmon mood: strained, memory pressure is high", labels(a11y("gate-open.json")))
+        base = json.loads((FIXTURES / "overview.json").read_text())
+        for level, want in (("WATCH", "watchful, memory pressure is rising"),
+                            ("CRITICAL", "overheating, memory pressure is critical")):
+            with tempfile.TemporaryDirectory() as d:
+                p = Path(d) / "f.json"
+                p.write_text(json.dumps(dict(base, system=dict(base["system"], score_level=level))))
+                self.assertIn("memmon mood: " + want, labels(a11y_path(p)))
 
     def test_footer_says_nothing_it_cannot_explain(self):
         spoken = " ".join(r["label"] + " " + r["value"] for r in a11y("overview.json"))
@@ -1131,7 +1135,29 @@ class HeaderAndRingTests(unittest.TestCase):
             # Background, System & other and the free track must not blend.
             self.assertGreater(min(b - a for a, b in zip(levels, levels[1:])), 0.08, theme)
 
+    def test_free_row_toggles_its_split(self):
+        self.assertEqual(run_json("--palette-probe")["free_toggle"], [True, False])
+        src = (ROOT / "MemmonBar.swift").read_text()
+        self.assertIn("{ model.toggleFree() } } label: {", src)
+
+    def test_recent_shows_three_and_offers_the_rest(self):
+        base = json.loads((FIXTURES / "overview.json").read_text())
+        ev = base["gate"]["history"]["events"][-1]
+        events = [dict(ev, ts=ev["ts"] - 60 * i, session=dict(ev["session"], id=f"fixture-r{i}"))
+                  for i in range(6)]
+        gate = dict(base["gate"], history=dict(base["gate"]["history"], events=events), pending_retry=[])
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "f.json"
+            p.write_text(json.dumps(dict(base, gate=gate, _view={"open_gate": True})))
+            found = labels(a11y_path(p))
+        self.assertEqual(sum(l.startswith("Warned, ") for l in found), 3, found)
+        self.assertIn("Show all 6", found)
+
     def test_app_icons_are_local_and_only_in_the_live_app(self):
+        src = (ROOT / "MemmonBar.swift").read_text()
+        # The live app, and only it, turns icons on before the controller starts.
+        self.assertIn("enableLiveOnlyFeatures()\nlet controller = Controller()", src)
+        self.assertEqual(src.count("AppIcons.enabled = true"), 1)
         icons = run_json("--palette-probe")["icons"]
         # Renders keep glyphs; the app finds an installed app's icon; a missing
         # bundle falls back to the glyph.

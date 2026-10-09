@@ -1446,6 +1446,7 @@ final class Model: ObservableObject {
     @Published var scrollTarget: OwnerSection?
     /// The ring legend's Free row is expanded into its parts.
     @Published var freeOpen = false
+    func toggleFree() { freeOpen.toggle() }
     @Published var techOpen: Set<String> = []
     @Published var confirm: ConfirmRequest?
     @Published var banner: Banner?
@@ -2001,6 +2002,9 @@ struct ActionButton: View {
 /// The installed app's own icon, looked up locally by bundle id. Only the
 /// running app enables it; renders and tests keep the glyphs, so their
 /// pictures do not depend on what this Mac has installed.
+/// What only the running app turns on; renders and probes stay deterministic.
+func enableLiveOnlyFeatures() { AppIcons.enabled = true }
+
 enum AppIcons {
     static var enabled = false
     private static var cache: [String: NSImage?] = [:]
@@ -3504,7 +3508,7 @@ struct ContentView: View {
                     ForEach(legend) { seg in legendRow(seg, s) }
                     if let free {
                         let split = freeSplit(sys, free: free)
-                        Button { withAnimation(motion(0.16)) { model.freeOpen.toggle() } } label: {
+                        Button { withAnimation(motion(0.16)) { model.toggleFree() } } label: {
                             LegendRow(color: P.track, outlined: true, name: "Free", value: gb(free))
                         }
                         .buttonStyle(.plain)
@@ -4917,13 +4921,17 @@ if ARGS.contains("--palette-probe") {
     // App icons: off by default (renders), found locally when the app enables them.
     let finder = Owner.decode(["owner_id": "app:com.apple.finder", "kind": "app", "title": "Finder"])!
     let iconOff = AppIcons.icon(for: finder) != nil
-    AppIcons.enabled = true
+    enableLiveOnlyFeatures()
     let iconOn = AppIcons.icon(for: finder) != nil
     let missing = Owner.decode(["owner_id": "app:com.example.not-installed", "kind": "app", "title": "X"])!
     let iconMissing = AppIcons.icon(for: missing) != nil
     AppIcons.enabled = false
+    let fm = Model()
+    fm.toggleFree(); let freeOnce = fm.freeOpen
+    fm.toggleFree(); let freeTwice = fm.freeOpen
     let data = try! JSONSerialization.data(withJSONObject: [
         "icons": ["off": iconOff, "on": iconOn, "missing": iconMissing],
+        "free_toggle": [freeOnce, freeTwice],
         "tokens": out, "mood_animates": moodAnimates(reduceMotion: false),
         "mood_animates_reduced": moodAnimates(reduceMotion: true)], options: [.sortedKeys])
     print(String(data: data, encoding: .utf8)!)
@@ -5021,7 +5029,7 @@ if ARGS.contains("--a11y-dump") {
 }
 
 let app = NSApplication.shared
-AppIcons.enabled = true
+enableLiveOnlyFeatures()
 let controller = Controller()
 app.delegate = controller
 app.run()
