@@ -1592,7 +1592,7 @@ struct UsageData {
     /// The sections memmon reports, in ring order, each with the ring's colour.
     static let sections: [(key: String, name: String)] = [
         ("claude", "Claude sessions"), ("codex", "Codex"), ("browser", "Browsers"),
-        ("app", "Mac apps"), ("service", "Shared services"), ("other", "Other"),
+        ("dev", "Terminals & editors"), ("app", "Mac apps"), ("service", "Shared services"), ("other", "Other"),
     ]
 
     static func color(_ key: String) -> Color {
@@ -1602,6 +1602,7 @@ struct UsageData {
         case "browser": return P.sectionBrowser
         case "app": return P.sectionApp
         case "service": return P.sectionService
+        case "dev": return P.sectionDev
         default: return P.system
         }
     }

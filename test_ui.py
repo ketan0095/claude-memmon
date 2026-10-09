@@ -2190,6 +2190,21 @@ class UsageCardTests(StubCase):
         self.assertTrue(any("No samples: Sat, Sun" in l for l in found), found)
         self.assertTrue(any("Few samples: Tue (42)" in l for l in found), found)
 
+    def test_dev_and_missing_sections_decode_as_optional(self):
+        p = payload("usage-consumers.json")
+        for k, d in enumerate(p["_usage"]["series"]):
+            d["by_section"] = {"claude": 4 * 1024 ** 3, "dev": (k + 1) * 1024 ** 3, "codex": None}
+            d["runner"] = {"held": None, "cancelled": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.json"
+            path.write_text(json.dumps(dict(p, _view={"usage": "consumers"})))
+            u = run_json("--sections-probe", "--fixture", str(path))["s2"]["usage"]
+        self.assertEqual(u["top"], ["claude", "dev"])
+        self.assertIn("Terminals & editors 7.0 GB", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertNotIn("Codex", u["views"]["consumers"]["bars"][6]["spoken"])
+        self.assertFalse(u["runner_recorded"])
+        self.assertIn("not recorded", u["views"]["protection"]["summary"])
+
     def test_a_day_with_no_samples_drops_any_values_it_carries(self):
         p = payload("usage-empty-days.json")
         p["_usage"]["series"][1].update(mem_peak_bytes=40 * 1024 ** 3, by_section={"claude": 1})
