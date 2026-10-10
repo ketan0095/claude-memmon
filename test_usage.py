@@ -293,7 +293,10 @@ class UsageBenchTests(unittest.TestCase):
         p95 = times[18]
         print(f"\nusage bench: {len(rows)} rows, {size / 1e6:.1f} MB, "
               f"median {times[10]:.0f} ms, p95 {p95:.0f} ms")
-        self.assertLessEqual(p95, 300)
+        # 300 ms on a developer Mac. Shared CI runners are slower and noisier,
+        # so they get twice that: still enough to catch a real regression.
+        budget = 600 if os.environ.get("GITHUB_ACTIONS") == "true" else 300
+        self.assertLessEqual(p95, budget)
 
 
 if __name__ == "__main__":

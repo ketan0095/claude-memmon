@@ -6,6 +6,7 @@ The full reference for memmon. The [README](../README.md) covers install and eve
 
 - [Installation](#installation)
 - [Updating](#updating)
+  - [Updating from the menu bar](#updating-from-the-menu-bar)
 - [Permissions and privacy](#permissions-and-privacy)
 - [Turning it off and uninstalling](#turning-it-off-and-uninstalling)
 - [Commands](#commands)
@@ -127,6 +128,20 @@ Pass `--menubar` again if you use the menu bar. Without it, the old app keeps
 running its old build against the new CLI. An old menu bar still calls
 `--end-session` and `--reap`, which now take the graceful path and can keep it
 busy for about 25 seconds per click.
+
+### Updating from the menu bar
+
+From the menu bar: **Settings → Updates → Check for updates**, then **Update now…**. From a terminal:
+
+```bash
+memmon update --check     # what is new on the branch you installed from
+memmon update --apply     # fast-forward the clone, re-run its installer with your flags
+memmon update --status    # how the last update went
+```
+
+Every install records where it ran from in `~/.claude/memmon/install.json` (the clone, its branch and commit, and the flags you passed), so updates work only for an install made from a git clone with `./install.sh`. `--apply` refuses when the clone has uncommitted changes, is not on that branch, or cannot be fast-forwarded. The installer then runs in the background, logging to `~/.claude/memmon/update.log`, and the menu bar restarts.
+
+Checking for updates contacts the clone's git remote (GitHub, for a clone of this repo), only when you click Check or Update now, or run `--check`/`--apply`. Never in the background.
 
 ### Upgrade notes
 

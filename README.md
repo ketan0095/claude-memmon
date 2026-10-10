@@ -82,16 +82,22 @@ git pull --ff-only && ./install.sh --sampler --menubar --gate   # the same flags
 ```
 
 Re-running is safe: it replaces the code, rebuilds the menu bar, never duplicates
-the hook and keeps your history. A Settings → Updates button is coming in a future
-release. See [Upgrade notes](docs/reference.md#upgrade-notes) for behaviour changes.
+the hook and keeps your history. See [Upgrade notes](docs/reference.md#upgrade-notes)
+for behaviour changes.
+
+After one install from a clone, later updates come from the menu bar:
+**Settings → Updates → Check for updates**, then **Update now…**. From a terminal,
+`memmon update --check` lists what is new and `memmon update --apply` installs it
+with your original flags. It refuses when the clone has local changes, and it
+contacts GitHub only when you ask.
 
 ## Privacy and permissions
 
 memmon needs no `sudo` and no Screen Recording, Accessibility or Full Disk Access
 permission. It reads only your own processes, through libproc, `top`, `ps`,
 `sysctl`, `vm_stat` and `lsof`. Everything stays in `~/.claude/memmon/`. It makes no
-network calls and sends no telemetry, except when you click Ask Claude (and, once
-they ship, update checks).
+network calls and sends no telemetry, except when you click Ask Claude or check for
+updates.
 
 ## Common commands
 
