@@ -157,6 +157,33 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual((st["state"], st["to"]), ("finished", latest[:7]))
         self.assertIn("stub installer ran", Path(r["log"]).read_text())
 
+    def install_record(self):
+        return json.loads((self.state / "install.json").read_text())
+
+    def test_success_records_the_new_commit_when_the_installer_did_not(self):
+        """The stub, like an installer from before install.json, never writes
+        it: a 0 exit must still leave install.json at the new commit, keeping
+        source, flags and branch, and the next check up to date."""
+        before = self.install_record()
+        self.upstream("feat: new thing")
+        up.apply(str(self.state))
+        self.assertEqual(self.wait_done()["state"], "finished")
+        after = self.install_record()
+        self.assertEqual(after["commit"], self.git(self.origin, "rev-parse", "main"))
+        for key in ("source", "flags", "branch", "version"):
+            self.assertEqual(after[key], before[key], key)
+        self.assertGreater(after["installed_at"], before["installed_at"])
+        self.assertEqual(up.check(str(self.state))["state"], "up_to_date")
+
+    def test_failed_install_keeps_the_old_commit(self):
+        os.environ["STUB_EXIT"] = "3"
+        before = self.install_record()
+        self.upstream("feat: new thing")
+        up.apply(str(self.state))
+        self.assertEqual(self.wait_done()["state"], "failed")
+        self.assertEqual(self.install_record(), before)
+        self.assertEqual(up.check(str(self.state))["state"], "available")
+
     def test_recorded_flags_only_and_in_order(self):
         self.record(flags=("--gate", "--sampler", "; rm -rf ~", "--uninstall"))
         self.upstream("feat: new thing")

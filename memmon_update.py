@@ -156,6 +156,29 @@ def apply(state_dir, timeout=FETCH_TIMEOUT_S) -> dict:
     return start_installer(state_dir, rec, src, _short(rec["commit"] or head), _short(to))
 
 
+# Run by the detached wrapper after the installer exits 0. An installer from
+# before install.json existed would leave the old commit recorded, and every
+# later --check would offer the same update again. Self-contained: the
+# installer it follows may have replaced or never shipped this module.
+RECORD_HEAD = r"""
+import json, os, subprocess, sys, time
+path, src = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as fh:
+        rec = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)
+head = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True,
+                      text=True).stdout.strip()
+if isinstance(rec, dict) and head and rec.get("commit") != head:
+    rec.update(commit=head, installed_at=int(time.time()))
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh)
+    os.replace(tmp, path)
+"""
+
+
 def start_installer(state_dir, rec, src, frm, to) -> dict:
     p = _paths(state_dir)
     flags = recorded_flags(rec)
@@ -166,8 +189,12 @@ def start_installer(state_dir, rec, src, frm, to) -> dict:
     # setsid: the installer restarts the menu bar that asked for this and
     # must not die with it. posix_spawn leaves nothing for this process to
     # reap. The trailing line is how --status learns the result.
-    script = 'cd "$0" && bash ./install.sh "$@"; echo "' + DONE_MARK + '$?"'
-    pid = os.posix_spawn("/bin/bash", ["/bin/bash", "-c", script, src, *flags], dict(os.environ),
+    script = ('src="$0"; record="$1"; ij="$2"; shift 2\n'
+              'cd "$src" && bash ./install.sh "$@"; rc=$?\n'
+              'if [ "$rc" -eq 0 ]; then /usr/bin/python3 -c "$record" "$ij" "$src" || :; fi\n'
+              'echo "' + DONE_MARK + '$rc"')
+    pid = os.posix_spawn("/bin/bash", ["/bin/bash", "-c", script, src, RECORD_HEAD, p["install"],
+                                       *flags], dict(os.environ),
                          file_actions=[(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
                                        (os.POSIX_SPAWN_OPEN, 1, p["log"],
                                         os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600),
