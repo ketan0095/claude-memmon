@@ -3795,6 +3795,11 @@ def effective_gate_mode() -> tuple:
     return mode, source
 
 
+def _install_summary() -> dict:
+    import memmon_update
+    return memmon_update.install_summary(STATE_DIR)
+
+
 def settings_payload() -> dict:
     mode, source = effective_gate_mode()
     paused = pause_until()
@@ -3805,6 +3810,7 @@ def settings_payload() -> dict:
            **_runner_settings(),
            "pressure_suggestions": suggestions_enabled(),
            "notifications": CONFIG.get("notifications", True) is not False,
+           "install": _install_summary(),
            "state_dir": os.path.abspath(STATE_DIR)}
     if source == "env":
         out["warning"] = ENV_WARNING
@@ -3924,6 +3930,9 @@ def main() -> int:
         import memmon_route
         return memmon_route.cli(sys.argv[1:], STATE_DIR, classify=classify_command,
                                 split=shell_commands)
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        import memmon_update
+        return memmon_update.cli(sys.argv[2:], STATE_DIR)
     if len(sys.argv) > 1 and sys.argv[1] == "explain":
         import memmon_explain
         return memmon_explain.cli(sys.argv[2:], lambda: owners_json(cpu_window=1.0),

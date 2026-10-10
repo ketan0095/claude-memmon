@@ -1,0 +1,80 @@
+{
+ "_base": "overview.json",
+ "_settings": {
+  "schema_version": 1,
+  "gate_mode": {
+   "value": "block-critical",
+   "source": "config",
+   "choices": [
+    "block-critical",
+    "block",
+    "warn",
+    "off"
+   ]
+  },
+  "paused_until": null,
+  "runner_mode": "protect",
+  "auto_cancel_interruptible": false,
+  "pressure_suggestions": true,
+  "notifications": true,
+  "state_dir": "/opt/example/memmon",
+  "install": {
+   "commit": "abc1234",
+   "installed_at": 1791277200
+  }
+ },
+ "_view": {
+  "settings": true,
+  "update": {
+   "check": {
+    "exit": 0,
+    "stdout": {
+     "state": "available",
+     "installed": "abc1234",
+     "latest": "d4e5f60",
+     "behind": 7,
+     "commits": [
+      {
+       "sha": "d4e5f60",
+       "subject": "Show resource owners"
+      },
+      {
+       "sha": "1a2b3c4",
+       "subject": "Bullet each suggestion"
+      },
+      {
+       "sha": "9f8e7d6",
+       "subject": "Say which look System follows"
+      },
+      {
+       "sha": "5c6b7a8",
+       "subject": "Drop the week chart's footnotes"
+      },
+      {
+       "sha": "0f1e2d3",
+       "subject": "Ask Claude straight away"
+      },
+      {
+       "sha": "7a8b9c0",
+       "subject": "Title the Claude card by its answer"
+      },
+      {
+       "sha": "3e4f5a6",
+       "subject": "Keep stale visible under UNKNOWN"
+      }
+     ],
+     "reason": null
+    }
+   },
+   "apply": {
+    "exit": 0,
+    "stdout": {
+     "state": "started",
+     "from": "abc1234",
+     "to": "d4e5f60",
+     "log": "update.log"
+    }
+   }
+  }
+ }
+}

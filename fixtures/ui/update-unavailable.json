@@ -1,0 +1,38 @@
+{
+ "_base": "overview.json",
+ "_settings": {
+  "schema_version": 1,
+  "gate_mode": {
+   "value": "block-critical",
+   "source": "config",
+   "choices": [
+    "block-critical",
+    "block",
+    "warn",
+    "off"
+   ]
+  },
+  "paused_until": null,
+  "runner_mode": "protect",
+  "auto_cancel_interruptible": false,
+  "pressure_suggestions": true,
+  "notifications": true,
+  "state_dir": "/opt/example/memmon"
+ },
+ "_view": {
+  "settings": true,
+  "update": {
+   "check": {
+    "exit": 0,
+    "stdout": {
+     "state": "unavailable",
+     "installed": null,
+     "latest": null,
+     "behind": null,
+     "commits": [],
+     "reason": "Run ./install.sh once from your clone to enable updates"
+    }
+   }
+  }
+ }
+}
