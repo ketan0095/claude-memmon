@@ -1,5 +1,7 @@
 # memmon
 
+[![Tests](https://github.com/ketan0095/claude-memmon/actions/workflows/test.yml/badge.svg)](https://github.com/ketan0095/claude-memmon/actions/workflows/test.yml)
+
 A macOS memory monitor that shows which Claude session, Codex thread or app owns
 each process.
 
