@@ -281,6 +281,10 @@ class Registry:
             if cur.pid in self.ids and tuple(cur.start) == tuple(self.ids[cur.pid]):
                 return True
             seen.add(cur.pid)
+            # Another user's process (root, say) reads as present but
+            # unreadable, with no parent: the walk ends there.
+            if cur.ppid is None:
+                break
             cur = self.src.read(cur.ppid)
         return False
 
