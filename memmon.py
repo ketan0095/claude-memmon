@@ -3328,6 +3328,9 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
     complete = bool(seen) and len(seen) == len(members)
     system["cpu_coverage"] = memmon_owners.coverage(len(seen), len(members)) if seen else None
     system["cpu_cores"] = round(sum(seen), 3) if complete else None
+    # What the measured members add up to: a floor, since an unmeasured member
+    # (one that started after the baseline) can only add to it.
+    system["cpu_cores_min"] = round(sum(seen), 3) if seen else None
     if not seen:
         system["cpu_reason"] = sample.cpu_reason or "not measured"
     payload["runner_jobs"] = ctx.leases       # v2 rows, a strict superset of v1
