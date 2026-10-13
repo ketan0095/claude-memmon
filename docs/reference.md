@@ -346,12 +346,12 @@ summed over the owner. memmon reads it with libproc, in about 4 ms for every
 process on the machine, instead of `top`'s ~0.6 s. A number memmon could not
 read is shown as `—` with the reason, never as 0.
 
-CPU needs two samples, so a process that started after the first one is not
-measured yet. On a busy machine that is always a few processes, so when at
-least 90 % were measured the popover shows their total as a floor ("CPU at
-least 2.3 of 18 cores busy"); below that it says "CPU partly measured". CPU
-needs two samples: The popover takes them a second apart; the sampler keeps
-a baseline so the next tick can measure against it. Growth per 10 minutes
+CPU needs two samples. The popover takes them a second apart; the sampler keeps
+a baseline so the next tick can measure against it. A process that started after
+the first sample is not measured yet, and on a busy machine there are always a
+few. So when at least 90 % were measured, the popover shows their total as a
+floor ("CPU at least 2.3 of 18 cores busy"); below that it says "CPU partly
+measured". Growth per 10 minutes
 appears on an owner's detail card and in the Under pressure list. It needs at
 least 5 samples over 10 minutes with no gap longer than 3 minutes. Until then, a
 freshly started owner, or one seen across a sleep, shows "not enough history" on
