@@ -1398,20 +1398,21 @@ class RefreshAndTitleTests(StubCase):
     def title(self, payload, now):
         path = self.dir / "latest.json"
         path.write_text(json.dumps(payload))
-        return run_bin("--title-probe", "--latest", str(path), "--now", str(now)).strip()
+        return run_bin("--title-probe", "--latest", str(path), "--now", str(now),
+                       "--ram", str(48 * 1024 ** 3)).strip()
 
     def test_status_title_is_neutral_when_unknown_or_stale(self):
         base = {"ts": 1000, "used_bytes": 31.6 * 1024 ** 3, "swap_used": 2 * 1024 ** 3}
-        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1100), "🟢 32G")
-        self.assertEqual(self.title(dict(base, pressure="DANGER"), 1100), "🔴 32G")
-        self.assertEqual(self.title(base, 1100), "⚪ 32G")
-        self.assertEqual(self.title(dict(base, pressure="?"), 1100), "⚪ 32G")
-        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1181), "⚪ 32G")
+        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1100), "🟢 66%")
+        self.assertEqual(self.title(dict(base, pressure="DANGER"), 1100), "🔴 66%")
+        self.assertEqual(self.title(base, 1100), "⚪ 66%")
+        self.assertEqual(self.title(dict(base, pressure="?"), 1100), "⚪ 66%")
+        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1181), "⚪ 66%")
 
     def test_status_title_shows_memory_in_use_not_swap(self):
-        # The same number as the ring's centre; swap moves to the hover text.
+        # The ring's centre as a share of RAM; swap moves to the hover text.
         row = {"ts": 1000, "pressure": "HEALTHY", "used_bytes": 31.4 * 1024 ** 3, "swap_used": 1.3 * 1024 ** 3}
-        self.assertEqual(self.title(row, 1020), "🟢 31G")
+        self.assertEqual(self.title(row, 1020), "🟢 65%")
         # A sampler row from before used_bytes: the dot alone, never swap.
         self.assertEqual(self.title({"ts": 1000, "pressure": "HEALTHY", "swap_used": 2 * 1024 ** 3}, 1020), "🟢")
 
@@ -1714,7 +1715,8 @@ class UnknownPressureTests(StubCase):
         path.write_text(json.dumps({"ts": 1000, "used_bytes": 20 * 1024 ** 3, "swap_used": 2 * 1024 ** 3,
                                     "pressure": "UNKNOWN", "level_reason": "no rate baseline",
                                     "rates": "unavailable"}))
-        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 20G")
+        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010",
+                                 "--ram", str(40 * 1024 ** 3)).strip(), "⚪ 50%")
 
     def test_a_lower_bound_level_is_shown_as_at_least(self):
         p = payload("overview.json")

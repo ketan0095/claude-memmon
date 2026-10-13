@@ -6736,10 +6736,10 @@ private func titleLevel(_ j: [String: Any], now: Double) -> String? {
     return fresh ? j["pressure"] as? String : nil
 }
 
-/// The status-item title from the sampler's latest.json: a level dot and memory
-/// in use, the same number as the ring's centre. A row from a sampler that
-/// predates used_bytes shows the dot alone.
-func statusTitle(_ j: [String: Any], now: Double) -> String? {
+/// The status-item title from the sampler's latest.json: a level dot and the
+/// share of RAM in use, the ring's centre as a percentage. A row from a sampler
+/// that predates used_bytes shows the dot alone.
+func statusTitle(_ j: [String: Any], now: Double, ram: Double) -> String? {
     guard j["ts"] != nil else { return nil }
     let dot: String
     switch titleLevel(j, now: now) {
@@ -6748,8 +6748,8 @@ func statusTitle(_ j: [String: Any], now: Double) -> String? {
     case "HEALTHY"?: dot = "🟢"
     default: dot = "⚪"
     }
-    guard let used = num(j["used_bytes"]) else { return dot }
-    return "\(dot) \(String(format: "%.0fG", used / GB))"
+    guard let used = num(j["used_bytes"]), ram > 0 else { return dot }
+    return "\(dot) \(String(format: "%.0f%%", min(used / ram, 1) * 100))"
 }
 
 /// What hovering the status item says: the number spelled out, swap, the
@@ -6892,7 +6892,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let now = Date().timeIntervalSince1970
         guard let d = FileManager.default.contents(atPath: cache),
               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-              let title = statusTitle(j, now: now) else { return }
+              let title = statusTitle(j, now: now, ram: Double(ProcessInfo.processInfo.physicalMemory)) else { return }
         statusItem.button?.attributedTitle = NSAttributedString(
             string: title,
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)])
@@ -8181,11 +8181,11 @@ if ARGS.contains("--title-probe") {
           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
         fail("usage: --title-probe --latest <latest.json> --now <epoch>")
     }
+    let ram = argValue("--ram").flatMap(Double.init) ?? Double(ProcessInfo.processInfo.physicalMemory)
     if ARGS.contains("--tooltip") {
-        let ram = argValue("--ram").flatMap(Double.init) ?? Double(ProcessInfo.processInfo.physicalMemory)
         print(statusTooltip(j, now: now, ram: ram))
     } else {
-        print(statusTitle(j, now: now) ?? "")
+        print(statusTitle(j, now: now, ram: ram) ?? "")
     }
     exit(0)
 }
