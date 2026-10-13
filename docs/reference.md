@@ -280,9 +280,9 @@ The terminal dashboard looks like this:
 ## Reading the popover
 
 **The menu-bar item** shows a dot for memory pressure (🟢 normal, 🟠 watch,
-🔴 danger or critical, ⚪ unknown or a sample older than 3 minutes) and the
-memory in use in GB, the same number as the ring's centre. Hover over it for
-the exact figure, swap and how old the sample is.
+🔴 danger or critical, ⚪ unknown or a sample older than 3 minutes) and how
+much of your RAM is in use, as a percentage. Hover over it for the figure in
+GB, swap and how old the sample is.
 
 From top to bottom:
 
