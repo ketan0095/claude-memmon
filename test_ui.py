@@ -1401,12 +1401,32 @@ class RefreshAndTitleTests(StubCase):
         return run_bin("--title-probe", "--latest", str(path), "--now", str(now)).strip()
 
     def test_status_title_is_neutral_when_unknown_or_stale(self):
-        base = {"ts": 1000, "swap_used": 2 * 1024 ** 3}
-        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1100), "🟢 2.0G")
-        self.assertEqual(self.title(dict(base, pressure="DANGER"), 1100), "🔴 2.0G")
-        self.assertEqual(self.title(base, 1100), "⚪ 2.0G")
-        self.assertEqual(self.title(dict(base, pressure="?"), 1100), "⚪ 2.0G")
-        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1181), "⚪ 2.0G")
+        base = {"ts": 1000, "used_bytes": 31.6 * 1024 ** 3, "swap_used": 2 * 1024 ** 3}
+        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1100), "🟢 32G")
+        self.assertEqual(self.title(dict(base, pressure="DANGER"), 1100), "🔴 32G")
+        self.assertEqual(self.title(base, 1100), "⚪ 32G")
+        self.assertEqual(self.title(dict(base, pressure="?"), 1100), "⚪ 32G")
+        self.assertEqual(self.title(dict(base, pressure="HEALTHY"), 1181), "⚪ 32G")
+
+    def test_status_title_shows_memory_in_use_not_swap(self):
+        # The same number as the ring's centre; swap moves to the hover text.
+        row = {"ts": 1000, "pressure": "HEALTHY", "used_bytes": 31.4 * 1024 ** 3, "swap_used": 1.3 * 1024 ** 3}
+        self.assertEqual(self.title(row, 1020), "🟢 31G")
+        # A sampler row from before used_bytes: the dot alone, never swap.
+        self.assertEqual(self.title({"ts": 1000, "pressure": "HEALTHY", "swap_used": 2 * 1024 ** 3}, 1020), "🟢")
+
+    def tooltip(self, payload, now, ram=48 * 1024 ** 3):
+        path = self.dir / "latest.json"
+        path.write_text(json.dumps(payload))
+        return run_bin("--title-probe", "--tooltip", "--latest", str(path), "--now", str(now),
+                       "--ram", str(ram)).strip()
+
+    def test_status_tooltip_spells_the_number_out(self):
+        row = {"ts": 1000, "pressure": "HEALTHY", "used_bytes": 31.4 * 1024 ** 3, "swap_used": 1.3 * 1024 ** 3}
+        self.assertEqual(self.tooltip(row, 1020),
+                         "31.4 GB in use of 48 · swap 1.3 GB · memory pressure normal · sampled 20 s ago")
+        stale = self.tooltip(dict(row, swap_used=300 * 1024 ** 2), 1000 + 600)
+        self.assertEqual(stale, "31.4 GB in use of 48 · swap 300 MB · memory pressure unknown · sampled 10 min ago")
 
 
 class GeneratorContractTests(unittest.TestCase):
@@ -1691,9 +1711,10 @@ class UnknownPressureTests(StubCase):
 
     def test_status_item_dot_is_neutral_for_unknown(self):
         path = self.dir / "latest.json"
-        path.write_text(json.dumps({"ts": 1000, "swap_used": 2 * 1024 ** 3, "pressure": "UNKNOWN",
-                                    "level_reason": "no rate baseline", "rates": "unavailable"}))
-        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 2.0G")
+        path.write_text(json.dumps({"ts": 1000, "used_bytes": 20 * 1024 ** 3, "swap_used": 2 * 1024 ** 3,
+                                    "pressure": "UNKNOWN", "level_reason": "no rate baseline",
+                                    "rates": "unavailable"}))
+        self.assertEqual(run_bin("--title-probe", "--latest", str(path), "--now", "1010").strip(), "⚪ 20G")
 
     def test_a_lower_bound_level_is_shown_as_at_least(self):
         p = payload("overview.json")

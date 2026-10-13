@@ -6727,21 +6727,47 @@ struct ContentView: View {
 
 // MARK: - app
 
-/// The status-item title from the sampler's latest.json: a level dot and swap
-/// in use. An unknown level or a sample older than 180 s gets a neutral dot,
-/// never green.
+/// A sample older than this gets a neutral dot, never green.
+let titleFreshS: Double = 180
+
+/// The pressure level of a fresh sample, nil when it is unknown or stale.
+private func titleLevel(_ j: [String: Any], now: Double) -> String? {
+    let fresh = num(j["ts"]).map { now - $0 <= titleFreshS } ?? false
+    return fresh ? j["pressure"] as? String : nil
+}
+
+/// The status-item title from the sampler's latest.json: a level dot and memory
+/// in use, the same number as the ring's centre. A row from a sampler that
+/// predates used_bytes shows the dot alone.
 func statusTitle(_ j: [String: Any], now: Double) -> String? {
-    guard let used = num(j["swap_used"]) else { return nil }
-    let fresh = num(j["ts"]).map { now - $0 <= 180 } ?? false
+    guard j["ts"] != nil else { return nil }
     let dot: String
-    switch fresh ? (j["pressure"] as? String) : nil {
+    switch titleLevel(j, now: now) {
     case "CRITICAL"?, "DANGER"?: dot = "🔴"
     case "WATCH"?: dot = "🟠"
     case "HEALTHY"?: dot = "🟢"
     default: dot = "⚪"
     }
-    let text = used >= GB ? String(format: "%.1fG", used / GB) : String(format: "%.0fM", used / MB)
-    return "\(dot) \(text)"
+    guard let used = num(j["used_bytes"]) else { return dot }
+    return "\(dot) \(String(format: "%.0fG", used / GB))"
+}
+
+/// What hovering the status item says: the number spelled out, swap, the
+/// pressure verdict and how old the sample is.
+func statusTooltip(_ j: [String: Any], now: Double, ram: Double) -> String {
+    var parts: [String] = []
+    if let used = num(j["used_bytes"]) {
+        parts.append(String(format: "%.1f GB in use of %.0f", used / GB, ram / GB))
+    }
+    if let swap = num(j["swap_used"]) {
+        parts.append("swap " + (swap >= GB ? String(format: "%.1f GB", swap / GB) : String(format: "%.0f MB", swap / MB)))
+    }
+    parts.append("memory pressure " + pressureWord(titleLevel(j, now: now)).lowercased())
+    if let ts = num(j["ts"]) {
+        let age = max(0, now - ts)
+        parts.append(age < 60 ? String(format: "sampled %.0f s ago", age) : String(format: "sampled %.0f min ago", age / 60))
+    }
+    return parts.joined(separator: " · ")
 }
 
 /// The popover's content, shared by the app and the hosted-view self-test.
@@ -6860,15 +6886,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updateTitleFromCache()
     }
 
-    /// Colour comes from the pressure model, not from swap usage: macOS grows
-    /// swap on demand, so a large swapfile on its own means nothing.
+    /// Colour comes from the pressure model, not from how much memory is used:
+    /// macOS keeps RAM busy on purpose, so a high number on its own means nothing.
     func updateTitleFromCache() {
+        let now = Date().timeIntervalSince1970
         guard let d = FileManager.default.contents(atPath: cache),
               let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-              let title = statusTitle(j, now: Date().timeIntervalSince1970) else { return }
+              let title = statusTitle(j, now: now) else { return }
         statusItem.button?.attributedTitle = NSAttributedString(
             string: title,
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)])
+        statusItem.button?.toolTip = statusTooltip(j, now: now, ram: Double(ProcessInfo.processInfo.physicalMemory))
     }
 }
 
@@ -8153,7 +8181,12 @@ if ARGS.contains("--title-probe") {
           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else {
         fail("usage: --title-probe --latest <latest.json> --now <epoch>")
     }
-    print(statusTitle(j, now: now) ?? "")
+    if ARGS.contains("--tooltip") {
+        let ram = argValue("--ram").flatMap(Double.init) ?? Double(ProcessInfo.processInfo.physicalMemory)
+        print(statusTooltip(j, now: now, ram: ram))
+    } else {
+        print(statusTitle(j, now: now) ?? "")
+    }
     exit(0)
 }
 if ARGS.contains("--selftest-refresh") {
