@@ -484,6 +484,8 @@ struct SystemInfo {
     var kernelLevel: String? = nil
     var kernel: String? { pressureLevel ?? kernelLevel }
     var ncpu: Double?, cpuCores: Double?, cpuCoverage: Double?
+    /// The measured members' sum: a floor whenever coverage is below 1.
+    var cpuCoresMin: Double? = nil
     /// Why nothing was measured; set only when cpu_coverage is null.
     var cpuReason: String?
     var reason: String?
@@ -746,6 +748,7 @@ struct OwnersSnap {
             s.system.idleBytes = num(y["idle_bytes"]); s.system.cacheBytes = num(y["cache_bytes"])
             s.system.levelReason = str(y["level_reason"]); s.system.rates = str(y["rates"])
             s.system.kernelLevel = str(y["kernel_level"])
+            s.system.cpuCoresMin = num(y["cpu_cores_min"])
         }
         if let p = j["protection"] as? [String: Any] {
             s.protection = Protection(summary: str(p["summary"]), gate: str(p["gate"]),
@@ -1054,6 +1057,21 @@ func pressureWord(_ level: String?) -> String {
     case "CRITICAL": return "Critical"
     default: return "Unknown"
     }
+}
+
+/// Below this share of processes measured, even a floor says too little.
+let cpuFloorCoverage = 0.9
+
+/// The CPU line when there is no complete total. New processes keep appearing
+/// between two samples on a busy machine, so coverage rarely reaches 1: show
+/// what was measured as a floor rather than waiting for it.
+func cpuShortfall(_ sys: SystemInfo, degraded: Bool, ncpu: Double) -> String {
+    if degraded { return "CPU not measured" }
+    guard let coverage = sys.cpuCoverage else { return "CPU \(sys.cpuReason ?? "not measured")" }
+    if coverage >= cpuFloorCoverage, let floor = sys.cpuCoresMin {
+        return String(format: "CPU at least %.1f of %.0f cores busy", floor, ncpu)
+    }
+    return "CPU partly measured"
 }
 
 /// The section's memory: owners partition processes, so known footprints add up.
@@ -6038,12 +6056,10 @@ struct ContentView: View {
         let headline = pressureHeadline(level, reason: sys.levelReason)
         let segments = ringSegments(s.rows, used: sys.usedBytes)
         let used = sys.usedBytes, ram = sys.ramBytes
-        // A partial sum would understate the machine, so memmon sends a CPU
-        // total only when every process was measured (coverage exactly 1).
-        let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
-        let cpuMissing = s.degraded ? "CPU not measured"
-            : sys.cpuCoverage == nil ? "CPU \(sys.cpuReason ?? "not measured")" : "CPU still measuring some processes"
         let ncpu = sys.ncpu ?? Double(ProcessInfo.processInfo.activeProcessorCount)
+        // The total only when every process was measured; otherwise a floor.
+        let cpuNow = sys.cpuCoverage == 1 ? sys.cpuCores : nil
+        let cpuMissing = cpuShortfall(sys, degraded: s.degraded, ncpu: ncpu)
         let over = (used ?? 0) > (ram ?? .infinity)
         let free = used.flatMap { u in ram.map { max($0 - u, 0) } }
         let legend = Array(segments.filter { if case .section = $0.kind { return true }; return false }
@@ -6130,7 +6146,8 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .help("Pressure score \(level ?? "unavailable")"
                       + (sys.levelReason.map { " (\($0))" } ?? "")
-                      + " · macOS memory pressure \(sys.kernel ?? "unavailable")")
+                      + " · macOS memory pressure \(sys.kernel ?? "unavailable")"
+                      + (sys.cpuCoverage.map { $0 < 1 ? String(format: "\nCPU measured for %.0f%% of processes; ones started in the last few seconds are not counted yet.", $0 * 100) : "" } ?? ""))
             if let notice = gapNotice(s, dismissed: model.dismissedGap, now: nowTs()) {
                 gapNoticeRow(notice)
             }

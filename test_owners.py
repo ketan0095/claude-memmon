@@ -1013,6 +1013,7 @@ class OwnersCliTests(unittest.TestCase):
         self.assertEqual(payload["system"]["ncpu"], os.cpu_count())
         self.assertIsNone(payload["system"]["cpu_cores"])       # window 0, no baseline
         self.assertIsNone(payload["system"]["cpu_coverage"])
+        self.assertIsNone(payload["system"]["cpu_cores_min"])
         self.assertEqual(payload["system"]["cpu_reason"], "warming up")
         self.assertEqual(payload["runner_jobs"], [])
         self.assertEqual(payload["protection"],
@@ -1042,6 +1043,8 @@ class OwnersCliTests(unittest.TestCase):
                 system = memmon.owners_json(1.0, ctx=ctx)["system"]
             self.assertEqual(system["cpu_cores"], expect)
             self.assertEqual(system["cpu_coverage"], 0.5 if partial else 1.0)
+            # The measured member's 1.0 core is a floor either way.
+            self.assertEqual(system["cpu_cores_min"], 1.0)
 
     def test_system_cpu_counts_whole_members_not_rounded_fractions(self):
         # One owner of 2001 members, one unmeasured: 2000/2001 rounds to 1.0,

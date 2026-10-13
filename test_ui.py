@@ -679,14 +679,29 @@ class AccessibilityTests(unittest.TestCase):
         self.assertIn("Managed job acme-api tests, waiting, resource held by acme-web typecheck · 12s", found)
 
     def test_cpu_total_only_with_full_coverage(self):
-        self.assertIn("CPU still measuring some processes", self.spoken("small.json"))
-        self.assertIn("CPU still measuring some processes", self.spoken("overview.json"))
+        # Under 90 % measured, even a floor says too little.
+        self.assertIn("CPU partly measured", self.spoken("small.json"))
+        self.assertIn("CPU partly measured", self.spoken("overview.json"))
+        self.assertNotIn("still measuring", self.spoken("overview.json"))
         self.assertIn("CPU 3.1 of 18 cores busy", self.spoken("helpers-only.json"))
         for jargon in ("Score HEALTHY", "kernel normal"):
             self.assertNotIn(jargon, self.spoken("overview.json"))
         # Nothing measured: coverage is null and memmon says why.
         self.assertIn("CPU warming up", self.spoken("warming-up.json"))
         self.assertIn("CPU not measured", self.spoken("degraded.json"))
+
+    def test_most_measured_shows_a_floor_not_a_wait(self):
+        # A busy Mac starts processes between samples, so coverage rarely hits 1.
+        p = payload("overview.json")
+        p["system"] = dict(p["system"], cpu_coverage=0.976, cpu_cores=None, cpu_cores_min=3.14)
+        found = said_payload(p)
+        self.assertTrue(any(l.startswith("CPU at least 3.1 of 18 cores busy") for l in found), found)
+        self.assertFalse(any("still measuring" in l for l in found))
+        # Without the floor (an older CLI), or below 90 %, it says so plainly.
+        p["system"].pop("cpu_cores_min")
+        self.assertTrue(any(l.startswith("CPU partly measured") for l in said_payload(p)))
+        p["system"].update(cpu_coverage=0.85, cpu_cores_min=3.14)
+        self.assertTrue(any(l.startswith("CPU partly measured") for l in said_payload(p)))
 
     def test_unattributed_cpu_needs_every_tree_fully_measured(self):
         found = labels(a11y("unattributed-partial.json"))
@@ -1507,7 +1522,7 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertIsNone(payload["system"]["cpu_cores"])
         self.assertEqual(payload["runner_jobs"], [self.LEASE])
         spoken = " ".join(r["label"] + " " + r["value"] for r in rows)
-        self.assertIn("CPU still measuring some processes", spoken)
+        self.assertTrue("CPU at least" in spoken or "CPU partly measured" in spoken, spoken)
         self.assertIn("Managed job acme-api tests, waiting, memory pressure: WATCH · 12s",
                       [r["label"] or r["value"] for r in rows])
 
