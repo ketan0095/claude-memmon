@@ -881,9 +881,26 @@ the gaps in its window. After a starved gap with at least 5 min awake, the
 sampler posts one notification and the menu bar shows a notice for a day. The
 notice never says why sampling stopped: an unloaded sampler looks the same.
 
-Each run has a 40 s budget. If `top` or `lsof` stalls past it, the run writes
-what it has as a `partial` row and exits, so the next minute's run is not
-hidden behind it. The sampler runs at launchd's Standard priority rather than
+Each run has a 40 s budget. Right after the pressure reading, the run writes an
+essentials row (`"stage": "essentials"`) from libproc and sysctl alone: memory
+in use, swap, the pressure level and the five largest owners as `owners_top`.
+The full collection then rewrites that row in place (`"stage": "full"`). If
+`top` or `lsof` stalls past the budget, the essentials row stays, marked
+`partial`, and the run exits, so the next minute's run is not hidden behind it.
+A partial row also carries the last full row's top owners as `owners_carried`
+(`from_ts`, `top`), so the worst minute still says who was big.
+
+The essentials step also watches for runaway growth, at any pressure level.
+An owner that grew by at least 1 GB a minute over three samples in a row
+(three minutes) and is at least 4 GB now gets one notification: *"Checkout
+refactor grew 9 GB in 5 min (now 14 GB). Open memmon to stop it."* Nothing is
+stopped. The episode ends once it has not grown that fast for 5 minutes, or the
+owner is gone; growing again starts a new one. While it lasts, `latest.json`
+lists it under `runaway` (`owner_id`, `title`, `bytes`, `grown_bytes`,
+`minutes`, `since_ts`), and `memmon owners --json` repeats that list as
+`system.runaway` while the sample is fresh.
+
+The sampler runs at launchd's Standard priority rather than
 Background, which would yield to exactly the contention it is there to observe.
 Standard still has light resource limits, so this lessens throttling; it does
 not remove it.

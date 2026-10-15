@@ -50,6 +50,22 @@ class UsageTests(unittest.TestCase):
         with open(path, "w") as fh:
             fh.writelines(json.dumps(r) + "\n" for r in rows)
 
+    def test_essentials_rows_count_as_measured_memory(self):
+        # A minute whose full collection overran is an essentials row: its
+        # strict used_bytes is measured memory, and it has no sections.
+        ess = {"ts": int(at(0, 13)), "stage": "essentials", "partial": True,
+               "used_bytes": 20 * GB, "free_pct": 10, "swap_used": 9 * GB,
+               "pressure": "CRITICAL",
+               "owners_top": [{"owner_id": "claude:0000a001", "title": "Checkout refactor",
+                               "kind": "claude", "bytes": 12 * GB}]}
+        self.write(memmon.HISTORY, [full_row(at(0)), ess])
+        day = memmon.usage(1, now=NOW)["series"][-1]
+        self.assertEqual(day["samples"], 2)
+        self.assertEqual(day["mem_basis"], "measured")
+        self.assertEqual(day["mem_avg_bytes"], 25 * GB)
+        self.assertEqual(day["mem_peak_bytes"], 30 * GB)
+        self.assertEqual(day["by_section"]["claude"], GB + GB // 2)   # the full row only
+
     def test_shape_and_empty_days(self):
         self.write(memmon.HISTORY, [full_row(at(-6)), full_row(at(-6, 13), ram=34 * GB),
                                     full_row(at(-2)), full_row(at(0))])
@@ -251,6 +267,15 @@ class UsageTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(memmon.main(), 0)
         self.assertEqual(len(json.loads(out.getvalue())["series"]), 3)
+
+
+class TempStateIsolationTests(unittest.TestCase):
+    def test_the_usage_cache_never_lands_in_the_real_state_dir(self):
+        # Suites that call usage() without patching write this cache, so
+        # TempState itself must point it at the temp dir.
+        state = TempState()
+        self.addCleanup(state.close)
+        self.assertTrue(memmon.USAGE_CACHE.startswith(state.root), memmon.USAGE_CACHE)
 
 
 class UsageBenchTests(unittest.TestCase):
