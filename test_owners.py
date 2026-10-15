@@ -956,6 +956,20 @@ class LegacyCompatTests(unittest.TestCase):
             snap = memmon.collect()
         self.assertEqual(set(snap), self.LEGACY_KEYS)
 
+    def test_collect_survives_a_session_root_that_exited_mid_sample(self):
+        # The daemon names a root PID that ps no longer lists: the sampler
+        # crashed on it (KeyError) and lost that minute's reading.
+        gone = 2 ** 22 + 12345
+        session = {"short": "deadbeef", "name": "Checkout refactor", "state": "working",
+                   "doing": "", "learning_cmd": None, "cwd": "", "session_id": "s-1",
+                   "updated": T0, "intent": ""}
+        with mock.patch.object(memmon, "read_sessions", return_value=[session]), \
+                mock.patch.object(memmon, "map_pids_to_jobs", return_value={gone: "deadbeef"}):
+            snap = memmon.collect()
+        # A gone session is not listed as live, and the reading is not lost.
+        self.assertFalse(any(s.get("session_id") == "s-1" for s in snap["sessions"]))
+        self.assertIn("vm", snap)
+
     def test_log_row_shape_unchanged(self):
         snap = {"ts": T0, "vm": {}, "pressure": {"level": "HEALTHY"}, "orphan_total": 0,
                 "sessions": [], "apps": {}, "worktrees": [], "overhead": {}}
