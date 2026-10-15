@@ -987,7 +987,7 @@ class LegacyCompatTests(unittest.TestCase):
                                     "under_pressure", "pressure_suggestions",
                                     "suggestions_ts",
                                     # The sampler's essentials-first rewrite
-                                    "stage"})
+                                    "stage", "runaway"})
 
     def test_runway_copy_is_a_trend_to_the_floor(self):
         # P11: the estimate is to the 20 % floor, never "runs out".
