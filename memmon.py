@@ -1324,7 +1324,9 @@ def collect(pres: dict | None = None) -> dict:
     live_sessions = []
     for s in sessions:
         root = short_to_pid.get(s.get("short")) or sid_to_pid.get(s["session_id"])
-        if root is None:
+        # The daemon's map is read separately from ps: a root that exited in
+        # between is as gone as one never found.
+        if root is None or root not in ps:
             s["alive"] = False
             s["mem"] = s["cmprs"] = s["nproc"] = 0
             s["top_children"] = []
