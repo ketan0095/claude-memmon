@@ -269,6 +269,15 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(len(json.loads(out.getvalue())["series"]), 3)
 
 
+class TempStateIsolationTests(unittest.TestCase):
+    def test_the_usage_cache_never_lands_in_the_real_state_dir(self):
+        # Suites that call usage() without patching write this cache, so
+        # TempState itself must point it at the temp dir.
+        state = TempState()
+        self.addCleanup(state.close)
+        self.assertTrue(memmon.USAGE_CACHE.startswith(state.root), memmon.USAGE_CACHE)
+
+
 class UsageBenchTests(unittest.TestCase):
     """p95 at most 300 ms, cold, on a full 12 MB history. Runs only while the
     machine reads HEALTHY."""
