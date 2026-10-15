@@ -24,7 +24,7 @@ from unittest import mock
 
 import memmon
 import memmon_telemetry
-from testkit import TempState
+from testkit import FakeSource, P, TempState, session_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GB = 1 << 30
@@ -528,6 +528,157 @@ class BudgetTests(unittest.TestCase):
     def test_budget_is_not_an_exception(self):
         self.assertTrue(issubclass(memmon.SamplerBudget, BaseException))
         self.assertFalse(issubclass(memmon.SamplerBudget, Exception))
+
+
+T0 = 1_700_000_000
+
+
+def owner_source(claude_fp=6 * GB, extra=()):
+    """A synthetic table: a Claude session ("Checkout refactor") whose build
+    child is 2 GB, and an unattributed 3 GB node server."""
+    return FakeSource([P(os.getpid(), ppid=0, comm="Python"),
+                       P(10, start=(T0 + 10, 0), comm="2.1.293", fp=claude_fp),
+                       P(11, ppid=10, pgid=11, comm="node", fp=2 * GB),
+                       P(20, comm="node", fp=3 * GB), *extra],
+                      argv={10: ["claude"], 11: ["node", "/r/acme-web/build.js"],
+                            20: ["node", "/r/acme-web/server.js"]},
+                      cwds={11: "/r/acme-web", 20: "/r/acme-web"})
+
+
+class EssentialsTests(unittest.TestCase):
+    """The sampler under pressure: the essentials row (libproc and sysctl
+    only) goes out before collect(), so a run that overruns its budget still
+    records used_bytes and who was big."""
+
+    def setUp(self):
+        self.st = SamplerState(self)
+        session_file(memmon.CLAUDE_SESSIONS_DIR, 10, T0 + 10, job_id="0000a001")
+        p = mock.patch.object(memmon, "read_sessions", return_value=[
+            {"short": "0000a001", "name": "Checkout refactor", "session_id": None}])
+        p.start()
+        self.addCleanup(p.stop)
+        self.src = owner_source()
+        self.seen = []
+
+    def full(self, pres):
+        self.seen.append(self.st.read(memmon.SNAPSHOT))
+        return {"ts": time.time(), "vm": {}, "pressure": pres, "orphan_total": 0,
+                "sessions": [{"name": "Checkout refactor", "mem": 8 * GB}],
+                "apps": {}, "worktrees": []}
+
+    @staticmethod
+    def overrun(pres):
+        raise memmon.SamplerBudget()
+
+    def sample(self, T, collect=None):
+        with mock.patch.object(memmon, "collect", collect or self.full), \
+                mock.patch.object(memmon, "learn"), \
+                mock.patch("sys.stderr", io.StringIO()):
+            rc = memmon.sampler_run(budget_s=5.0, source=T, clock=T, procs=self.src)
+        T.sleep(60)
+        return rc
+
+    def rows(self):
+        with open(memmon.HISTORY) as fh:
+            return [json.loads(line) for line in fh]
+
+    def test_full_run_rewrites_the_essentials_row(self):
+        T = FakeTelemetry()
+        self.assertEqual(self.sample(T), 0)
+        ess = self.seen[0]                    # latest.json while collect() ran
+        self.assertEqual(ess["stage"], "essentials")
+        self.assertNotIn("sessions", ess)
+        self.assertGreater(ess["used_bytes"], 0)
+        self.assertEqual(ess["owners_top"][0], {
+            "owner_id": ess["owners_top"][0]["owner_id"], "title": "Checkout refactor",
+            "kind": "claude", "bytes": 8 * GB})
+        self.assertEqual([o["bytes"] for o in ess["owners_top"]][:2], [8 * GB, 3 * GB])
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)        # rewritten in place, not appended
+        self.assertEqual(rows[0]["stage"], "full")
+        self.assertEqual(rows[0]["owners_top"], ess["owners_top"])
+        self.assertEqual(rows[0]["sessions"], {"Checkout refactor": 8 * GB})
+        self.assertEqual(rows[0]["used_bytes"], ess["used_bytes"])
+        self.assertNotIn("partial", rows[0])
+        self.assertEqual(self.st.read(memmon.SNAPSHOT), rows[0])
+
+    def test_overrun_keeps_used_bytes_and_top_owners(self):
+        T = FakeTelemetry()
+        self.sample(T)
+        self.src.table[10].footprint = 20 * GB
+        self.sample(T, self.overrun)
+        first, row = self.rows()
+        self.assertEqual(self.st.read(memmon.SNAPSHOT), row)
+        self.assertTrue(row["partial"])
+        self.assertEqual(row["partial_reason"], "sampler budget exceeded")
+        self.assertEqual(row["stage"], "essentials")
+        self.assertGreater(row["used_bytes"], 0)
+        self.assertEqual(row["owners_top"][0]["title"], "Checkout refactor")
+        self.assertEqual(row["owners_top"][0]["bytes"], 22 * GB)
+        self.assertEqual(row["owners_carried"],
+                         {"from_ts": first["ts"], "top": first["owners_top"]})
+        self.assertIn(row["pressure"], ("HEALTHY", "WATCH", "DANGER", "CRITICAL"))
+
+    def test_overrun_before_the_essentials_row_carries_owners(self):
+        T = FakeTelemetry()
+        self.sample(T)
+        with mock.patch.object(memmon, "sampler_owners", side_effect=memmon.SamplerBudget):
+            self.sample(T)
+            self.sample(T)
+        first, second, third = self.rows()
+        for row in (second, third):
+            self.assertTrue(row["partial"])
+            self.assertNotIn("stage", row)
+            self.assertGreater(row["used_bytes"], 0)
+            self.assertEqual(row["owners_carried"],
+                             {"from_ts": first["ts"], "top": first["owners_top"]})
+        # The next full run names its own owners and carries nothing.
+        self.sample(T)
+        self.assertNotIn("owners_carried", self.rows()[-1])
+        self.assertEqual(self.rows()[-1]["owners_top"][0]["title"], "Checkout refactor")
+
+    def test_a_row_appended_meanwhile_is_kept(self):
+        # The live dashboard may append between the essentials row and the
+        # full one: its row stays, and the full row goes after it.
+        T = FakeTelemetry()
+
+        def dashboard(pres):
+            with open(memmon.HISTORY, "a") as fh:
+                fh.write(json.dumps({"ts": int(time.time()), "stage": "full"}) + "\n")
+            return self.full(pres)
+        self.sample(T, dashboard)
+        rows = self.rows()
+        self.assertEqual([r["stage"] for r in rows], ["essentials", "full", "full"])
+        self.assertIn("sessions", rows[2])
+
+    def test_falling_edge_notice_reads_the_previous_row(self):
+        # latest.json holds this run's essentials row by the time the full
+        # row is written; the "cleared" notice compares with the run before.
+        self.st.write(memmon.SNAPSHOT, {"ts": time.time() - 60, "pressure": "CRITICAL"})
+        self.st.write(memmon.PENDING, [{"ts": time.time(), "cmd": "pnpm build"}])
+        self.sample(FakeTelemetry())
+        self.assertIn(self.rows()[-1]["pressure"], ("HEALTHY", "WATCH"))
+        self.assertEqual([n for n in self.st.notes if "can be retried" in n[0]],
+                         [("1 blocked command(s) can be retried", "memmon",
+                           "Memory pressure cleared")])
+
+    def test_essentials_bench_750_processes(self):
+        # Informational: printed, never asserted (the machine is shared).
+        procs = [P(1000 + i, comm="node", fp=(50 + i) * 1024 * 1024) for i in range(746)]
+        self.src = owner_source(extra=procs)
+        T = FakeTelemetry()
+        times = []
+        for _ in range(20):
+            reading = memmon.sampler_reading(T, T)
+            t0 = time.perf_counter()
+            with mock.patch("sys.stderr", io.StringIO()):
+                memmon.sampler_essentials(reading, self.src)
+            times.append((time.perf_counter() - t0) * 1000)
+            T.sleep(60)
+        times.sort()
+        print(f"\nessentials bench: {len(self.src.table)} processes, "
+              f"median {times[len(times) // 2]:.0f} ms, p95 {times[18]:.0f} ms",
+              file=sys.stderr)
 
 
 class UnknownReaderTests(unittest.TestCase):

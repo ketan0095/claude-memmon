@@ -1994,11 +1994,15 @@ def _log_row(snap: dict, reading: dict | None) -> dict:
         "worktrees": {f"build:{r['name']}": r["mem"] for r in snap.get("worktrees", [])},
         "worktree_tags": {r["name"]: r.get("tag", "") for r in snap.get("worktrees", [])},
         "overhead": (snap.get("overhead") or {}).get("mem", 0),
+        "stage": "full",
     }
     row.update(_s2_fields(p, rec, vm))
     if reading is not None:
         row["pressure_suggestions"] = snap.get("pressure_suggestions") or []
         row["suggestions_ts"] = row["ts"]
+        ess = (reading.get("essentials") or {}).get("row")
+        if ess is not None:
+            row["owners_top"] = ess["owners_top"]
     else:
         # The live dashboard never scans for suggestions. It carries the
         # sampler's list, the under_pressure it was computed under and when,
@@ -2028,18 +2032,39 @@ def _s2_fields(p: dict, rec: dict, vm: dict) -> dict:
     return out
 
 
-def _append_row(row: dict, reading: dict | None = None) -> None:
+def _write_line(row: dict, replace: dict | None) -> tuple:
+    """Append one history line, or put it in place of the line `replace`
+    names (this run's essentials row) when that line is still the last one.
+    Anything appended since (the live dashboard's row) stays: the new line
+    then goes after it. Returns the line's (start, end) offsets."""
+    data = (json.dumps(row) + "\n").encode()
+    try:
+        fh = open(HISTORY, "ab" if replace is None else "r+b")
+    except FileNotFoundError:
+        fh, replace = open(HISTORY, "ab"), None
+    with fh:
+        end = fh.seek(0, os.SEEK_END)
+        if replace is not None and end == replace["end"]:
+            fh.truncate(replace["at"])
+            end = fh.seek(replace["at"])
+        fh.write(data)
+    return end, end + len(data)
+
+
+def _append_row(row: dict, reading: dict | None = None, essentials: bool = False) -> None:
     import memmon_owners
     import signal
     os.makedirs(STATE_DIR, exist_ok=True)
+    ess = (reading or {}).get("essentials")
     # The append and the flag are one step as far as the budget goes: SIGALRM
     # is held until both are done, so an expiry either precedes the row (and a
     # partial row follows) or only re-publishes it, never both.
     held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     try:
-        with open(HISTORY, "a") as fh:
-            fh.write(json.dumps(row) + "\n")
-        if reading is not None:
+        at, end = _write_line(row, ess)
+        if essentials:
+            reading["essentials"] = {"row": row, "at": at, "end": end}
+        elif reading is not None:
             reading["row"] = row
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, held)
@@ -2053,8 +2078,12 @@ def log_sample(snap: dict, reading: dict | None = None) -> None:
     # something is still waiting to be re-run. Only on the transition, so it
     # cannot nag every minute.
     try:
-        with open(SNAPSHOT) as fh:
-            was = json.load(fh).get("pressure", "HEALTHY")
+        # This run's essentials row is already in latest.json.
+        if reading is not None and "was" in reading:
+            was = reading["was"]
+        else:
+            with open(SNAPSHOT) as fh:
+                was = json.load(fh).get("pressure", "HEALTHY")
     except Exception:
         was = "HEALTHY"
     now_level = row["pressure"]
@@ -2085,16 +2114,31 @@ def gap_notice(gap: dict) -> str:
             "Readings around the gap may be incomplete.")
 
 
+def _carried_owners(prev: dict | None) -> dict | None:
+    """The top owners of the newest row that has its own: the previous row's,
+    or what that row itself carried."""
+    if not prev:
+        return None
+    if prev.get("owners_top") and not prev.get("partial"):
+        return {"from_ts": prev.get("ts"), "top": prev["owners_top"]}
+    return prev.get("owners_carried")
+
+
 def write_partial(reading: dict | None) -> dict:
-    """The row a budget-killed run leaves: whatever the pressure phase knew."""
+    """The row a budget-killed run leaves before its essentials row: whatever
+    the pressure phase knew, and the last full row's top owners."""
     rec = (reading or {}).get("record") or {}
     row = {"ts": int(time.time()), "partial": True,
            "partial_reason": "sampler budget exceeded",
            "mono": rec.get("mono", mono_now()), "uptime": rec.get("uptime", uptime_now()),
            "boot": rec.get("boot")}
+    carried = _carried_owners(_read_row(SNAPSHOT))
+    if carried:
+        row["owners_carried"] = carried
     if rec:
         row.update({k: rec[k] for k in ("free_pct", "swap_used", "swap_total", "load",
-                                        "swapins", "swapouts", "kernel_level") if k in rec})
+                                        "swapins", "swapouts", "kernel_level",
+                                        "used_bytes") if k in rec})
         row.update(pressure=rec["level"], _lh_streak=rec.get("lh_streak", 0),
                    lh_streak=rec.get("lh_streak", 0), level_reason=rec.get("level_reason"),
                    rates=rec.get("rates"), rates_source=rec.get("rates_source"),
@@ -2108,7 +2152,87 @@ def write_partial(reading: dict | None) -> dict:
     return row
 
 
-def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> int:
+ESSENTIALS_TOP = 5          # owners an essentials row names, largest first
+
+
+def top_owners(tick: dict | None, n: int = ESSENTIALS_TOP) -> list:
+    """The largest owners of one libproc tick, titled without lsof or Codex's
+    database: what a minute that never reaches collect() says about who was big."""
+    import memmon_owners as mo
+    if not isinstance(tick, dict) or "part" not in tick:
+        return []
+    inv, part, ctx = tick["inv"], tick["part"], tick.get("ctx") or mo.Context()
+    fps = mo.owner_footprints(part, inv)
+    big = sorted((o for o in part.owners.values() if fps.get(o.owner_id)),
+                 key=lambda o: -fps[o.owner_id])[:n]
+    try:
+        for sess in read_sessions():
+            ctx.titles_by_job.setdefault(sess["short"], sess["name"])
+            if sess["session_id"]:
+                ctx.titles_by_sid.setdefault(sess["session_id"], sess["name"])
+    except Exception:
+        pass
+    out = []
+    for o in big:
+        try:
+            mo._titles(o, inv, ctx, {})
+        except Exception:
+            pass
+        out.append({"owner_id": o.owner_id, "title": o.title or o.owner_id,
+                    "kind": o.kind, "bytes": fps[o.owner_id]})
+    return out
+
+
+def essentials_row(reading: dict, top: list, suggestions: list) -> dict:
+    """The row the sampler writes before collect(): the pressure reading and
+    the largest owners, from libproc and sysctl only."""
+    rec = reading["record"]
+    row = {"ts": int(rec["ts"]), "stage": "essentials",
+           **{k: rec[k] for k in ("free_pct", "swap_used", "swap_total", "load",
+                                  "swapins", "swapouts", "kernel_level", "used_bytes")
+              if k in rec},
+           "pressure": rec["level"], "_lh_streak": rec.get("lh_streak", 0),
+           "lh_streak": rec.get("lh_streak", 0), "level_reason": rec.get("level_reason"),
+           "rates": rec.get("rates"), "rates_source": rec.get("rates_source"),
+           "under_pressure": rec.get("under_pressure", False),
+           "mono": rec["mono"], "uptime": rec["uptime"], "boot": rec.get("boot"),
+           "owners_top": top, "pressure_suggestions": suggestions,
+           "suggestions_ts": int(rec["ts"])}
+    if rec.get("gap"):
+        row["gap"] = rec["gap"]
+    return row
+
+
+def sampler_essentials(reading: dict, source=None) -> dict:
+    """Write the essentials row at once. collect() then rewrites it as the
+    full row, or, when the budget runs out first, marks it partial."""
+    ess: dict = {}
+    try:
+        tick = sampler_owners(ess, reading, source=source)
+    except Exception as exc:
+        print(f"owners sample failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        tick = None
+    prev = _read_row(SNAPSHOT)
+    reading["carried"] = _carried_owners(prev)
+    reading["was"] = (prev or {}).get("pressure", "HEALTHY")
+    row = essentials_row(reading, top_owners(tick), ess.get("pressure_suggestions") or [])
+    _append_row(row, reading, essentials=True)
+    return ess
+
+
+def mark_partial(reading: dict) -> dict:
+    """The budget ran out after the essentials row: it stays, marked partial
+    and carrying the last full row's top owners."""
+    row = {**reading["essentials"]["row"], "partial": True,
+           "partial_reason": "sampler budget exceeded"}
+    if reading.get("carried"):
+        row["owners_carried"] = reading["carried"]
+    _append_row(row, reading, essentials=True)
+    return row
+
+
+def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None,
+                procs=None) -> int:
     """One `memmon --log` run under a 40 s wall budget. launchd never starts a
     second instance while one runs, so without the budget a run whose
     subprocess timeouts add up would hide every interval behind it. On expiry
@@ -2131,11 +2255,11 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> 
                 notify(gap_notice(gap), "memmon", "Sampling gap")
             except Exception:
                 pass
+        # The essentials row goes out before collect(), whose top, ps and
+        # lsof are what a machine under pressure cannot finish in time.
+        ess = sampler_essentials(reading, procs)
         snap = collect(pres=reading["pressure"])
-        try:
-            sampler_owners(snap, reading)
-        except Exception as exc:
-            print(f"owners sample failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        snap["pressure_suggestions"] = ess.get("pressure_suggestions") or []
         log_sample(snap, reading)
         done = True
     except SamplerBudget:
@@ -2144,7 +2268,10 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None) -> 
             import memmon_owners
             memmon_owners.write_json_atomic(SNAPSHOT, reading["row"])
         elif not done:
-            write_partial(reading)
+            if (reading or {}).get("essentials"):
+                mark_partial(reading)
+            else:
+                write_partial(reading)
             print("memmon: sampler budget exceeded; partial row written",
                   file=sys.stderr)
     finally:
@@ -3398,7 +3525,8 @@ def owners_sampler_tick(source=None, ctx=None, clock=None, mono=None) -> dict | 
     inv = memmon_procs.snapshot(src, clock=clock, mono=mono)
     if inv.kind == "degraded":
         return None
-    part = mo.partition(inv, ctx or _owners_ctx(titles=False))
+    ctx = ctx or _owners_ctx(titles=False)
+    part = mo.partition(inv, ctx)
     boot, awake = mo.boot_id(), mo.awake_ns()
     base = mo.read_json(CPU_BASELINE, {})
     problem = mo.baseline_problem(base, inv, boot, awake)
@@ -3415,7 +3543,7 @@ def owners_sampler_tick(source=None, ctx=None, clock=None, mono=None) -> dict | 
     mo.write_json_atomic(OWNERS_HISTORY, hist)
     mo.write_json_atomic(CPU_BASELINE, mo.make_baseline(inv, boot, awake))
     return {"cpu": cpu, "baseline_problem": problem, "owners": len(part.owners),
-            "inv": inv, "part": part}
+            "inv": inv, "part": part, "ctx": ctx, "hist": hist}
 
 
 def owners_text(payload: dict) -> str:
