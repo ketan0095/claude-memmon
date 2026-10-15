@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 import memmon
+import memmon_owners as mo
 import memmon_telemetry
 from testkit import FakeSource, P, TempState, session_file
 
@@ -545,10 +546,8 @@ def owner_source(claude_fp=6 * GB, extra=()):
                       cwds={11: "/r/acme-web", 20: "/r/acme-web"})
 
 
-class EssentialsTests(unittest.TestCase):
-    """The sampler under pressure: the essentials row (libproc and sysctl
-    only) goes out before collect(), so a run that overruns its budget still
-    records used_bytes and who was big."""
+class OwnerSamplerCase(unittest.TestCase):
+    """Whole sampler runs over owner_source(), with collect() stubbed."""
 
     def setUp(self):
         self.st = SamplerState(self)
@@ -581,6 +580,12 @@ class EssentialsTests(unittest.TestCase):
     def rows(self):
         with open(memmon.HISTORY) as fh:
             return [json.loads(line) for line in fh]
+
+
+class EssentialsTests(OwnerSamplerCase):
+    """The sampler under pressure: the essentials row (libproc and sysctl
+    only) goes out before collect(), so a run that overruns its budget still
+    records used_bytes and who was big."""
 
     def test_full_run_rewrites_the_essentials_row(self):
         T = FakeTelemetry()
@@ -679,6 +684,173 @@ class EssentialsTests(unittest.TestCase):
         print(f"\nessentials bench: {len(self.src.table)} processes, "
               f"median {times[len(times) // 2]:.0f} ms, p95 {times[18]:.0f} ms",
               file=sys.stderr)
+
+
+class RunawayTests(unittest.TestCase):
+    """An owner that grew >= 1 GB a minute over three one-minute samples and
+    is >= 4 GB now is a runaway, at any pressure level, notified once per
+    episode. Synthetic series only."""
+    OID = "claude:0000a001"
+
+    def series(self, sizes, times=None, present=None, state=None):
+        """One footprint per minute (or at `times`); the state after each."""
+        samples, out = [], []
+        for i, gb in enumerate(sizes):
+            ts = T0 + (times[i] if times else i * 60)
+            samples.append([ts, int(gb * GB)])
+            here = {self.OID} if present is None or present(i) else set()
+            state = mo.update_runaways(state or {}, {self.OID: {"samples": list(samples)}},
+                                       here, ts)
+            out.append(state["owners"])
+        return out
+
+    def test_fires_at_the_threshold(self):
+        states = self.series([1, 2, 3, 4])
+        self.assertEqual(states[:3], [{}, {}, {}])
+        ep = states[3][self.OID]
+        self.assertEqual((ep["since_ts"], ep["since_bytes"], ep["bytes"], ep["notified"]),
+                         (T0, GB, 4 * GB, False))
+        row, = mo.runaway_rows({"owners": {self.OID: {**ep, "title": "Checkout refactor"}}})
+        self.assertEqual(row, {"owner_id": self.OID, "title": "Checkout refactor",
+                               "bytes": 4 * GB, "grown_bytes": 3 * GB, "minutes": 3,
+                               "since_ts": T0})
+
+    def test_not_below_the_rate_the_size_or_the_streak(self):
+        self.assertEqual(self.series([1, 1.9, 2.8, 3.7, 4.6, 5.5, 6.4])[-1], {})   # 0.9 GB/min
+        self.assertEqual(self.series([0.5, 1.5, 2.5, 3.5])[-1], {})               # under 4 GB
+        self.assertIn(self.OID, self.series([0.5, 1.5, 2.5, 3.5, 4.5])[-1])
+        self.assertEqual(self.series([10, 11, 12])[-1], {})                       # two intervals
+        self.assertIn(self.OID, self.series([10, 11, 12, 13])[-1])
+        # One slow minute restarts the streak.
+        self.assertEqual(self.series([10, 11, 12, 12.5, 13.5, 14.5])[-1], {})
+
+    def test_three_intervals_and_three_minutes_both_count(self):
+        # Two slow-cadence intervals span 160 s; three quick ones only 120 s.
+        self.assertEqual(self.series([10, 12, 14], times=[0, 80, 160])[-1], {})
+        self.assertIn(self.OID, self.series([10, 12, 14, 16], times=[0, 80, 160, 240])[-1])
+        self.assertEqual(self.series([10, 11, 12, 13], times=[0, 40, 80, 120])[-1], {})
+
+    def test_steady_big_owner_never_fires(self):
+        self.assertEqual(self.series([20] * 10)[-1], {})
+        self.assertEqual(self.series([20 + 0.3 * i for i in range(10)])[-1], {})
+
+    def test_a_gap_breaks_the_streak(self):
+        times = [0, 60, 120, 400, 460, 520, 580]
+        states = self.series([4, 5, 6, 10, 11, 12, 13], times=times)
+        self.assertEqual(states[3], {})
+        self.assertEqual(states[5], {})
+        self.assertEqual(states[6][self.OID]["since_ts"], T0 + 400)
+
+    def test_episode_ends_after_five_minutes_without_growth(self):
+        states = self.series([1, 2, 3, 4, 4, 4, 4, 4, 4])
+        for s in states[3:8]:                      # 1-4 min flat: still an episode
+            self.assertIn(self.OID, s)
+        self.assertEqual(states[8], {})            # 5 min since the last growth
+        # Growing again is a new episode, with its own notification.
+        again = self.series([1, 2, 3, 4, 4, 4, 4, 4, 4, 5, 6, 7])
+        self.assertEqual(again[10], {})
+        self.assertFalse(again[11][self.OID]["notified"])
+        self.assertEqual(again[11][self.OID]["since_ts"], T0 + 8 * 60)
+
+    def test_an_owner_that_is_gone_ends_its_episode(self):
+        states = self.series([1, 2, 3, 4, 5], present=lambda i: i < 4)
+        self.assertIn(self.OID, states[3])
+        self.assertEqual(states[4], {})
+
+
+class WallClocked(FakeTelemetry):
+    """Wall time that follows the fake clock, so owner samples a minute apart
+    are a minute apart."""
+
+    def wall(self):
+        return T0 + self.m
+
+
+class RunawaySamplerTests(OwnerSamplerCase):
+    """The sampler path: latest.json's `runaway`, one notification per
+    episode through the stubbed osascript path, and owners --json."""
+
+    def grow(self, T, sizes, collect=None):
+        for gb in sizes:
+            self.src.table[10].footprint = int(gb * GB)
+            self.sample(T, collect)
+
+    def runaway_notes(self):
+        return [n for n in self.st.notes if n[1] == "memmon · memory growing fast"]
+
+    def test_notified_once_per_episode_at_healthy(self):
+        T = WallClocked()
+        self.grow(T, [1, 2.5, 4])
+        self.assertEqual(self.runaway_notes(), [])
+        self.assertEqual(self.st.read(memmon.SNAPSHOT)["runaway"], [])
+        self.grow(T, [5.5])
+        row = self.st.read(memmon.SNAPSHOT)
+        self.assertEqual(row["pressure"], "HEALTHY")
+        entry, = row["runaway"]
+        self.assertEqual(set(entry), {"owner_id", "title", "bytes", "grown_bytes",
+                                      "minutes", "since_ts"})
+        self.assertEqual((entry["title"], entry["bytes"], entry["grown_bytes"],
+                          entry["minutes"]),
+                         ("Checkout refactor", int(7.5 * GB), int(4.5 * GB), 3))
+        self.assertEqual(self.runaway_notes(), [(
+            "Checkout refactor grew 4.5 GB in 3 min (now 7.5 GB). Open memmon to stop it.",
+            "memmon · memory growing fast", "Nothing was stopped")])
+        self.assertEqual(self.rows()[-1]["runaway"], row["runaway"])    # the full row too
+        self.grow(T, [7, 8.5, 10])
+        self.assertEqual(len(self.runaway_notes()), 1)
+        self.assertEqual(self.st.read(memmon.SNAPSHOT)["runaway"][0]["grown_bytes"],
+                         int(9 * GB))
+        # Five flat minutes end it; growing again is a second episode.
+        self.grow(T, [10] * 4)
+        self.assertEqual(len(self.st.read(memmon.SNAPSHOT)["runaway"]), 1)
+        self.grow(T, [10])
+        self.assertEqual(self.st.read(memmon.SNAPSHOT)["runaway"], [])
+        self.grow(T, [11.5, 13, 14.5])
+        self.assertEqual(len(self.runaway_notes()), 2)
+
+    def test_an_overrun_minute_keeps_the_runaway(self):
+        T = WallClocked()
+        self.grow(T, [1, 2.5, 4])
+        self.grow(T, [5.5], self.overrun)
+        row = self.st.read(memmon.SNAPSHOT)
+        self.assertTrue(row["partial"])
+        self.assertEqual(row["runaway"][0]["title"], "Checkout refactor")
+        self.assertEqual(len(self.runaway_notes()), 1)
+
+    def test_a_failed_send_is_retried_next_run(self):
+        T = WallClocked()
+        self.grow(T, [1, 2.5, 4])
+        sent = []
+
+        def flaky(text, title="memmon", subtitle="", **kw):
+            if not sent:
+                sent.append("failed")
+                raise OSError("osascript failed")
+            self.st.notes.append((text, title, subtitle))
+        with mock.patch.object(memmon, "notify", flaky):
+            self.grow(T, [5.5])
+            self.assertEqual(self.runaway_notes(), [])
+            self.grow(T, [7])
+        self.assertEqual(len(self.runaway_notes()), 1)
+        self.grow(T, [8.5])
+        self.assertEqual(len(self.runaway_notes()), 1)
+
+    def test_owners_json_exposes_the_fresh_list(self):
+        entry = {"owner_id": "claude:0000a001", "title": "Checkout refactor",
+                 "bytes": 14 * GB, "grown_bytes": 9 * GB, "minutes": 5, "since_ts": T0}
+        self.st.write(memmon.SNAPSHOT, {"ts": time.time(), "runaway": [entry]})
+        with mock.patch.object(memmon, "gate_stats", return_value={}), \
+                mock.patch.object(memmon, "pressure", return_value={"level": "HEALTHY"}), \
+                mock.patch.object(memmon, "read_vm", return_value={}):
+            payload = memmon.owners_json(0, source=self.src,
+                                         ctx=mo.Context(sessions_dir=memmon.CLAUDE_SESSIONS_DIR),
+                                         system_reader=lambda: {"ram_bytes": 8,
+                                                                "used_bytes": 4,
+                                                                "pressure_level": "normal"})
+        self.assertEqual(payload["system"]["runaway"], [entry])
+        json.dumps(payload)
+        self.assertEqual(memmon.runaway_block(now=time.time() + memmon.STALE_DISPLAY_S + 5),
+                         [])
 
 
 class UnknownReaderTests(unittest.TestCase):

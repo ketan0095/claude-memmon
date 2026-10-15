@@ -50,6 +50,11 @@ GROWTH_MIN_SAMPLES = 5
 GROWTH_MIN_SPAN_S = 600
 GROWTH_WINDOW_S = 900
 WAKE_SLACK_NS = 2_000_000_000
+RUNAWAY_RATE = 1 << 30          # bytes a minute, held over every interval of the streak
+RUNAWAY_MIN_BYTES = 4 << 30     # and at least this large now
+RUNAWAY_MIN_SAMPLES = 3         # growth intervals in a row
+RUNAWAY_MIN_S = 150             # three one-minute intervals, less launchd's start jitter
+RUNAWAY_QUIET_S = 300           # an episode ends after this long without such growth
 
 AGENT_OF = {"claude": "claude", "codex": "codex", "codex-app": "codex",
             "codex-ui": "codex", "job": "job", "app": "app",
@@ -1102,6 +1107,59 @@ def growth(samples: list, now: float) -> tuple:
         return None, "not enough history"
     slope = sum((t - mx) * (v - my) for t, v in tail) / den
     return int(slope * 600), None
+
+
+def runaway_streak(samples: list) -> tuple | None:
+    """The run of intervals a series ends with in which the owner grew by at
+    least RUNAWAY_RATE a minute: (since_ts, since_bytes, intervals), or None
+    when the newest interval did not. A gap over MAX_GAP_S ends the run."""
+    pts = samples or []
+    i, n = len(pts) - 1, 0
+    while i > 0:
+        (t0, b0), (t1, b1) = pts[i - 1], pts[i]
+        dt = t1 - t0
+        if not 0 < dt <= MAX_GAP_S or (b1 - b0) * 60 < RUNAWAY_RATE * dt:
+            break
+        i, n = i - 1, n + 1
+    return (pts[i][0], pts[i][1], n) if n else None
+
+
+def update_runaways(state: dict, hist_owners: dict, present: set, now: float) -> dict:
+    """One sampler tick of the runaway episodes. An owner starts one when its
+    streak spans RUNAWAY_MIN_SAMPLES intervals and RUNAWAY_MIN_S and it is at
+    least RUNAWAY_MIN_BYTES now, at any pressure level. The episode lasts
+    until RUNAWAY_QUIET_S pass without such growth or the owner is gone;
+    `notified` is the caller's once-per-episode flag."""
+    eps = dict((state or {}).get("owners") or {})
+    for oid in present:
+        samples = (hist_owners.get(oid) or {}).get("samples") or []
+        if oid == UNATTRIBUTED or not samples:
+            continue
+        ts, cur = samples[-1]
+        streak = runaway_streak(samples)
+        ep = eps.get(oid)
+        if ep is not None:
+            if streak:
+                ep["last_growth_ts"] = ts
+            ep.update(bytes=cur, now_ts=ts)
+        elif (streak and streak[2] >= RUNAWAY_MIN_SAMPLES
+              and ts - streak[0] >= RUNAWAY_MIN_S and cur >= RUNAWAY_MIN_BYTES):
+            eps[oid] = {"since_ts": streak[0], "since_bytes": streak[1],
+                        "last_growth_ts": ts, "bytes": cur, "now_ts": ts,
+                        "notified": False}
+    eps = {oid: ep for oid, ep in eps.items()
+           if oid in present and now - ep["last_growth_ts"] < RUNAWAY_QUIET_S}
+    return {"v": 1, "owners": eps}
+
+
+def runaway_rows(state: dict) -> list:
+    """latest.json's `runaway` list, the fastest growth first."""
+    rows = [{"owner_id": oid, "title": ep.get("title") or oid, "bytes": ep["bytes"],
+             "grown_bytes": ep["bytes"] - ep["since_bytes"],
+             "minutes": max(1, round((ep["now_ts"] - ep["since_ts"]) / 60)),
+             "since_ts": ep["since_ts"]}
+            for oid, ep in ((state or {}).get("owners") or {}).items()]
+    return sorted(rows, key=lambda r: -r["grown_bytes"])
 
 
 def awake_ns() -> int:

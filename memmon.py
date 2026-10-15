@@ -45,10 +45,11 @@ OWNERS_HISTORY = os.path.join(STATE_DIR, "owners-history.json")
 CPU_BASELINE = os.path.join(STATE_DIR, "cpu-baseline.json")
 # Serialises every stop, including the menu bar's quit-app, across processes.
 ACTIONS_LOCK = os.path.join(STATE_DIR, "runner", "coord", "actions.lock")
-# Sampler state (S2.10, S2.11). The sampler is the only writer of all three.
+# Sampler state (S2.10, S2.11). The sampler is the only writer of all four.
 PRESSURE_FILE = os.path.join(STATE_DIR, "pressure.json")
 JOB_HISTORY = os.path.join(STATE_DIR, "job-history.json")
 PRESSURE_EPISODE = os.path.join(STATE_DIR, "runner", "coord", "pressure-episode.json")
+RUNAWAY_STATE = os.path.join(STATE_DIR, "runaway.json")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
 CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
@@ -2003,6 +2004,7 @@ def _log_row(snap: dict, reading: dict | None) -> dict:
         ess = (reading.get("essentials") or {}).get("row")
         if ess is not None:
             row["owners_top"] = ess["owners_top"]
+        row["runaway"] = (ess or {}).get("runaway") or []
     else:
         # The live dashboard never scans for suggestions. It carries the
         # sampler's list, the under_pressure it was computed under and when,
@@ -2011,6 +2013,7 @@ def _log_row(snap: dict, reading: dict | None) -> dict:
         row["under_pressure"] = bool(prev.get("under_pressure"))
         row["pressure_suggestions"] = prev.get("pressure_suggestions") or []
         row["suggestions_ts"] = prev.get("suggestions_ts")
+        row["runaway"] = prev.get("runaway") or []
     return row
 
 
@@ -2132,9 +2135,12 @@ def write_partial(reading: dict | None) -> dict:
            "partial_reason": "sampler budget exceeded",
            "mono": rec.get("mono", mono_now()), "uptime": rec.get("uptime", uptime_now()),
            "boot": rec.get("boot")}
-    carried = _carried_owners(_read_row(SNAPSHOT))
+    prev = _read_row(SNAPSHOT)
+    carried = _carried_owners(prev)
     if carried:
         row["owners_carried"] = carried
+    # No tick ran: the previous run's episodes stand until the next one.
+    row["runaway"] = (prev or {}).get("runaway") or []
     if rec:
         row.update({k: rec[k] for k in ("free_pct", "swap_used", "swap_total", "load",
                                         "swapins", "swapouts", "kernel_level",
@@ -2161,29 +2167,82 @@ def top_owners(tick: dict | None, n: int = ESSENTIALS_TOP) -> list:
     import memmon_owners as mo
     if not isinstance(tick, dict) or "part" not in tick:
         return []
-    inv, part, ctx = tick["inv"], tick["part"], tick.get("ctx") or mo.Context()
+    inv, part = tick["inv"], tick["part"]
     fps = mo.owner_footprints(part, inv)
     big = sorted((o for o in part.owners.values() if fps.get(o.owner_id)),
                  key=lambda o: -fps[o.owner_id])[:n]
-    try:
-        for sess in read_sessions():
-            ctx.titles_by_job.setdefault(sess["short"], sess["name"])
-            if sess["session_id"]:
-                ctx.titles_by_sid.setdefault(sess["session_id"], sess["name"])
-    except Exception:
-        pass
-    out = []
-    for o in big:
+    titles = owner_titles(tick, [o.owner_id for o in big])
+    return [{"owner_id": o.owner_id, "title": titles[o.owner_id], "kind": o.kind,
+             "bytes": fps[o.owner_id]} for o in big]
+
+
+def owner_titles(tick: dict, oids: list) -> dict:
+    """Titles for some of a tick's owners: session names from the job state
+    files, never lsof or Codex's database."""
+    import memmon_owners as mo
+    inv, part, ctx = tick["inv"], tick["part"], tick.get("ctx") or mo.Context()
+    if not ctx.titles_by_job:
+        try:
+            for sess in read_sessions():
+                ctx.titles_by_job.setdefault(sess["short"], sess["name"])
+                if sess["session_id"]:
+                    ctx.titles_by_sid.setdefault(sess["session_id"], sess["name"])
+        except Exception:
+            pass
+    out = {}
+    for oid in oids:
+        o = part.owners.get(oid)
+        if o is None:
+            continue
         try:
             mo._titles(o, inv, ctx, {})
         except Exception:
             pass
-        out.append({"owner_id": o.owner_id, "title": o.title or o.owner_id,
-                    "kind": o.kind, "bytes": fps[o.owner_id]})
+        out[oid] = o.title or oid
     return out
 
 
-def essentials_row(reading: dict, top: list, suggestions: list) -> dict:
+def _gb(n: float) -> str:
+    return f"{n / GB:.1f}".removesuffix(".0")
+
+
+def runaway_text(row: dict) -> str:
+    return (f"{row['title']} grew {_gb(row['grown_bytes'])} GB in {row['minutes']} min "
+            f"(now {_gb(row['bytes'])} GB). Open memmon to stop it.")
+
+
+def sampler_runaway(tick: dict | None) -> list:
+    """The runaway episodes after this tick (memmon_owners.update_runaways),
+    each notified once. The state says "notified" before the send; a send
+    that fails clears it, so the next run retries."""
+    import memmon_owners as mo
+    if not isinstance(tick, dict) or "hist" not in tick:
+        return []
+    inv, part = tick["inv"], tick["part"]
+    present = {oid for oid, fp in mo.history_footprints(part, inv).items()
+               if fp is not None and oid != mo.UNATTRIBUTED}
+    state = mo.update_runaways(mo.read_json(RUNAWAY_STATE, {}),
+                               tick["hist"].get("owners") or {}, present, inv.ts)
+    eps = state["owners"]
+    for oid, title in owner_titles(tick, list(eps)).items():
+        eps[oid]["title"] = title
+    due = [oid for oid, ep in eps.items() if not ep["notified"]]
+    for oid in due:
+        eps[oid]["notified"] = True
+    mo.write_json_atomic(RUNAWAY_STATE, state)
+    rows = {r["owner_id"]: r for r in mo.runaway_rows(state)}
+    for oid in due:
+        try:
+            notify(runaway_text(rows[oid]), "memmon · memory growing fast",
+                   "Nothing was stopped")
+        except Exception:
+            eps[oid]["notified"] = False
+            mo.write_json_atomic(RUNAWAY_STATE, state)
+    return list(rows.values())
+
+
+def essentials_row(reading: dict, top: list, suggestions: list,
+                   runaway: list | None = None) -> dict:
     """The row the sampler writes before collect(): the pressure reading and
     the largest owners, from libproc and sysctl only."""
     rec = reading["record"]
@@ -2196,8 +2255,8 @@ def essentials_row(reading: dict, top: list, suggestions: list) -> dict:
            "rates": rec.get("rates"), "rates_source": rec.get("rates_source"),
            "under_pressure": rec.get("under_pressure", False),
            "mono": rec["mono"], "uptime": rec["uptime"], "boot": rec.get("boot"),
-           "owners_top": top, "pressure_suggestions": suggestions,
-           "suggestions_ts": int(rec["ts"])}
+           "owners_top": top, "runaway": runaway or [],
+           "pressure_suggestions": suggestions, "suggestions_ts": int(rec["ts"])}
     if rec.get("gap"):
         row["gap"] = rec["gap"]
     return row
@@ -2208,14 +2267,22 @@ def sampler_essentials(reading: dict, source=None) -> dict:
     full row, or, when the budget runs out first, marks it partial."""
     ess: dict = {}
     try:
-        tick = sampler_owners(ess, reading, source=source)
+        # The tick's footprints share the row's timestamp.
+        tick = sampler_owners(ess, reading, source=source,
+                              clock=lambda: reading["record"]["ts"])
     except Exception as exc:
         print(f"owners sample failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         tick = None
+    try:
+        runaway = sampler_runaway(tick)
+    except Exception as exc:
+        print(f"runaway check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        runaway = []
     prev = _read_row(SNAPSHOT)
     reading["carried"] = _carried_owners(prev)
     reading["was"] = (prev or {}).get("pressure", "HEALTHY")
-    row = essentials_row(reading, top_owners(tick), ess.get("pressure_suggestions") or [])
+    row = essentials_row(reading, top_owners(tick), ess.get("pressure_suggestions") or [],
+                         runaway)
     _append_row(row, reading, essentials=True)
     return ess
 
@@ -3348,6 +3415,16 @@ def sampler_block(now: float | None = None) -> dict:
             "last_starved_gap": rec.get("last_starved_gap")}
 
 
+def runaway_block(now: float | None = None) -> list:
+    """The sampler's runaway list from latest.json, empty once it is stale."""
+    row = _read_row(SNAPSHOT) or {}
+    ts = row.get("ts")
+    now = time.time() if now is None else now
+    if not isinstance(ts, (int, float)) or now - ts > STALE_DISPLAY_S:
+        return []
+    return row.get("runaway") or []
+
+
 def pressure_suggestions(sample, ctx, payload: dict, history=None) -> list:
     """owners --json's suggestion rows, the only place their tokens exist.
     S1's child-job rows are reused by job_id; the rest get S1-format tokens."""
@@ -3473,6 +3550,7 @@ def owners_json(cpu_window: float = 1.0, expand: list | None = None,
         pressure_suggestions(sample, ctx, payload)
         if payload["under_pressure"] and suggestions_enabled() else [])
     payload["sampler"] = sampler_block()
+    system["runaway"] = runaway_block()
     return payload
 
 

@@ -31,7 +31,7 @@ PATH_CONSTANTS = ("STATE_DIR", "HISTORY", "SNAPSHOT", "GATE_LOG", "PROFILE",
                   "CPU_BASELINE", "ACTIONS_LOCK", "JOBS_DIR", "PROJECTS_DIR",
                   "CLAUDE_SESSIONS_DIR", "CC_SOCKS_DIR", "CODEX_HOME",
                   "CLAUDE_ROSTER", "PRESSURE_FILE", "JOB_HISTORY", "PRESSURE_EPISODE",
-                  "USAGE_CACHE")
+                  "USAGE_CACHE", "RUNAWAY_STATE")
 
 
 class TempState:
@@ -57,6 +57,7 @@ class TempState:
             "PRESSURE_FILE": f"{r}/pressure.json", "JOB_HISTORY": f"{r}/job-history.json",
             "PRESSURE_EPISODE": f"{r}/runner/coord/pressure-episode.json",
             "USAGE_CACHE": f"{r}/runner/coord/usage-cache.json",
+            "RUNAWAY_STATE": f"{r}/runaway.json",
         }
         for n, v in values.items():
             if n in self.saved:
