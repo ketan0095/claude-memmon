@@ -2298,6 +2298,29 @@ def mark_partial(reading: dict) -> dict:
     return row
 
 
+def stalled_in(frame, depth: int = 3) -> str:
+    """Where a run was when its budget expired, so an intermittent stall names
+    its own cause in sampler.err: the innermost frames of this tool's own code,
+    then the call that was actually blocking (often inside subprocess)."""
+    import traceback
+    frames = traceback.extract_stack(frame)
+    if not frames:
+        return "unknown"
+    here = os.path.dirname(os.path.abspath(__file__))
+    own = [f for f in frames if os.path.dirname(os.path.abspath(f.filename)) == here]
+    shown = own[-depth:]
+    if frames[-1] not in shown:
+        shown.append(frames[-1])
+    where = " > ".join(f"{f.name} ({os.path.basename(f.filename)}:{f.lineno})" for f in shown)
+    # A hang inside _sh is a command that would not finish: name it.
+    f = frame
+    while f is not None:
+        if f.f_code.co_name == "_sh" and isinstance(f.f_locals.get("cmd"), list):
+            return f"{where} running `{' '.join(map(str, f.f_locals['cmd'][:4]))}`"
+        f = f.f_back
+    return where
+
+
 def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None,
                 procs=None) -> int:
     """One `memmon --log` run under a 40 s wall budget. launchd never starts a
@@ -2307,7 +2330,7 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None,
     import signal
 
     def expired(signum, frame):
-        raise SamplerBudget()
+        raise SamplerBudget(stalled_in(frame))
     old = signal.signal(signal.SIGALRM, expired)
     signal.setitimer(signal.ITIMER_REAL, budget_s)
     reading, done = None, False
@@ -2329,7 +2352,7 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None,
         snap["pressure_suggestions"] = ess.get("pressure_suggestions") or []
         log_sample(snap, reading)
         done = True
-    except SamplerBudget:
+    except SamplerBudget as exc:
         signal.setitimer(signal.ITIMER_REAL, 0)
         if (reading or {}).get("row"):
             import memmon_owners
@@ -2339,8 +2362,9 @@ def sampler_run(budget_s: float = SAMPLER_BUDGET_S, source=None, clock=None,
                 mark_partial(reading)
             else:
                 write_partial(reading)
-            print("memmon: sampler budget exceeded; partial row written",
-                  file=sys.stderr)
+            where = exc.args[0] if exc.args else "unknown"
+            print(f"memmon: {time.strftime('%Y-%m-%d %H:%M:%S')} sampler budget exceeded "
+                  f"in {where}; partial row written", file=sys.stderr)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)

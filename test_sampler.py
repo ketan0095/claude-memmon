@@ -607,6 +607,31 @@ class EssentialsTests(OwnerSamplerCase):
         self.assertNotIn("partial", rows[0])
         self.assertEqual(self.st.read(memmon.SNAPSHOT), rows[0])
 
+    def test_a_stall_names_where_it_was_stuck(self):
+        # The budget's own timer, a real stall: sampler.err must say when and
+        # where, so an intermittent hang can be traced to its call.
+        T = FakeTelemetry()
+
+        def read_top_that_hangs(pres):
+            time.sleep(5)
+        err = io.StringIO()
+        with mock.patch.object(memmon, "collect", read_top_that_hangs), \
+                mock.patch.object(memmon, "learn"), mock.patch("sys.stderr", err):
+            self.assertEqual(memmon.sampler_run(budget_s=0.5, source=T, clock=T, procs=self.src), 0)
+        line = err.getvalue()
+        self.assertRegex(line, r"^memmon: \d{4}-\d\d-\d\d \d\d:\d\d:\d\d sampler budget exceeded in ")
+        self.assertIn("read_top_that_hangs", line)
+        self.assertIn("partial row written", line)
+        self.assertTrue(self.rows()[-1]["partial"])
+
+    def test_a_stalled_command_is_named(self):
+        T = FakeTelemetry()
+        err = io.StringIO()
+        with mock.patch.object(memmon, "collect", lambda pres: memmon._sh(["sleep", "5"])), \
+                mock.patch.object(memmon, "learn"), mock.patch("sys.stderr", err):
+            memmon.sampler_run(budget_s=0.5, source=T, clock=T, procs=self.src)
+        self.assertIn("running `sleep 5`", err.getvalue())
+
     def test_overrun_keeps_used_bytes_and_top_owners(self):
         T = FakeTelemetry()
         self.sample(T)
