@@ -489,6 +489,8 @@ PROC_PPID_ONLY = 6
 def _child_lister(src):
     """proc_listpids(PROC_PPID_ONLY) for a libproc source, so a tick reads
     only its own job tree; None for any other source."""
+    if src.name == "procfs":
+        return _procfs_children
     lib = getattr(src, "lib", None)
     if lib is None or src.name != "libproc":
         return None
@@ -505,6 +507,23 @@ def _child_lister(src):
             raise OSError("proc_listpids failed or truncated")
         return [p for p in buf[:n // ctypes.sizeof(ctypes.c_int)] if p > 0]
     return children
+
+
+def _procfs_children(pid):
+    """Linux's per-parent listing: /proc/<pid>/task/<tid>/children for every
+    thread (a child belongs to the thread that forked it)."""
+    out = []
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except FileNotFoundError:
+        return out
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/children") as fh:
+                out.extend(int(x) for x in fh.read().split())
+        except FileNotFoundError:
+            continue
+    return out
 
 
 def committed_total(c) -> int:

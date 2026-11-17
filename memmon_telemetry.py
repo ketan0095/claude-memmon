@@ -25,8 +25,11 @@ import ctypes
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
+
+LINUX = sys.platform.startswith("linux")
 
 MB = 1024 * 1024
 HEADROOM_FLOOR = 20          # the free-% level the runway projects toward
@@ -86,6 +89,9 @@ def sysctl_int(name: str) -> int:
 
 
 def boot_session() -> str | None:
+    if LINUX:
+        import memmon_linux
+        return memmon_linux.boot_id()
     try:
         return sysctl_raw("kern.bootsessionuuid", 64).split(b"\0", 1)[0].decode() or None
     except Exception:
@@ -117,7 +123,25 @@ class Clock:
         time.sleep(max(0.0, s))
 
 
-SYSTEM_CLOCK = Clock()
+class LinuxClock(Clock):
+    """The same four clocks with the macOS meanings: CLOCK_BOOTTIME counts
+    through suspend (mono, raw) and CLOCK_MONOTONIC stops (awake, uptime).
+    Both count from boot in every process."""
+
+    def mono(self) -> float:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+    def awake(self) -> float:
+        return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+    def raw(self) -> float:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+    def uptime(self) -> float:
+        return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+SYSTEM_CLOCK = LinuxClock() if LINUX else Clock()
 
 
 # ------------------------------------------------------------------ source
@@ -169,7 +193,52 @@ class TelemetrySource:
         return proc.stdout
 
 
-DEFAULT_SOURCE = TelemetrySource()
+class ProcTelemetrySource(TelemetrySource):
+    """Linux: every input from /proc, read strictly (memmon_linux)."""
+
+    def __init__(self):
+        import memmon_linux
+        self.lx = memmon_linux
+
+    def _mi(self) -> dict:
+        try:
+            return self.lx.meminfo()
+        except OSError as exc:
+            raise TelemetryError(f"/proc/meminfo: {exc}")
+
+    def pressure_level(self) -> int:
+        return self.lx.psi_level(self.lx.psi())
+
+    def free_pct(self) -> int:
+        try:
+            return self.lx.free_pct(self._mi())
+        except ValueError as exc:
+            raise TelemetryError(str(exc))
+
+    def memsize(self) -> int:
+        return self._mi().get("MemTotal", 0)
+
+    def swapusage(self) -> tuple:
+        mi = self._mi()
+        if "SwapTotal" not in mi or "SwapFree" not in mi:
+            raise TelemetryError("/proc/meminfo: no swap fields")
+        return mi["SwapTotal"], max(0, mi["SwapTotal"] - mi["SwapFree"])
+
+    def extra(self) -> dict:
+        p = self.lx.psi()
+        return {"psi_some": p.get("some"), "psi_full": p.get("full")}
+
+    def vm_counters(self, timeout: float) -> dict:
+        try:
+            return self.lx.counters()
+        except (OSError, KeyError) as exc:
+            raise TelemetryError(f"/proc counters: {exc}")
+
+    def vm_stat(self, timeout: float) -> str:
+        raise TelemetryError("vm_stat does not exist on Linux")
+
+
+DEFAULT_SOURCE = ProcTelemetrySource() if LINUX else TelemetrySource()
 
 
 class _VM64(ctypes.Structure):
@@ -243,7 +312,7 @@ def agree(mach: dict, ref: dict) -> bool:
     return abs(mach["used_bytes"] - ref["used_bytes"]) <= 0.05 * max(ref["used_bytes"], 1)
 
 
-MACH_SOURCE = MachTelemetrySource()
+MACH_SOURCE = DEFAULT_SOURCE if LINUX else MachTelemetrySource()
 
 
 def _bounded(fn, budget_s: float):
@@ -302,10 +371,14 @@ def _instant(source, clock) -> dict:
     ram = source.memsize()
     if ram <= 0:
         raise TelemetryError("hw.memsize is zero")
-    return {"pressure_level": PRESSURE_LEVELS[level], "free_pct": free,
-            "ram_total": ram, "swap_total": swap_total, "swap_used": swap_used,
-            "load": float(source.loadavg()), "ncpu": int(source.ncpu()),
-            "boot": clock.boot()}
+    out = {"pressure_level": PRESSURE_LEVELS[level], "free_pct": free,
+           "ram_total": ram, "swap_total": swap_total, "swap_used": swap_used,
+           "load": float(source.loadavg()), "ncpu": int(source.ncpu()),
+           "boot": clock.boot()}
+    extra = getattr(source, "extra", None)
+    if extra:
+        out.update(extra())
+    return out
 
 
 def read_instant(source=None, clock=None, budget_s: float = 2.0) -> dict:
@@ -418,6 +491,14 @@ def score(vm: dict, rates: dict | None, free_delta_min: float | None,
         pts += 2; reasons.append(f"load {vm.get('load', 0):.0f} on {ncpu} cores")
     elif load_ratio >= 1.75:
         pts += 1; reasons.append(f"load {vm.get('load', 0):.0f}")
+
+    # Linux only: PSI, the kernel's own count of time lost waiting for memory.
+    # A Mac reading has no psi_* keys and scores nothing here.
+    if "psi_some" in vm or "psi_full" in vm:
+        import memmon_linux
+        extra, why = memmon_linux.psi_points(vm)
+        if extra:
+            pts += extra; reasons.append(why)
 
     headroom = None
     if free_delta_min is not None:

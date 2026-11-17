@@ -36,6 +36,8 @@ from memmon_common import spare_is_idle  # noqa: F401  (also used by callers)
 HOME = os.path.expanduser("~")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
+if os.path.isdir(f"/run/user/{os.getuid()}/cc-socks"):      # Linux: $XDG_RUNTIME_DIR
+    CC_SOCKS_DIR = f"/run/user/{os.getuid()}/cc-socks"
 CLAUDE_JOBS_DIR = os.path.join(HOME, ".claude", "jobs")
 CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
 CODEX_HOME = os.path.join(HOME, ".codex")
@@ -160,8 +162,15 @@ def _utc_ctime(text: str) -> int | None:
 def _same_start(record: dict, proc) -> bool:
     """A Claude sessions record names a process only together with the start
     time it recorded (second resolution, UTC). No parseable procStart, no
-    identity: a reused PID must never inherit the record."""
-    recorded = _utc_ctime(record.get("procStart") or "")
+    identity: a reused PID must never inherit the record.
+
+    On Linux Claude Code writes procStart as /proc/<pid>/stat field 22, the
+    start in clock ticks since boot, which must match exactly."""
+    raw = record.get("procStart")
+    if isinstance(raw, (str, int)) and str(raw).isdigit():
+        ticks = getattr(proc, "start_ticks", None) if proc is not None else None
+        return ticks is not None and int(raw) == ticks
+    recorded = _utc_ctime(raw or "")
     return (recorded is not None and proc is not None and proc.start is not None
             and abs(recorded - proc.start[0]) <= 2)
 
@@ -1164,10 +1173,14 @@ def runaway_rows(state: dict) -> list:
 
 def awake_ns() -> int:
     """Time since boot excluding sleep; diverges from CLOCK_MONOTONIC on wake."""
-    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    clock = getattr(time, "CLOCK_UPTIME_RAW", time.CLOCK_MONOTONIC)  # Linux: stops in suspend
+    return time.clock_gettime_ns(clock)
 
 
 def boot_id() -> str | None:
+    if not hasattr(time, "CLOCK_UPTIME_RAW"):        # Linux
+        import memmon_linux
+        return memmon_linux.boot_id()
     try:
         import ctypes
         libc = ctypes.CDLL(None, use_errno=True)

@@ -52,6 +52,12 @@ PRESSURE_EPISODE = os.path.join(STATE_DIR, "runner", "coord", "pressure-episode.
 RUNAWAY_STATE = os.path.join(STATE_DIR, "runaway.json")
 CLAUDE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CC_SOCKS_DIR = "/tmp/cc-socks"
+LINUX = sys.platform.startswith("linux")
+if LINUX:
+    # Claude Code puts its peer sockets under $XDG_RUNTIME_DIR on Linux.
+    _run_socks = f"/run/user/{os.getuid()}/cc-socks"
+    if os.path.isdir(_run_socks) or not os.path.isdir(CC_SOCKS_DIR):
+        CC_SOCKS_DIR = _run_socks
 CLAUDE_ROSTER = os.path.join(HOME, ".claude", "daemon", "roster.json")
 CODEX_HOME = os.path.join(HOME, ".codex")
 
@@ -143,6 +149,9 @@ def read_top(limit: int = 300) -> tuple[dict[int, dict], str]:
     Returns the header so callers do not spawn a second `top -l 1 -n 0` purely
     for PhysMem/Load Avg — that second spawn cost ~445ms, as much as this one.
     MEM is the footprint; CMPRS is how much of it has been compressed."""
+    if LINUX:
+        import memmon_linux
+        return memmon_linux.top_table(limit), ""
     out = _sh(["top", "-l", "1", "-n", str(limit), "-o", "mem",
                "-stats", "pid,mem,cmprs"])
     procs: dict[int, dict] = {}
@@ -176,6 +185,9 @@ def etime_to_sec(s: str) -> int:
 
 
 def read_ps() -> dict[int, dict]:
+    if LINUX:
+        import memmon_linux
+        return memmon_linux.ps_table()
     out = _sh(["ps", "-Ao", "pid=,ppid=,etime=,command="])
     procs: dict[int, dict] = {}
     for line in out.splitlines():
@@ -209,7 +221,15 @@ def read_vm(fast: bool = False, header: str = "", vm_stat_text: str | None = Non
     `fast` skips the `top` header, which costs ~400ms — far too slow for the
     PreToolUse gate, which runs on every tool call. Everything the pressure
     model needs is available from sysctl and vm_stat in ~10ms; only the
-    cosmetic ram_used/compressor/nprocs figures require top."""
+    cosmetic ram_used/compressor/nprocs figures require top.
+
+    On Linux every figure comes from /proc in well under a millisecond, so
+    `fast` changes nothing there (memmon_linux.read_vm)."""
+    if LINUX:
+        import memmon_linux
+        vm = memmon_linux.read_vm()
+        page_size("")
+        return vm
     vm: dict = {}
     # One sysctl spawn for both values, and os.* for the three that are constants
     # for the life of the machine. This runs on every gated Bash command, where
@@ -313,6 +333,9 @@ def page_size(vm_stat_text: str | None = None) -> int:
     rather than spawning vm_stat at import just for its header."""
     global _page
     if _page is None:
+        if LINUX:
+            _page = os.sysconf("SC_PAGE_SIZE")
+            return _page
         text = vm_stat_text if vm_stat_text is not None else _sh(["vm_stat"])
         m = re.search(r"page size of (\d+) bytes", text)
         _page = int(m.group(1)) if m else os.sysconf("SC_PAGE_SIZE")
@@ -333,13 +356,15 @@ RATE_CACHE_S = 5
 
 
 def mono_now() -> float:
-    """CLOCK_MONOTONIC_RAW: keeps counting while the Mac sleeps."""
-    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+    """CLOCK_MONOTONIC_RAW: keeps counting while the Mac sleeps
+    (CLOCK_BOOTTIME on Linux)."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME if LINUX else time.CLOCK_MONOTONIC_RAW)
 
 
 def uptime_now() -> float:
-    """CLOCK_UPTIME_RAW: the same clock, stopped while the Mac sleeps."""
-    return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    """CLOCK_UPTIME_RAW: the same clock, stopped while the Mac sleeps
+    (CLOCK_MONOTONIC on Linux)."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC if LINUX else time.CLOCK_UPTIME_RAW)
 
 
 def _has_counters(vm: dict) -> bool:
@@ -1092,6 +1117,37 @@ def read_subagents(transcript_path: str) -> list[dict]:
 RV_SOCK_RE = re.compile(r"/rv/([0-9a-f]{8})\.sock")
 
 
+def linux_session_records(ps: dict) -> list:
+    """(pid, session_id, name) for each live Claude Code process with a
+    ~/.claude/sessions/<pid>.json whose procStart (clock ticks since boot on
+    Linux) matches the process. A stale file for a reused PID is skipped."""
+    import memmon_linux
+    out = []
+    try:
+        names = os.listdir(CLAUDE_SESSIONS_DIR)
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".json") or not fn[:-5].isdigit():
+            continue
+        pid = int(fn[:-5])
+        if pid not in ps:
+            continue
+        try:
+            with open(os.path.join(CLAUDE_SESSIONS_DIR, fn)) as fh:
+                d = json.load(fh)
+            with open(f"/proc/{pid}/stat") as fh:
+                ticks = memmon_linux.parse_stat(fh.read())["starttime"]
+        except Exception:
+            continue
+        if str(d.get("procStart")) != str(ticks) or not d.get("sessionId") \
+                or d.get("spare") is True:
+            continue
+        name = d.get("name") or memmon_linux.nook_session(pid)
+        out.append((pid, d["sessionId"], name))
+    return out
+
+
 def map_pids_to_jobs() -> dict[int, str]:
     """pid -> job short id, via the daemon's per-job rendezvous socket.
 
@@ -1277,6 +1333,14 @@ def collect(pres: dict | None = None) -> dict:
         m = SESSION_ID_RE.search(info["cmd"])
         if m:
             sid_to_pid[m.group(1)] = pid
+    # Linux: interactive sessions (a Nook pane, a terminal) carry no
+    # --session-id; Claude Code's own ~/.claude/sessions/<pid>.json names them.
+    sid_name: dict[str, str] = {}
+    if LINUX:
+        for pid, sid, name in linux_session_records(ps):
+            sid_to_pid.setdefault(sid, pid)
+            if name:
+                sid_name[sid] = name
     # Sessions claimed from the prewarm pool are only visible via the daemon
     # socket, so this is what finds most of them.
     short_to_pid = {short: pid for pid, short in map_pids_to_jobs().items()}
@@ -1296,7 +1360,7 @@ def collect(pres: dict | None = None) -> dict:
         cwd = meta.get("cwd", "")
         by_sid[sid] = {
             "short": sid[:8], "state": "terminal", "origin": "terminal",
-            "name": os.path.basename(cwd.rstrip("/")) or sid[:8],
+            "name": sid_name.get(sid) or os.path.basename(cwd.rstrip("/")) or sid[:8],
             "doing": meta.get("last_prompt", ""), "cwd": cwd,
             "session_id": sid, "updated": meta.get("mtime", 0),
             "intent": meta.get("last_prompt", ""),
@@ -1371,7 +1435,7 @@ def collect(pres: dict | None = None) -> dict:
             continue
         if not REAPABLE.search(info["cmd"]):
             continue
-        parent_dead = info["ppid"] == 1
+        parent_dead = reparented(info["ppid"])
         if not parent_dead and info["age"] < 3600:
             continue
         orphans.append({
@@ -1823,6 +1887,16 @@ def notify(text: str, title: str = "memmon", subtitle: str = "",
     arguments, never inside the script, so a label or a command can never be
     read as AppleScript. Nothing is posted when settings turn notifications off."""
     if CONFIG.get("notifications", True) is False:
+        return
+    if LINUX:
+        # A desktop session has notify-send; a headless box has nothing to
+        # show a notification on, and the same text is in `memmon jobs`.
+        import shutil
+        if run is subprocess.run and not shutil.which("notify-send"):
+            return
+        run(["notify-send", "--app-name=memmon", title,
+             f"{subtitle}\n{text}" if subtitle else text],
+            capture_output=True, timeout=10)
         return
     run(["osascript", "-e", "on run argv",
          "-e", "display notification (item 1 of argv) with title (item 2 of argv) "
@@ -2497,12 +2571,23 @@ def report(days: int) -> str:
 STALE_SPARE = 4 * 3600
 
 
+def reparented(ppid) -> bool:
+    """The parent is the process orphans are handed to: launchd (pid 1) on
+    macOS, pid 1 or the user's systemd manager on Linux."""
+    if ppid == 1:
+        return True
+    if LINUX and ppid:
+        import memmon_linux
+        return ppid in memmon_linux.reapers()
+    return False
+
+
 def _orphan_still_selected(inv, pid: int) -> bool:
     """The orphan selector, re-applied to fresh data at stop time."""
     p = inv.procs.get(pid)
     if p is None or not REAPABLE.search(inv.cmdline(pid)):
         return False
-    return p.ppid == 1 or inv.ts - p.start[0] >= 3600
+    return reparented(p.ppid) or inv.ts - p.start[0] >= 3600
 
 
 def _spare_still_selected(inv, pid: int) -> bool:

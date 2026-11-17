@@ -50,6 +50,24 @@ macOS 13 or later, and the Xcode Command Line Tools (`xcode-select --install`) f
 `/usr/bin/python3` and, for the menu bar, `swiftc`. Session names and the gate need
 Claude Code. Nothing is pip-installed.
 
+### Linux
+
+memmon also runs on Linux (tested on Ubuntu 26.04 with systemd). Everything
+except the menu bar works: owners, the gate, `memmon run` and the sampler.
+It needs Python 3.10 or later at `/usr/bin/python3`, a systemd user session for
+`--sampler`, and zsh for `--gate`. `--menubar` is refused.
+
+| macOS reading | Linux reading |
+|---|---|
+| libproc footprint | `RssAnon + VmSwap` from `/proc/<pid>/status` |
+| `kern.memorystatus_level` | `MemAvailable / MemTotal` |
+| `vm_stat` swap-ins and swap-outs | `pswpin` / `pswpout` in `/proc/vmstat` |
+| kernel pressure level | PSI, `/proc/pressure/memory`, which also adds score points |
+| launchd sampler | systemd user timer `dev.memmon.sampler.timer` |
+| `osascript` notification | `notify-send` when present, else none |
+
+`memmon_linux.py` explains each choice and the PSI thresholds.
+
 ## Install
 
 ```bash

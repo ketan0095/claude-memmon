@@ -21,6 +21,7 @@ import errno
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -93,6 +94,7 @@ class Proc:
     comm: str = ""
     visible: bool = True
     argv: list | None = None
+    start_ticks: int | None = None      # Linux only: /proc/<pid>/stat field 22
 
     def key(self) -> str | None:
         """Identity string used by persisted baselines: "pid.sec.usec"."""
@@ -244,6 +246,106 @@ class LibprocSource(ProcSource):
         if n != VNODEPATHINFO_SIZE:
             return None
         return _cstr(buf.raw[CDIR_PATH_OFFSET:CDIR_PATH_OFFSET + 1024]) or None
+
+
+class ProcfsSource(ProcSource):
+    """Linux inventory from /proc: the libproc readings, same units and the
+    same trust. Footprint is RssAnon + VmSwap; memmon_linux says why."""
+
+    name = "procfs"
+
+    def __init__(self):
+        import memmon_linux
+        self.lx = memmon_linux
+        self.my_uid = os.getuid()
+        self._timebase = (1_000_000_000 // memmon_linux.CLK_TCK, 1)
+
+    def timebase(self) -> tuple:
+        return self._timebase
+
+    def read(self, pid: int) -> Proc | None:
+        base = f"/proc/{pid}"
+        try:
+            uid = os.stat(base).st_uid
+            with open(base + "/stat") as fh:
+                st = self.lx.parse_stat(fh.read())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return Proc(pid=pid, visible=False)
+        proc = Proc(pid=pid, start=self.lx.ticks_to_start(st["starttime"]),
+                    start_ticks=st["starttime"], ppid=st["ppid"], pgid=st["pgid"],
+                    uid=uid, zombie=st["state"] in ("Z", "X"), comm=st["comm"],
+                    visible=uid == self.my_uid)
+        if not proc.visible:
+            return proc
+        proc.cpu_ticks = st["utime"] + st["stime"]
+        try:
+            with open(base + "/status") as fh:
+                mem = self.lx._kv_kb(fh.read())
+        except OSError:
+            return proc
+        if "VmRSS" in mem:
+            swap = mem.get("VmSwap", 0)
+            proc.footprint = mem.get("RssAnon", 0) + swap
+            proc.resident = mem["VmRSS"]
+            proc.lifetime_max = max(mem.get("VmHWM", 0) + swap, proc.footprint)
+        return proc
+
+    def scan(self) -> dict:
+        out = {}
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                proc = self.read(int(name))
+                if proc is not None:
+                    out[proc.pid] = proc
+        return out
+
+    def argv(self, pid: int) -> list | None:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            return None
+        if raw.endswith(b"\0"):
+            raw = raw[:-1]
+        return [a.decode("utf-8", "replace") for a in raw.split(b"\0")] if raw else []
+
+    def path(self, pid: int) -> str | None:
+        try:
+            p = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+        return p[:-10] if p.endswith(" (deleted)") else p
+
+    def cwd(self, pid: int) -> str | None:
+        try:
+            return os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return None
+
+
+def procfs_self_check(source: ProcfsSource) -> str | None:
+    """The Linux twin of self_check(): our own readings against Python's."""
+    pid = os.getpid()
+    proc = source.read(pid)
+    if proc is None or not proc.visible or proc.start is None:
+        return "own process unreadable"
+    if proc.footprint is None or proc.cpu_ticks is None:
+        return "status unreadable"
+    if proc.ppid != os.getppid():
+        return "ppid mismatch"
+    if proc.start[0] > time.time() + 1:
+        return "start time in the future"
+    if not 0 < proc.footprint <= os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"):
+        return "footprint out of range"
+    numer, denom = source.timebase()
+    cpu_s = proc.cpu_ticks * numer / denom / 1e9
+    expect = time.process_time()
+    # Ticks are 10 ms; allow two of them plus 5 %.
+    if abs(cpu_s - expect) > 2.0 / source.lx.CLK_TCK + 0.05 * expect:
+        return f"cpu ticks disagree ({cpu_s:.3f}s vs {expect:.3f}s)"
+    return None
 
 
 LSTART_FORMATS = ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y")
@@ -407,6 +509,13 @@ def self_check(source: LibprocSource, memsize: int | None = None) -> str | None:
 
 
 def _probe():
+    if sys.platform.startswith("linux"):
+        try:
+            src = ProcfsSource()
+            problem = procfs_self_check(src)
+            return (None, problem) if problem else (src, None)
+        except Exception as exc:
+            return None, f"procfs unusable: {type(exc).__name__}"
     try:
         lib, libc = _load_libproc()
         if lib is None:
@@ -506,8 +615,13 @@ class Inventory:
 
 
 def mono_ns() -> int:
-    """CLOCK_MONOTONIC, which on macOS keeps counting through sleep."""
-    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    """CLOCK_MONOTONIC, which on macOS keeps counting through sleep
+    (CLOCK_BOOTTIME on Linux, which does the same)."""
+    return time.clock_gettime_ns(_MONO_CLOCK)
+
+
+_MONO_CLOCK = (getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+               if sys.platform.startswith("linux") else time.CLOCK_MONOTONIC)
 
 
 def snapshot(source: ProcSource | None = None, clock=None, mono=None) -> Inventory:
@@ -565,6 +679,9 @@ def read_system_strict(run=subprocess.run, sysctl=sysctl_u64,
     excludes "Pages stored in compressor", which is a logical size. Unlike
     pressure(), nothing here defaults: a timeout, a non-zero exit, a parse
     failure or a missing field raises."""
+    if sys.platform.startswith("linux") and sysctl is sysctl_u64:
+        import memmon_linux
+        return memmon_linux.read_system_strict()
     level = sysctl("kern.memorystatus_vm_pressure_level")
     if level not in PRESSURE_LEVELS:
         raise ValueError(f"unknown pressure level {level}")

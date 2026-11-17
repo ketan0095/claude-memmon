@@ -1426,7 +1426,7 @@ class RealProcessTests(unittest.TestCase):
         notes = self.reg.wait_notes(3)
         build, gc = notes["build"], notes["gc"]
         deadline = time.monotonic() + 5
-        while self.reg.src.read(gc).ppid != 1:
+        while not memmon.reparented(self.reg.src.read(gc).ppid):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.01)
         out = self.eng.run("stop-job", self.reg.token("stop-job", a, build))

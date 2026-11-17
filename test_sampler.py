@@ -1086,6 +1086,7 @@ class UnknownReaderTests(unittest.TestCase):
 
 
 class NotifyTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "osascript is macOS-only; test_linux covers notify-send")
     def test_osascript_gets_text_only_as_argv(self):
         calls = []
         text = 'vitest in acme-web" & (do shell script "id") & "'
@@ -1146,6 +1147,7 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertEqual(st.read(memmon.SNAPSHOT)["pressure"], "HEALTHY")
 
 
+@unittest.skipUnless(sys.platform == "darwin", "launchd is macOS-only; test_linux covers the systemd timer")
 class PlistTests(unittest.TestCase):
     """B36: install.sh --sampler into a temp HOME. launchctl, pkill and pgrep
     are stubs on PATH, so the real LaunchAgent is never loaded or unloaded."""
