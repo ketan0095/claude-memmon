@@ -152,6 +152,7 @@ class StrictTelemetryTests(Base):
         with self.assertRaises(tm.TelemetryError):
             tm.read_pressure_strict(source=bad)
 
+    @unittest.skipUnless(sys.platform == "darwin", "host_statistics64 is macOS-only")
     def test_mach_counters_match_vm_stat(self):
         """The runner's host_statistics64 reader names vm_stat's counters."""
         src = tm.MachTelemetrySource()

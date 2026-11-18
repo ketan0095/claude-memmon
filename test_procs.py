@@ -34,6 +34,7 @@ def stub_source(lib):
     return src
 
 
+@unittest.skipUnless(sys.platform == "darwin", "libproc and top -l are macOS-only")
 class LibprocTests(unittest.TestCase):
     def test_abi_struct_sizes_pinned(self):
         self.assertEqual(ctypes.sizeof(mp.BSDInfo), 136)
@@ -132,6 +133,7 @@ PS = """  101     1   101   {uid} Wed Oct  7 18:06:44 2026     Ss   /bin/zsh
 """
 
 
+@unittest.skipUnless(sys.platform == "darwin", "libproc and top -l are macOS-only")
 class DegradedTests(unittest.TestCase):
     def fake_run(self, cmd, **kw):
         out = TOP if cmd[0] == "top" else PS.format(uid=os.getuid())

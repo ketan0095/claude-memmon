@@ -33,12 +33,14 @@ esac
 
 # Classify within 1 s: alarm(1) is the interpreter's first act and SIGALRM
 # ends it, so a hang or any failure yields no verdict and passes through.
-# -I keeps the session's working directory off sys.path.
+# -I keeps the session's working directory off sys.path. The assignment's
+# own stderr goes too: dash (Linux's /bin/sh) reports a child killed by
+# SIGALRM by printing "Alarm clock" there.
 verdict=$(/usr/bin/python3 -I -c 'import signal, sys
 signal.alarm(1)
 sys.path.insert(0, sys.argv[1])
 import memmon_route
-memmon_route.classify_main(sys.argv[2])' "$M" "$1" 2>/dev/null)
+memmon_route.classify_main(sys.argv[2])' "$M" "$1" 2>/dev/null) 2>/dev/null
 tab=$(printf '\t')
 case "$verdict" in
   "wrap$tab"*)

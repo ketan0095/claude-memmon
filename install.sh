@@ -21,6 +21,11 @@ LABEL="dev.memmon.sampler"
 BAR_LABEL="dev.memmon.bar"
 APP="$DEST_DIR/MemmonBar.app"
 
+OS="$(uname)"
+# Linux: a systemd user timer stands in for the launchd sampler.
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT="dev.memmon.sampler"
+
 SETTINGS="$HOME/.claude/settings.json"
 GATE="$DEST_DIR/memmon-gate.sh"
 
@@ -76,9 +81,15 @@ STUB
     chmod +x "$DEST_DIR/.memmon_route.sh.$$"
     mv -f "$DEST_DIR/.memmon_route.sh.$$" "$DEST_DIR/memmon_route.sh"
   fi
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootout "gui/$(id -u)/$BAR_LABEL" 2>/dev/null || true
-  pkill -f "MemmonBar.app/Contents/MacOS/MemmonBar" 2>/dev/null || true
+  if [[ "$OS" == "Darwin" ]]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/$BAR_LABEL" 2>/dev/null || true
+    pkill -f "MemmonBar.app/Contents/MacOS/MemmonBar" 2>/dev/null || true
+  elif [[ -f "$UNIT_DIR/$UNIT.timer" ]]; then
+    systemctl --user disable --now "$UNIT.timer" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$UNIT.timer" "$UNIT_DIR/$UNIT.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
   # Patch settings.json BEFORE deleting the script it points at: under
   # `set -e` a failure here would otherwise leave a dead hook wired in.
   if [[ -f "$SETTINGS" ]]; then
@@ -103,7 +114,7 @@ PY
          "$DEST_DIR/memmon_runner.py" "$DEST_DIR/memmon_procs.py" \
          "$DEST_DIR/memmon_owners.py" "$DEST_DIR/memmon_act.py" \
          "$DEST_DIR/memmon_common.py" "$DEST_DIR/memmon_pressure.py" \
-         "$DEST_DIR/memmon_telemetry.py" "$DEST_DIR/memmon_route.py" "$DEST_DIR/memmon_explain.py" \
+         "$DEST_DIR/memmon_telemetry.py" "$DEST_DIR/memmon_linux.py" "$DEST_DIR/memmon_route.py" "$DEST_DIR/memmon_explain.py" \
          "$DEST_DIR/memmon_update.py" "$DEST_DIR/install.json" \
          "$DEST_DIR/memmon-gate.sh" "$DEST_DIR/learned.zsh" "$DEST_DIR/paused.json"
   echo "memmon removed. History kept at $DEST_DIR/history.jsonl"
@@ -112,15 +123,35 @@ fi
 
 # Preflight. Fail with a sentence that says what to do, not a stack trace three
 # steps later on a machine that has never run this.
-[[ "$(uname)" == "Darwin" ]] || {
-  echo "memmon is macOS-only (it reads top/vm_stat/sysctl)." >&2; exit 1; }
-MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
-if [[ "$MACOS_MAJOR" -lt 13 ]]; then
-  echo "needs macOS 13+ (found $(sw_vers -productVersion)); the menu-bar app uses SwiftUI popovers" >&2
-  exit 1
+if [[ "$OS" == "Darwin" ]]; then
+  MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+  if [[ "$MACOS_MAJOR" -lt 13 ]]; then
+    echo "needs macOS 13+ (found $(sw_vers -productVersion)); the menu-bar app uses SwiftUI popovers" >&2
+    exit 1
+  fi
+  [[ -x /usr/bin/python3 ]] || {
+    echo "no /usr/bin/python3 — run: xcode-select --install" >&2; exit 1; }
+elif [[ "$OS" == "Linux" ]]; then
+  [[ -x /usr/bin/python3 ]] || {
+    echo "no /usr/bin/python3 — install python3 (3.10 or later)" >&2; exit 1; }
+  /usr/bin/python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' || {
+    echo "needs Python 3.10 or later at /usr/bin/python3" >&2; exit 1; }
+  [[ -r /proc/meminfo && -r /proc/vmstat ]] || {
+    echo "/proc is not readable; memmon reads memory from it" >&2; exit 1; }
+  [[ -r /proc/pressure/memory ]] || \
+    echo "note: no /proc/pressure/memory (PSI off); pressure uses free memory and swap only"
+  if [[ $WANT_MENUBAR == 1 ]]; then
+    echo "--menubar is macOS-only; use 'memmon' or 'memmon --statusline' on Linux" >&2; exit 1
+  fi
+  if [[ $WANT_GATE == 1 ]] && ! command -v zsh >/dev/null; then
+    echo "--gate needs zsh (the hook is a zsh script): sudo apt install zsh" >&2; exit 1
+  fi
+  if [[ $WANT_SAMPLER == 1 ]] && ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "--sampler needs a systemd user session (systemctl --user)" >&2; exit 1
+  fi
+else
+  echo "memmon runs on macOS and Linux (found $OS)." >&2; exit 1
 fi
-[[ -x /usr/bin/python3 ]] || {
-  echo "no /usr/bin/python3 — run: xcode-select --install" >&2; exit 1; }
 if [[ ! -d "$HOME/.claude" ]]; then
   echo "note: ~/.claude not found — session attribution and the gate need Claude Code;"
   echo "      the RAM/swap monitor still works without it."
@@ -131,7 +162,7 @@ mkdir -p "$DEST_DIR" "$BIN_DIR"
 # deleted, and the monitor has to keep working after that.
 # Publish the dependency before the entrypoint, without exposing partial files
 # to an already-running sampler or another CLI invocation during an upgrade.
-for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry memmon_route memmon_explain memmon_update; do
+for mod in memmon_common memmon_runner memmon_procs memmon_owners memmon_act memmon_pressure memmon_telemetry memmon_linux memmon_route memmon_explain memmon_update; do
   cp "$SRC_DIR/$mod.py" "$DEST_DIR/.$mod.py.$$"
   mv -f "$DEST_DIR/.$mod.py.$$" "$DEST_DIR/$mod.py"
 done
@@ -156,7 +187,42 @@ EOF
 chmod +x "$BIN"
 echo "installed: $BIN -> $DEST"
 
-if [[ $WANT_SAMPLER == 1 ]]; then
+if [[ $WANT_SAMPLER == 1 && "$OS" == "Linux" ]]; then
+  # One oneshot run of `memmon --log` a minute, as launchd's StartInterval does.
+  # Persistent=false: a missed minute is a gap in history, not a catch-up run.
+  # Normal priority, for the same reason the launchd job is Standard: a niced
+  # sampler yields to exactly the contention it exists to observe.
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/$UNIT.service" <<UNITEOF
+[Unit]
+Description=memmon sampler (one memory sample)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $DEST --log
+StandardError=append:$DEST_DIR/sampler.err
+UNITEOF
+  cat > "$UNIT_DIR/$UNIT.timer" <<UNITEOF
+[Unit]
+Description=memmon sampler, once a minute
+
+[Timer]
+OnActiveSec=5s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+UNITEOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$UNIT.timer"
+  if [[ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != "yes" ]]; then
+    echo "note: lingering is off, so the sampler stops when you log out;"
+    echo "      'loginctl enable-linger $(id -un)' keeps it running"
+  fi
+  echo "sampler installed: 1 sample/min -> $DEST_DIR/history.jsonl"
+elif [[ $WANT_SAMPLER == 1 ]]; then
   # Standard, with no Nice and no LowPriorityIO: a Background sampler yields to
   # exactly the contention it exists to observe. launchd.plist(5) still gives
   # Standard "light resource limits", so this lessens throttling, not removes it.
@@ -297,7 +363,7 @@ PY
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "note: $BIN_DIR is not on PATH — add it to your ~/.zshrc" ;;
+  *) echo "note: $BIN_DIR is not on PATH — add it to your shell profile" ;;
 esac
 
 echo

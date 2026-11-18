@@ -1091,6 +1091,7 @@ class OwnersCliTests(unittest.TestCase):
         self.assertIsNone(block["pressure_level"])
         self.assertIn("vm_stat exited 1", block["reason"])
 
+    @unittest.skipUnless(sys.platform == "darwin", "vm_stat is macOS-only; Linux reads /proc")
     def test_system_block_runs_vm_stat_once(self):
         calls = []
         real_run, real_sh = subprocess.run, memmon._sh

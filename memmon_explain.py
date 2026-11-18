@@ -393,9 +393,11 @@ def items_text(items: list) -> str:
 
 # ------------------------------------------------------------------- call
 
-def find_claude(path=None, extra=EXTRA_PATH) -> str | None:
+def find_claude(path=None, extra=None) -> str | None:
+    # EXTRA_PATH is read at call time, not bound as a default, so the tests'
+    # patch of it holds on a machine that has ~/.local/bin/claude.
     dirs = (path if path is not None else os.environ.get("PATH", "")).split(os.pathsep)
-    dirs += [os.path.expanduser(d) for d in extra]
+    dirs += [os.path.expanduser(d) for d in (EXTRA_PATH if extra is None else extra)]
     return shutil.which("claude", path=os.pathsep.join(d for d in dirs if d))
 
 

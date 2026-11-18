@@ -223,7 +223,7 @@ class Registry:
     def __init__(self, testcase):
         self.tc = testcase
         self.src = memmon_procs.default_source()
-        assert self.src.name == "libproc", "real-process tests need libproc"
+        assert self.src.name in ("libproc", "procfs"), "real-process tests need libproc or procfs"
         self.ids = {}            # pid -> start
         self.popens = []
         self.dir = tempfile.mkdtemp(prefix="memmon-test-")
